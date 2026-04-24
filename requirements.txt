@@ -1,0 +1,35 @@
+# ─── UI ──────────────────────────────────────────────────────────────
+customtkinter>=5.2.2,<6.0
+CTkMessagebox>=2.7
+darkdetect>=0.8.0
+Pillow>=10.4.0,<12.0
+
+# ─── Downloading & Media Tooling ─────────────────────────────────────
+yt-dlp>=2025.9.5
+mutagen>=1.47.0
+imageio-ffmpeg>=0.5.1          # Auto-provisions ffmpeg binary; no PATH required
+
+# ─── Discovery APIs ──────────────────────────────────────────────────
+python3-discogs-client>=2.7
+ytmusicapi>=1.8.2
+requests>=2.32.0
+
+# ─── DSP / Analysis ──────────────────────────────────────────────────
+librosa>=0.10.2,<0.12
+numpy>=1.26,<3.0
+scipy>=1.13
+soundfile>=0.12.1
+audioread>=3.0.1
+
+# ─── Stem Separation ─────────────────────────────────────────────────
+# Torch pinned to a known-good combo with demucs 4.x
+torch>=2.2,<2.6
+torchaudio>=2.2,<2.6
+demucs>=4.0.1
+
+# ─── Persistence & Config ────────────────────────────────────────────
+# sqlite3 is stdlib; no dependency needed
+pydantic>=2.8                  # Used by utils/config.py for schema validation
+
+# ─── Packaging (dev only, not required at runtime) ───────────────────
+pyinstaller>=6.10 ; extra == "build"

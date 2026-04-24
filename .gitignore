@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+*.log
+build/
+dist/
+*.spec.bak
+*.zip
+.claude/
+extract_from_transcript.ps1
+Claude-CRATE DIGGER.md
