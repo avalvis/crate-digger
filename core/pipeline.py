@@ -56,6 +56,10 @@ from core.stems import (
 )
 from utils.paths import build_vault_track_dir, sanitize_filename_component
 
+# Type alias for the optional AI enricher passed in from main.py.
+# Callable[[youtube_title, uploader], (artist, title)] — empty strings mean "no result".
+_AiEnricher = Callable[[str, str], tuple[str, str]]
+
 
 # ─── Public types ────────────────────────────────────────────────────
 
@@ -169,6 +173,7 @@ class IngestionPipeline:
         database: VaultDatabase,
         vault_root: Path,
         staging_root: Path,
+        ai_enricher: Optional[_AiEnricher] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self._dl = downloader
@@ -179,6 +184,7 @@ class IngestionPipeline:
         self._db = database
         self._vault_root = Path(vault_root)
         self._staging_root = Path(staging_root)
+        self._ai_enricher = ai_enricher
         self._log = logger or logging.getLogger("cratedigger.pipeline")
 
         self._vault_root.mkdir(parents=True, exist_ok=True)
@@ -246,6 +252,9 @@ class IngestionPipeline:
             resolved_artist, resolved_title = self._resolve_names(
                 download, request,
             )
+            # Refresh display_name now that we have the resolved (possibly AI-
+            # enriched) names — earlier we used the raw download fields.
+            progress.display_name = f"{resolved_artist} — {resolved_title}"
             tags = self._build_tags(
                 download, analysis, request, artwork_bytes,
                 resolved_artist, resolved_title,
@@ -420,20 +429,50 @@ class IngestionPipeline:
 
     # ── Name resolution & tag construction ──
 
-    @staticmethod
     def _resolve_names(
-        download: DownloadResult, request: PipelineRequest,
+        self,
+        download: DownloadResult,
+        request: PipelineRequest,
     ) -> tuple[str, str]:
         """
-        Pick the best Artist and Title candidates. YouTube Music metadata
-        (download.artist / download.track) is preferred when available;
-        otherwise fall back to uploader + video title. Final strings
-        are sanitized for filesystem safety at the path-build step,
-        but we normalize whitespace here.
+        Pick the best Artist and Title candidates.
+
+        Priority:
+          1. YouTube Music structured fields (download.artist / download.track)
+             — these are already accurate; no AI needed.
+          2. AI enrichment via DeepSeek: parse artist/title from the raw video
+             title + uploader name when structured fields are absent.
+          3. Heuristic fallback: uploader name as artist, raw video title as title.
         """
+        # Structured fields present (YouTube Music, official uploads with tags).
+        if download.artist and download.track:
+            artist = download.artist.strip()
+            title = download.track.strip()
+            if artist.endswith(" - Topic"):
+                artist = artist[:-len(" - Topic")].strip()
+            return artist or "Unknown Artist", title or "Unknown Title"
+
+        # Try AI enrichment for untagged uploads (unofficial re-uploads, etc.)
+        if self._ai_enricher is not None:
+            raw_title = download.title or ""
+            uploader = download.uploader or ""
+            ai_artist, ai_title = self._ai_enricher(raw_title, uploader)
+            if ai_artist or ai_title:
+                artist = (ai_artist or download.uploader or "Unknown Artist").strip()
+                title  = (ai_title  or raw_title or "Unknown Title").strip()
+                self._log.info(
+                    "AI metadata: '%s' + uploader '%s' → artist='%s' title='%s'",
+                    raw_title, uploader, artist, title,
+                )
+                return artist or "Unknown Artist", title or "Unknown Title"
+            self._log.debug(
+                "AI metadata returned no result for '%s'; using heuristic fallback.",
+                raw_title,
+            )
+
+        # Heuristic fallback: prefer any partial structured fields, then uploader.
         artist = (download.artist or download.uploader or "Unknown Artist").strip()
-        title = (download.track or download.title or "Unknown Title").strip()
-        # Collapse the common " - Topic" artist suffix YouTube auto-creates
+        title  = (download.track  or download.title  or "Unknown Title").strip()
         if artist.endswith(" - Topic"):
             artist = artist[:-len(" - Topic")].strip()
         return artist or "Unknown Artist", title or "Unknown Title"

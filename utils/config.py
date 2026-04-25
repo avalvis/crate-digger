@@ -107,6 +107,13 @@ class GeneralConfig(BaseModel):
         default=False,
         description="Default state of the stems toggle on Manual Rip.",
     )
+    use_ai_metadata: bool = Field(
+        default=True,
+        description=(
+            "Use AI (DeepSeek) to extract artist/title from YouTube video "
+            "titles when the track has no structured metadata."
+        ),
+    )
 
 
 class DownloaderConfig(BaseModel):

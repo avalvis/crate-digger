@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import logging.handlers
+import os
 import sys
 import traceback
 from pathlib import Path
@@ -76,6 +77,33 @@ def _patch_customtkinter_compat() -> None:
 
     base.place = _compat_place
     base._cratedigger_place_patched = True
+
+
+def _load_dotenv(project_root: Path) -> None:
+    """
+    Load a .env file from project_root into os.environ, without overwriting
+    values already set by the real environment (same semantics as python-dotenv).
+    Silently no-ops if the file is missing or unreadable.
+    """
+    env_file = project_root / ".env"
+    if not env_file.exists():
+        return
+    try:
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            # Strip surrounding quotes (both " and ') from the value.
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                value = value[1:-1]
+            # Don't clobber values already present in the real environment.
+            if key and key not in os.environ:
+                os.environ[key] = value
+    except Exception:
+        pass
 
 
 def _app_data_dir() -> Path:
@@ -347,6 +375,9 @@ def _bootstrap(splash: _SplashWindow, log: logging.Logger) -> int:
     Construct every service the app needs. Returns a process exit code.
     Called from `main()` inside a try/except so failures surface on splash.
     """
+    # Load .env from the project root before anything reads os.environ.
+    _load_dotenv(Path(__file__).parent)
+
     # Deferred imports for snappy splash display
     splash.set_status("Loading configuration…")
     data_dir = _app_data_dir()
@@ -393,6 +424,7 @@ def _bootstrap(splash: _SplashWindow, log: logging.Logger) -> int:
     # ── Engine construction ──
     splash.set_status("Preparing engine…")
 
+    from core.ai_metadata import make_ai_enricher
     from core.analyzer import AudioAnalyzer
     from core.artwork import ArtworkProcessor
     from core.downloader import Downloader
@@ -436,6 +468,18 @@ def _bootstrap(splash: _SplashWindow, log: logging.Logger) -> int:
     vault_root = Path(snap.config.general.vault_root).expanduser()
     staging_root = Path(snap.config.general.staging_root).expanduser()
 
+    # AI metadata enricher — opt-in via Settings; requires DEEPSEEK_API_KEY.
+    ai_enricher = None
+    if snap.config.general.use_ai_metadata:
+        ai_enricher = make_ai_enricher(logger=log.getChild("ai_metadata"))
+        if ai_enricher is None:
+            log.info(
+                "AI metadata enrichment enabled in config but DEEPSEEK_API_KEY "
+                "is not set — falling back to heuristic name resolution."
+            )
+        else:
+            log.info("AI metadata enricher ready (DeepSeek).")
+
     pipeline = IngestionPipeline(
         downloader=downloader,
         artwork=artwork,
@@ -445,6 +489,7 @@ def _bootstrap(splash: _SplashWindow, log: logging.Logger) -> int:
         database=database,
         vault_root=vault_root,
         staging_root=staging_root,
+        ai_enricher=ai_enricher,
         logger=log.getChild("pipeline"),
     )
 

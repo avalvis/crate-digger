@@ -23,8 +23,9 @@ audioread>=3.0.1
 
 # ─── Stem Separation ─────────────────────────────────────────────────
 # Torch pinned to a known-good combo with demucs 4.x
-torch>=2.2,<2.6
-torchaudio>=2.2,<2.6
+# Upper bound relaxed: Python 3.14 wheels start at torch 2.9
+torch>=2.9,<3.0
+torchaudio>=2.9,<3.0
 demucs>=4.0.1
 
 # ─── Persistence & Config ────────────────────────────────────────────

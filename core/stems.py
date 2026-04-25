@@ -220,7 +220,6 @@ class StemSeparator:
             "-n", active_model.value,
             "-d", device,
             "-o", str(staging_root),
-            "--filename", "{stem}.{ext}",
             str(audio_path),
         ]
         self._log.debug("demucs command: %s", " ".join(cmd))
@@ -307,6 +306,7 @@ class StemSeparator:
 
         last_reported_pct = 0.0
         saw_model_load = False
+        output_lines: list[str] = []   # full buffer for error reporting
 
         while True:
             if cancel_event is not None and cancel_event.is_set():
@@ -328,6 +328,7 @@ class StemSeparator:
             if not line:
                 continue
 
+            output_lines.append(line)
             self._log.debug("demucs: %s", line)
 
             # Stage heuristics. First "loading"/"downloading" line fires
@@ -357,8 +358,9 @@ class StemSeparator:
         drain_thread.join(timeout=2.0)
         rc = proc.wait()
         if rc != 0:
+            tail = "\n".join(output_lines[-30:]) if output_lines else "(no output)"
             raise StemSeparationFailedError(
-                f"demucs exited with code {rc}. See cratedigger.log for details."
+                f"demucs exited with code {rc}.\n{tail}"
             )
 
     def _terminate_process(self, proc: subprocess.Popen) -> None:
