@@ -282,7 +282,7 @@ class VaultTab(ctk.CTkFrame):
     def _build_filter_row(self) -> None:
         t = self._theme
 
-        card = ctk.CTkFrame(self, **style_card(t))
+        card = ctk.CTkFrame(self, **{**style_card(t), "border_width": 0})
         card.grid(row=1, column=0, sticky="ew", padx=t.space.xl, pady=(0, t.space.md))
         card.grid_columnconfigure(0, weight=1)
 
@@ -532,9 +532,7 @@ class VaultTab(ctk.CTkFrame):
             width=68,
             height=38,
             placeholder_text="—",
-            **{
-                k: v for k, v in style_input(t).items() if k not in ("height",)
-            },  # override height only
+            **{k: v for k, v in style_input(t).items() if k != "height"},
             justify="center",
         )
         try:
@@ -542,12 +540,14 @@ class VaultTab(ctk.CTkFrame):
             if inner_entry is not None:
                 inner_entry.configure(
                     highlightthickness=0,
+                    highlightbackground=t.surface.raised,
+                    highlightcolor=t.surface.raised,
                     bd=0,
                     relief="flat",
+                    insertbackground=t.text.primary,
                 )
         except Exception:
             pass
-        # Save on focus-out + Enter.
         entry.bind("<FocusOut>", lambda _e: self._apply_bpm_range(), add="+")
         entry.bind("<Return>", lambda _e: self._apply_bpm_range(), add="+")
         return entry

@@ -3,15 +3,15 @@ ui/components/glow_entry.py
 ──────────────────────────────────────────────────────────────────────
 Crate Digger — Focus-Accented Input Field
 
-Outer CTkFrame fg_color IS the "border" — inner content frame sits
-1 px inset, so the outer color rings the content as a visible outline.
-No CTk canvas border_width is used (that approach leaves corner gaps on
-Windows when child Canvas windows cover the drawn outline). Here the
-1 px ring is solid background color — it always renders perfectly.
+Uses CTkFrame's built-in border_width + border_color mechanism for the
+focus ring. Children are placed directly in the frame (no nested inner
+frame) with pady=4 so they clear the 2 px border on all sides without
+the z-order overlap issues that plagued the previous dual-frame
+approach on Windows.
 
-Focus state: outer frame fg_color → accent orange.
-Error state: outer frame fg_color → error red-orange.
-Idle state:  outer frame fg_color → border.strong warm brown.
+Focus state: border_color → accent orange.
+Error state: border_color → error red-orange.
+Idle state:  border_color → border.strong warm brown.
 """
 
 from __future__ import annotations
@@ -27,8 +27,8 @@ ValidationState = Literal["ok", "error"]
 
 class GlowEntry(ctk.CTkFrame):
     """
-    Composed entry with a cleanly rendered focus ring. All content lives
-    in a 1 px inset inner frame; the outer frame's bg color is the ring.
+    Composed entry with a cleanly rendered focus ring. The outer frame
+    IS the container; border_color drives the ring color.
     """
 
     _DEFAULT_HEIGHT = 48
@@ -49,30 +49,22 @@ class GlowEntry(ctk.CTkFrame):
     ) -> None:
         self._height = int(height or self._DEFAULT_HEIGHT)
 
-        # Outer frame — fg_color is the visible "border ring".
-        # No border_width used; the 1 px padding of _inner creates the ring.
         super().__init__(
             parent,
-            fg_color=theme.border.strong,
-            border_width=0,
+            fg_color=theme.surface.raised,
+            border_color=theme.border.strong,
+            border_width=2,
             corner_radius=theme.radius.md,
             height=self._height,
             width=width,
         )
         self.grid_propagate(False)
 
-        # Inner content frame — exactly 2 px inset on every side.
-        # 2 px ring is reliably visible at all DPI scales; 1 px can
-        # drop to a sub-pixel and disappear on some Windows setups.
-        # Corner radii satisfy pad + inner_r = outer_r (2+6=8) so the
-        # ring width is uniform all the way around the corners.
-        self._inner = ctk.CTkFrame(
-            self,
-            fg_color=theme.surface.raised,
-            border_width=0,
-            corner_radius=max(0, theme.radius.md - 2),
-        )
-        self._inner.place(x=2, y=2, relwidth=1.0, relheight=1.0, width=-4, height=-4)
+        # Three-column layout: icon | entry | clear button
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=0)
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_columnconfigure(2, weight=0)
 
         self._theme = theme
         self._validator = validator
@@ -84,6 +76,10 @@ class GlowEntry(ctk.CTkFrame):
         self._build_body(theme, placeholder, prefix_icon, show_clear_button)
         self._error_label: Optional[ctk.CTkLabel] = None
 
+        # After layout settles: defocus any auto-focus Windows assigns to
+        # the first tabbable widget on window show, and paint the correct ring.
+        self.after_idle(self._reset_init_focus)
+
     # ── Body construction ──
 
     def _build_body(
@@ -94,70 +90,80 @@ class GlowEntry(ctk.CTkFrame):
         show_clear_button: bool,
     ) -> None:
         t = theme
-        inn = self._inner
-
-        inn.grid_rowconfigure(0, weight=1)
-        inn.grid_columnconfigure(0, weight=0)
-        inn.grid_columnconfigure(1, weight=1)
-        inn.grid_columnconfigure(2, weight=0)
 
         # ── Prefix icon ──
         if prefix_icon:
             self._prefix_label = ctk.CTkLabel(
-                inn,
+                self,
                 text=prefix_icon,
                 text_color=t.text.muted,
                 font=t.font.body_emphasis,
                 width=20,
+                fg_color="transparent",
             )
             self._prefix_label.grid(
                 row=0,
                 column=0,
                 sticky="nsw",
                 padx=(t.space.md, t.space.xs),
+                pady=4,
             )
         else:
             self._prefix_label = None
 
         # ── Core entry ──
         self._entry = ctk.CTkEntry(
-            inn,
+            self,
             placeholder_text=placeholder,
             fg_color="transparent",
             border_width=0,
             text_color=t.text.primary,
             placeholder_text_color=t.text.muted,
             font=t.font.body,
-            height=max(28, self._height - 10),
+            # Keep the inner entry away from the outer ring so corners and
+            # side borders render cleanly on Windows.
+            height=max(28, self._height - 16),
         )
-        left_pad = 0 if prefix_icon else t.space.md
-        right_pad = 0 if show_clear_button else t.space.md
+        left_pad = t.space.xs if prefix_icon else t.space.md
+        right_pad = t.space.xs
         self._entry.grid(
             row=0,
             column=1,
             sticky="nsew",
             padx=(left_pad, right_pad),
+            pady=6,
         )
 
-        # Suppress the native Tk Entry's own focus ring.
+        # Suppress the native Tk Entry's own focus ring and bind focus events
+        # on both the CTkEntry wrapper and the inner tk.Entry so we catch
+        # all focus transitions (CTk sometimes routes events differently on Windows).
         try:
             inner_entry = getattr(self._entry, "_entry", None)
             if inner_entry is not None:
-                inner_entry.configure(highlightthickness=0, bd=0, relief="flat")
+                inner_entry.configure(
+                    highlightthickness=0,
+                    highlightbackground=theme.surface.raised,
+                    highlightcolor=theme.surface.raised,
+                    bd=0,
+                    relief="flat",
+                    insertbackground=theme.text.primary,
+                )
+                inner_entry.bind("<FocusIn>", self._on_focus_in, add="+")
+                inner_entry.bind("<FocusOut>", self._on_focus_out, add="+")
         except Exception:
             pass
 
-        self._entry.bind("<FocusIn>",    self._on_focus_in,    add="+")
-        self._entry.bind("<FocusOut>",   self._on_focus_out,   add="+")
+        self._entry.bind("<FocusIn>", self._on_focus_in, add="+")
+        self._entry.bind("<FocusOut>", self._on_focus_out, add="+")
         self._entry.bind("<KeyRelease>", self._on_key_release, add="+")
-        self._entry.bind("<Return>",     self._on_enter_pressed, add="+")
-        self._entry.bind("<KP_Enter>",   self._on_enter_pressed, add="+")
+        self._entry.bind("<Return>", self._on_enter_pressed, add="+")
+        self._entry.bind("<KP_Enter>", self._on_enter_pressed, add="+")
 
         # ── Clear button ──
         self._clear_button: Optional[ctk.CTkButton] = None
         if show_clear_button:
             self._clear_button = ctk.CTkButton(
-                inn,
+                self,
                 text="×",
                 width=30,
                 height=30,
@@ -192,11 +198,10 @@ class GlowEntry(ctk.CTkFrame):
         t = self._theme
         if disabled:
             self._entry.configure(state="disabled")
-            self._inner.configure(fg_color=t.surface.base)
-            self.configure(fg_color=t.border.subtle)
+            self.configure(fg_color=t.surface.base, border_color=t.border.subtle)
         else:
             self._entry.configure(state="normal")
-            self._inner.configure(fg_color=t.surface.raised)
+            self.configure(fg_color=t.surface.raised)
             self._apply_ring_color()
 
     def bind_submit(self, callback: Callable[[str], None]) -> None:
@@ -245,6 +250,24 @@ class GlowEntry(ctk.CTkFrame):
 
     # ── Event handlers ──
 
+    def _reset_init_focus(self) -> None:
+        """
+        Called via after_idle once layout has settled.
+        If Windows auto-focused this entry during window creation, move
+        focus to the root window so the ring shows idle, not orange.
+        """
+        try:
+            inner = getattr(self._entry, "_entry", None)
+            top = self.winfo_toplevel()
+            focused = top.focus_displayof()
+            if focused is not None and inner is not None:
+                if str(focused) == str(inner) or str(focused) == str(self._entry):
+                    top.focus_set()
+                    self._has_focus = False
+        except Exception:
+            pass
+        self._apply_ring_color()
+
     def _on_focus_in(self, _event) -> None:
         self._has_focus = True
         self._apply_ring_color()
@@ -278,11 +301,11 @@ class GlowEntry(ctk.CTkFrame):
     def _apply_ring_color(self) -> None:
         t = self._theme
         if self._validation_state == "error":
-            self.configure(fg_color=t.status.error)
+            self.configure(border_color=t.status.error)
         elif self._has_focus:
-            self.configure(fg_color=t.accent.blue)
+            self.configure(border_color=t.accent.blue)
         else:
-            self.configure(fg_color=t.border.strong)
+            self.configure(border_color=t.border.strong)
 
     # kept for any callers that used the old name
     def _apply_border_state(self) -> None:
@@ -313,7 +336,7 @@ class GlowEntry(ctk.CTkFrame):
                 column=2,
                 sticky="nse",
                 padx=(0, t.space.sm),
-                pady=t.space.xs,
+                pady=4,
             )
         elif not has_content and currently_visible:
             self._clear_button.grid_forget()

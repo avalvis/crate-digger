@@ -90,6 +90,8 @@ class SettingsTab(ctk.CTkFrame):
         self._workers_dropdown: Optional[ctk.CTkOptionMenu] = None
         self._stems_default_switch: Optional[ctk.CTkSwitch] = None
         self._stems_default_var: Optional[ctk.BooleanVar] = None
+        self._ai_metadata_switch: Optional[ctk.CTkSwitch] = None
+        self._ai_metadata_var: Optional[ctk.BooleanVar] = None
         self._stem_model_dropdown: Optional[ctk.CTkOptionMenu] = None
         self._device_dropdown: Optional[ctk.CTkOptionMenu] = None
         self._token_status_label: Optional[ctk.CTkLabel] = None
@@ -315,6 +317,32 @@ class SettingsTab(ctk.CTkFrame):
         )
         self._stems_default_switch.pack()
 
+        # AI metadata toggle
+        self._field_label(
+            body, 4, "AI metadata enrichment",
+            "Use DeepSeek AI to extract the original artist name and title from "
+            "YouTube video titles. Requires DEEPSEEK_API_KEY in your .env file. "
+            "Disable if you prefer the raw upload metadata or have no API key.",
+        )
+
+        ai_toggle_row = ctk.CTkFrame(body, fg_color="transparent")
+        ai_toggle_row.grid(row=5, column=0, sticky="w",
+                           pady=(0, t.space.xs))
+
+        self._ai_metadata_var = ctk.BooleanVar(value=True)
+        self._ai_metadata_switch = ctk.CTkSwitch(
+            ai_toggle_row, text="",
+            variable=self._ai_metadata_var,
+            onvalue=True, offvalue=False,
+            command=lambda: self._save_ai_metadata(self._ai_metadata_var.get()),
+            progress_color=t.accent.blue,
+            button_color=t.text.primary,
+            button_hover_color=t.text.primary,
+            fg_color=t.surface.elevated,
+            width=40, height=22,
+        )
+        self._ai_metadata_switch.pack()
+
         return row + 3
 
     # ── Stem separation section ──
@@ -536,6 +564,9 @@ class SettingsTab(ctk.CTkFrame):
         if self._stems_default_var is not None:
             self._stems_default_var.set(cfg.general.enable_stems_by_default)
 
+        if self._ai_metadata_var is not None:
+            self._ai_metadata_var.set(cfg.general.use_ai_metadata)
+
         if self._stem_model_dropdown is not None:
             label = self._label_for_stem_model(cfg.stems.model)
             self._stem_model_dropdown.set(label)
@@ -612,6 +643,12 @@ class SettingsTab(ctk.CTkFrame):
     def _save_stems_default(self, value: bool) -> None:
         try:
             self._config.update_general(enable_stems_by_default=bool(value))
+        except ConfigError as e:
+            self._ctx.publish_toast(str(e), kind="error")
+
+    def _save_ai_metadata(self, value: bool) -> None:
+        try:
+            self._config.update_general(use_ai_metadata=bool(value))
         except ConfigError as e:
             self._ctx.publish_toast(str(e), kind="error")
 
@@ -713,6 +750,7 @@ class SettingsTab(ctk.CTkFrame):
                 staging_root=str(Path.home() / ".cratedigger" / "staging"),
                 concurrent_workers=2,
                 enable_stems_by_default=False,
+                use_ai_metadata=True,
             )
             self._config.update_stems(model="htdemucs_ft", device="auto")
             self._config.update_downloader(
