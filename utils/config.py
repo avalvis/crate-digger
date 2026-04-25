@@ -25,6 +25,7 @@ Design contract:
     tab can save from the Tk thread while the pipeline reads
     independently.
 """
+
 from __future__ import annotations
 
 import json
@@ -38,7 +39,6 @@ from pathlib import Path
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field, ValidationError
-
 
 # Schema version written into every saved config. Bump when you rename
 # or remove a field; migrations branch on the stored value.
@@ -55,8 +55,9 @@ _KEYRING_USER_DISCOGS_TOKEN = "discogs_token"
 
 def _keyring_available() -> bool:
     try:
-        import keyring                           # noqa: F401
-        import keyring.errors                    # noqa: F401
+        import keyring  # noqa: F401
+        import keyring.errors  # noqa: F401
+
         return True
     except Exception:
         return False
@@ -65,6 +66,7 @@ def _keyring_available() -> bool:
 def _keyring_get(user: str) -> Optional[str]:
     try:
         import keyring
+
         return keyring.get_password(_KEYRING_SERVICE, user)
     except Exception:
         return None
@@ -73,6 +75,7 @@ def _keyring_get(user: str) -> Optional[str]:
 def _keyring_set(user: str, value: str) -> bool:
     try:
         import keyring
+
         keyring.set_password(_KEYRING_SERVICE, user, value)
         return True
     except Exception:
@@ -82,6 +85,7 @@ def _keyring_set(user: str, value: str) -> bool:
 def _keyring_delete(user: str) -> None:
     try:
         import keyring
+
         keyring.delete_password(_KEYRING_SERVICE, user)
     except Exception:
         pass
@@ -89,8 +93,10 @@ def _keyring_delete(user: str) -> None:
 
 # ─── Schema ──────────────────────────────────────────────────────────
 
+
 class GeneralConfig(BaseModel):
     """Top-level app preferences."""
+
     vault_root: str = Field(
         default_factory=lambda: str(Path.home() / "Music" / "CrateDigger_Vault"),
         description="Filesystem root of the Vault tree.",
@@ -100,7 +106,9 @@ class GeneralConfig(BaseModel):
         description="Scratch directory for in-progress pipeline jobs.",
     )
     concurrent_workers: int = Field(
-        default=2, ge=1, le=8,
+        default=2,
+        ge=1,
+        le=8,
         description="Number of simultaneous pipeline jobs.",
     )
     enable_stems_by_default: bool = Field(
@@ -118,6 +126,7 @@ class GeneralConfig(BaseModel):
 
 class DownloaderConfig(BaseModel):
     """yt-dlp / downloader preferences."""
+
     retries: int = Field(default=5, ge=0, le=20)
     fragment_retries: int = Field(default=5, ge=0, le=20)
     concurrent_fragments: int = Field(default=4, ge=1, le=16)
@@ -125,6 +134,7 @@ class DownloaderConfig(BaseModel):
 
 class StemsConfig(BaseModel):
     """Stem separation preferences."""
+
     model: str = Field(
         default="htdemucs_ft",
         description="Default demucs model.",
@@ -137,6 +147,7 @@ class StemsConfig(BaseModel):
 
 class DiscoveryConfig(BaseModel):
     """Discogs + YTM discovery preferences. Token is NOT stored here."""
+
     # Reference to the keyring entry rather than the value itself. When
     # `True`, the loader fetches the token from the OS keyring.
     # `False` means the user hasn't entered one yet.
@@ -146,6 +157,7 @@ class DiscoveryConfig(BaseModel):
 
 class UIConfig(BaseModel):
     """UI-state preferences."""
+
     window_width: int = Field(default=1280, ge=1120)
     window_height: int = Field(default=820, ge=720)
     last_active_tab: str = "manual_rip"
@@ -154,6 +166,7 @@ class UIConfig(BaseModel):
 
 class AppConfig(BaseModel):
     """Root config schema."""
+
     schema_version: int = CONFIG_SCHEMA_VERSION
     general: GeneralConfig = Field(default_factory=GeneralConfig)
     downloader: DownloaderConfig = Field(default_factory=DownloaderConfig)
@@ -163,6 +176,7 @@ class AppConfig(BaseModel):
 
 
 # ─── Public exceptions ───────────────────────────────────────────────
+
 
 class ConfigError(Exception):
     """Base class for config failures."""
@@ -178,6 +192,7 @@ class ConfigSaveError(ConfigError):
 
 # ─── Manager ─────────────────────────────────────────────────────────
 
+
 @dataclass(slots=True)
 class ConfigSnapshot:
     """
@@ -185,9 +200,10 @@ class ConfigSnapshot:
     this; they call `ConfigManager.update(...)` to mutate. Never mutate
     the snapshot directly — always go through the manager.
     """
+
     config: AppConfig
-    discogs_token: Optional[str]    # materialized from keyring; None if unset
-    keyring_available: bool         # used by Settings UI to warn user
+    discogs_token: Optional[str]  # materialized from keyring; None if unset
+    keyring_available: bool  # used by Settings UI to warn user
 
 
 class ConfigManager:
@@ -205,9 +221,14 @@ class ConfigManager:
         self._log = logger or logging.getLogger("cratedigger.config")
 
         self._lock = threading.RLock()
-        self._config: AppConfig = AppConfig()         # defaults until load()
+        self._config: AppConfig = AppConfig()  # defaults until load()
         self._token: Optional[str] = None
         self._loaded = False
+
+    @property
+    def data_dir(self) -> Path:
+        """Directory that holds config.json, vault.db, and cratedigger.log."""
+        return self._path.parent
 
     # ── Lifecycle ──
 
@@ -224,25 +245,29 @@ class ConfigManager:
                     self._config = self._parse_and_migrate(data)
                     self._log.info(
                         "Loaded config from %s (schema v%d)",
-                        self._path, self._config.schema_version,
+                        self._path,
+                        self._config.schema_version,
                     )
                 except (OSError, json.JSONDecodeError) as e:
                     self._log.warning(
                         "Could not read config (%s); using defaults. "
                         "Corrupted file moved to %s.bak",
-                        e, self._path,
+                        e,
+                        self._path,
                     )
                     self._quarantine_corrupt_file()
                     self._config = AppConfig()
                 except ValidationError as e:
                     self._log.warning(
-                        "Config failed schema validation (%s); using defaults.", e,
+                        "Config failed schema validation (%s); using defaults.",
+                        e,
                     )
                     self._quarantine_corrupt_file()
                     self._config = AppConfig()
             else:
                 self._log.info(
-                    "No config at %s — starting with defaults.", self._path,
+                    "No config at %s — starting with defaults.",
+                    self._path,
                 )
                 self._config = AppConfig()
 
@@ -258,6 +283,10 @@ class ConfigManager:
             if not self._loaded:
                 return self.load()
             return self._snapshot()
+
+    def config_path(self) -> Path:
+        """Absolute path to the JSON config file on disk."""
+        return self._path
 
     # ── Mutation API ──
 
@@ -288,11 +317,13 @@ class ConfigManager:
             if token is None:
                 _keyring_delete(_KEYRING_USER_DISCOGS_TOKEN)
                 self._token = None
-                self._config = self._config.model_copy(update={
-                    "discovery": self._config.discovery.model_copy(
-                        update={"has_token": False},
-                    ),
-                })
+                self._config = self._config.model_copy(
+                    update={
+                        "discovery": self._config.discovery.model_copy(
+                            update={"has_token": False},
+                        ),
+                    }
+                )
                 self._save()
                 return self._snapshot()
 
@@ -307,18 +338,23 @@ class ConfigManager:
                 self._fallback_write_plaintext_token(token)
 
             self._token = token
-            self._config = self._config.model_copy(update={
-                "discovery": self._config.discovery.model_copy(
-                    update={"has_token": True},
-                ),
-            })
+            self._config = self._config.model_copy(
+                update={
+                    "discovery": self._config.discovery.model_copy(
+                        update={"has_token": True},
+                    ),
+                }
+            )
             self._save()
             return self._snapshot()
 
     # ── Internals ──
 
     def _update_section(
-        self, section: str, model_cls: type[BaseModel], fields: dict[str, Any],
+        self,
+        section: str,
+        model_cls: type[BaseModel],
+        fields: dict[str, Any],
     ) -> ConfigSnapshot:
         """
         Merge `fields` into the named section, validate the result, save,
@@ -332,9 +368,7 @@ class ConfigManager:
                 # defaults kick in and constraint checks (ge/le) fire.
                 merged = model_cls.model_validate(merged.model_dump())
             except ValidationError as e:
-                raise ConfigError(
-                    f"Invalid {section} config: {e}"
-                ) from e
+                raise ConfigError(f"Invalid {section} config: {e}") from e
             self._config = self._config.model_copy(update={section: merged})
             self._save()
             return self._snapshot()
@@ -367,7 +401,8 @@ class ConfigManager:
             # Write to a tmp sibling, fsync, then replace. This is the
             # same atomicity pattern the exporter uses for .partial WAVs.
             tmp_fd, tmp_path = tempfile.mkstemp(
-                prefix=".config_", suffix=".tmp",
+                prefix=".config_",
+                suffix=".tmp",
                 dir=str(self._path.parent),
             )
             try:

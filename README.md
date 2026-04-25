@@ -106,6 +106,29 @@ The codebase is structured to keep UI concerns separate from ingestion logic and
 - This is expected on CPU-only systems.
 - Use a smaller model or disable stems by default if throughput is more important.
 
+### Stem Separation Fails (TorchCodec Or diffq Errors)
+
+- If you see errors mentioning TorchCodec, your torchaudio runtime cannot encode/decode audio for Demucs.
+- Recreate the exact pinned stack used by this project:
+
+```bash
+pip install -r requirements.txt
+```
+
+- Run the runtime verifier before testing Manual Rip:
+
+```bash
+python scripts/check_stems_runtime.py
+```
+
+- On Windows, ensure Microsoft Visual C++ Redistributable x64 is installed and up to date.
+
+- If you selected the mdx_extra_q model, install diffq or switch to htdemucs/mdx_extra:
+
+```bash
+pip install diffq
+```
+
 ## Contributing
 
 1. Create a branch from main.

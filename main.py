@@ -442,7 +442,10 @@ def _bootstrap(splash: _SplashWindow, log: logging.Logger) -> int:
         logger=log.getChild("downloader"),
     )
     artwork = ArtworkProcessor(logger=log.getChild("artwork"))
-    analyzer = AudioAnalyzer(logger=log.getChild("analyzer"))
+    analyzer = AudioAnalyzer(
+        ffmpeg_path=binaries.ffmpeg_path,
+        logger=log.getChild("analyzer"),
+    )
     metadata_writer = MetadataWriter(logger=log.getChild("metadata"))
 
     try:
@@ -457,8 +460,20 @@ def _bootstrap(splash: _SplashWindow, log: logging.Logger) -> int:
     stem_separator = StemSeparator(
         model=stem_model,
         device=snap.config.stems.device,
+        ffmpeg_path=binaries.ffmpeg_path,
         logger=log.getChild("stems"),
     )
+
+    splash.set_status("Validating stem runtime…")
+    stems_ok, stems_info = stem_separator.probe_runtime()
+    if stems_ok:
+        log.info("Stem runtime ready: %s", stems_info)
+    else:
+        log.warning(
+            "Stem runtime is unavailable. Stems jobs will fail until "
+            "dependencies are fixed. Details: %s",
+            stems_info,
+        )
 
     exporter = MPCExporter(
         ffmpeg_path=binaries.ffmpeg_path,

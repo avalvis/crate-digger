@@ -17,29 +17,26 @@ Sections:
 All write paths validate through the config manager's pydantic schema;
 invalid values produce a red-bordered field + toast rather than a save.
 """
+
 from __future__ import annotations
 
-import logging
 import webbrowser
 from pathlib import Path
 from tkinter import filedialog
-from typing import Callable, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, Optional
 
 import customtkinter as ctk
 
 from core.stems import StemModel
 from ui.components.glow_entry import GlowEntry
 from ui.theme import (
-    style_card,
     style_card_elevated,
     style_danger_button,
     style_ghost_button,
-    style_input,
     style_label_body,
     style_label_heading,
     style_label_meta,
     style_label_subheading,
-    style_primary_button,
     style_secondary_button,
 )
 from utils.config import ConfigError
@@ -51,17 +48,17 @@ if TYPE_CHECKING:
 # Display names for stem models — keeps the UI human-readable while
 # the underlying StemModel enum stays stable.
 _STEM_MODEL_CHOICES: list[tuple[StemModel, str]] = [
-    (StemModel.HTDEMUCS_FT,  "htdemucs_ft  —  Fine-tuned, highest quality"),
-    (StemModel.HTDEMUCS,     "htdemucs  —  Demucs v4 default"),
-    (StemModel.HTDEMUCS_6S,  "htdemucs_6s  —  6 stems (adds piano + guitar)"),
-    (StemModel.MDX_EXTRA,    "mdx_extra  —  ~2x faster on CPU"),
-    (StemModel.MDX_EXTRA_Q,  "mdx_extra_q  —  Quantized, smallest memory"),
+    (StemModel.HTDEMUCS_FT, "htdemucs_ft  —  Fine-tuned, highest quality"),
+    (StemModel.HTDEMUCS, "htdemucs  —  Demucs v4 default"),
+    (StemModel.HTDEMUCS_6S, "htdemucs_6s  —  6 stems (adds piano + guitar)"),
+    (StemModel.MDX_EXTRA, "mdx_extra  —  ~2x faster on CPU"),
+    (StemModel.MDX_EXTRA_Q, "mdx_extra_q  —  Quantized, smallest memory"),
 ]
 
 _DEVICE_CHOICES: list[tuple[str, str]] = [
     ("auto", "Auto  —  use best available"),
-    ("cpu",  "CPU"),
-    ("mps",  "Apple Silicon (MPS)"),
+    ("cpu", "CPU"),
+    ("mps", "Apple Silicon (MPS)"),
     ("cuda", "NVIDIA (CUDA)"),
 ]
 
@@ -69,7 +66,7 @@ _DEVICE_CHOICES: list[tuple[str, str]] = [
 class SettingsTab(ctk.CTkFrame):
     """Form-driven preferences editor. Saves on change."""
 
-    _DEBOUNCE_MS = 500    # text field debounce before saving
+    _DEBOUNCE_MS = 500  # text field debounce before saving
 
     def __init__(self, parent: ctk.CTkBaseClass, ctx: "AppContext") -> None:
         super().__init__(parent, fg_color=ctx.theme.surface.app)
@@ -120,15 +117,21 @@ class SettingsTab(ctk.CTkFrame):
         scroll.grid_columnconfigure(0, weight=1)
 
         content = ctk.CTkFrame(scroll, fg_color="transparent")
-        content.grid(row=0, column=0, sticky="ew",
-                     padx=t.space.xl, pady=(t.space.xxl, t.space.xl))
+        content.grid(
+            row=0,
+            column=0,
+            sticky="ew",
+            padx=t.space.xl,
+            pady=(t.space.xxl, t.space.xl),
+        )
         content.grid_columnconfigure(0, weight=1)
         self._content = content
         content.bind("<Configure>", self._on_content_configure)
 
         # Heading
         ctk.CTkLabel(
-            content, text="Settings",
+            content,
+            text="Settings",
             **style_label_heading(t),
         ).grid(row=0, column=0, sticky="w")
 
@@ -136,8 +139,7 @@ class SettingsTab(ctk.CTkFrame):
             content,
             text="Preferences are saved automatically as you change them.",
             **style_label_meta(t),
-        ).grid(row=1, column=0, sticky="w",
-               pady=(t.space.xs, t.space.xl))
+        ).grid(row=1, column=0, sticky="w", pady=(t.space.xs, t.space.xl))
 
         # Section builders — each returns the next available row index.
         next_row = 2
@@ -147,35 +149,36 @@ class SettingsTab(ctk.CTkFrame):
         next_row = self._build_discovery_section(content, next_row)
         next_row = self._build_about_section(content, next_row)
 
-    def _section_card(self, parent, row: int, title: str, subtitle: str = "") -> ctk.CTkFrame:
+    def _section_card(
+        self, parent, row: int, title: str, subtitle: str = ""
+    ) -> ctk.CTkFrame:
         """Render a section heading + card wrapper; return the card body frame."""
         t = self._theme
 
         ctk.CTkLabel(
-            parent, text=title,
+            parent,
+            text=title,
             **style_label_subheading(t),
-        ).grid(row=row, column=0, sticky="w",
-               pady=(0, t.space.xs))
+        ).grid(row=row, column=0, sticky="w", pady=(0, t.space.xs))
 
         if subtitle:
             ctk.CTkLabel(
-                parent, text=subtitle,
+                parent,
+                text=subtitle,
                 **style_label_meta(t),
-                wraplength=720, justify="left",
-            ).grid(row=row + 1, column=0, sticky="w",
-                   pady=(0, t.space.md))
+                wraplength=720,
+                justify="left",
+            ).grid(row=row + 1, column=0, sticky="w", pady=(0, t.space.md))
             card_row = row + 2
         else:
             card_row = row + 1
 
         card = ctk.CTkFrame(parent, **style_card_elevated(t))
-        card.grid(row=card_row, column=0, sticky="ew",
-                  pady=(0, t.space.xl))
+        card.grid(row=card_row, column=0, sticky="ew", pady=(0, t.space.xl))
         card.grid_columnconfigure(0, weight=1)
 
         body = ctk.CTkFrame(card, fg_color="transparent")
-        body.grid(row=0, column=0, sticky="ew",
-                  padx=t.space.xl, pady=t.space.xl)
+        body.grid(row=0, column=0, sticky="ew", padx=t.space.xl, pady=t.space.xl)
         body.grid_columnconfigure(0, weight=1)
         return body
 
@@ -184,90 +187,107 @@ class SettingsTab(ctk.CTkFrame):
     def _build_library_section(self, parent, row: int) -> int:
         t = self._theme
         body = self._section_card(
-            parent, row, "Library",
+            parent,
+            row,
+            "Library",
             "Where Crate Digger keeps your tracks on disk.",
         )
 
         # Vault root field + browse button
-        self._field_label(body, 0, "Vault root",
-                          "Final destination for every ingested track.")
+        self._field_label(
+            body, 0, "Vault root", "Final destination for every ingested track."
+        )
 
         vault_row = ctk.CTkFrame(body, fg_color="transparent")
         vault_row.grid(row=1, column=0, sticky="ew", pady=(0, t.space.lg))
         vault_row.grid_columnconfigure(0, weight=1)
 
         self._vault_entry = GlowEntry(
-            vault_row, t,
+            vault_row,
+            t,
             placeholder="~/Music/CrateDigger_Vault",
             show_clear_button=False,
             on_submit=lambda v: self._save_vault_root(v),
         )
-        self._vault_entry.grid(row=0, column=0, sticky="ew",
-                               padx=(0, t.space.sm))
+        self._vault_entry.grid(row=0, column=0, sticky="ew", padx=(0, t.space.sm))
         # Also debounce-save on every keystroke so the user doesn't
         # have to hit Enter to persist.
         self._vault_entry._entry.bind(
             "<KeyRelease>",
             lambda _e: self._debounce(
-                "vault_root", lambda: self._save_vault_root(self._vault_entry.get()),
+                "vault_root",
+                lambda: self._save_vault_root(self._vault_entry.get()),
             ),
             add="+",
         )
 
         ctk.CTkButton(
-            vault_row, text="Browse…",
+            vault_row,
+            text="Browse…",
             command=self._pick_vault_root,
             **style_secondary_button(t),
             width=100,
         ).grid(row=0, column=1, sticky="e")
 
         # Staging root (secondary)
-        self._field_label(body, 2, "Staging directory",
-                          "Scratch space for in-progress downloads. "
-                          "Can live on a fast SSD separate from the vault.")
+        self._field_label(
+            body,
+            2,
+            "Staging directory",
+            "Scratch space for in-progress downloads. "
+            "Can live on a fast SSD separate from the vault.",
+        )
 
         staging_row = ctk.CTkFrame(body, fg_color="transparent")
         staging_row.grid(row=3, column=0, sticky="ew")
         staging_row.grid_columnconfigure(0, weight=1)
 
         self._staging_entry = GlowEntry(
-            staging_row, t,
+            staging_row,
+            t,
             placeholder="~/.cratedigger/staging",
             show_clear_button=False,
             on_submit=lambda v: self._save_staging_root(v),
         )
-        self._staging_entry.grid(row=0, column=0, sticky="ew",
-                                 padx=(0, t.space.sm))
+        self._staging_entry.grid(row=0, column=0, sticky="ew", padx=(0, t.space.sm))
         self._staging_entry._entry.bind(
             "<KeyRelease>",
             lambda _e: self._debounce(
-                "staging_root", lambda: self._save_staging_root(self._staging_entry.get()),
+                "staging_root",
+                lambda: self._save_staging_root(self._staging_entry.get()),
             ),
             add="+",
         )
 
         ctk.CTkButton(
-            staging_row, text="Browse…",
+            staging_row,
+            text="Browse…",
             command=self._pick_staging_root,
             **style_secondary_button(t),
             width=100,
         ).grid(row=0, column=1, sticky="e")
 
-        return row + 3   # heading + subtitle + card row
+        return row + 3  # heading + subtitle + card row
 
     # ── Ingestion section ──
 
     def _build_ingestion_section(self, parent, row: int) -> int:
         t = self._theme
         body = self._section_card(
-            parent, row, "Ingestion",
+            parent,
+            row,
+            "Ingestion",
             "How Crate Digger processes queued jobs.",
         )
 
         # Concurrent workers dropdown
-        self._field_label(body, 0, "Concurrent workers",
-                          "Number of pipeline jobs running in parallel. "
-                          "More = faster queues; also more CPU and network.")
+        self._field_label(
+            body,
+            0,
+            "Concurrent workers",
+            "Number of pipeline jobs running in parallel. "
+            "More = faster queues; also more CPU and network.",
+        )
 
         _workers_wrapper = ctk.CTkFrame(
             body,
@@ -289,13 +309,16 @@ class SettingsTab(ctk.CTkFrame):
             dropdown_hover_color=t.surface.overlay,
             font=t.font.body,
             corner_radius=max(0, t.radius.md - 2),
-            width=156, height=38,
+            width=156,
+            height=38,
         )
         self._workers_dropdown.pack(padx=2, pady=2)
 
         # Default stems toggle
         self._field_label(
-            body, 2, "Default 'Split stems' to on",
+            body,
+            2,
+            "Default 'Split stems' to on",
             "When enabled, the Manual Rip and Digital Crate tabs start "
             "with stem separation turned on.",
         )
@@ -305,41 +328,48 @@ class SettingsTab(ctk.CTkFrame):
 
         self._stems_default_var = ctk.BooleanVar(value=False)
         self._stems_default_switch = ctk.CTkSwitch(
-            toggle_row, text="",
+            toggle_row,
+            text="",
             variable=self._stems_default_var,
-            onvalue=True, offvalue=False,
+            onvalue=True,
+            offvalue=False,
             command=lambda: self._save_stems_default(self._stems_default_var.get()),
             progress_color=t.accent.blue,
             button_color=t.text.primary,
             button_hover_color=t.text.primary,
             fg_color=t.surface.elevated,
-            width=40, height=22,
+            width=40,
+            height=22,
         )
         self._stems_default_switch.pack()
 
         # AI metadata toggle
         self._field_label(
-            body, 4, "AI metadata enrichment",
+            body,
+            4,
+            "AI metadata enrichment",
             "Use DeepSeek AI to extract the original artist name and title from "
             "YouTube video titles. Requires DEEPSEEK_API_KEY in your .env file. "
             "Disable if you prefer the raw upload metadata or have no API key.",
         )
 
         ai_toggle_row = ctk.CTkFrame(body, fg_color="transparent")
-        ai_toggle_row.grid(row=5, column=0, sticky="w",
-                           pady=(0, t.space.xs))
+        ai_toggle_row.grid(row=5, column=0, sticky="w", pady=(0, t.space.xs))
 
         self._ai_metadata_var = ctk.BooleanVar(value=True)
         self._ai_metadata_switch = ctk.CTkSwitch(
-            ai_toggle_row, text="",
+            ai_toggle_row,
+            text="",
             variable=self._ai_metadata_var,
-            onvalue=True, offvalue=False,
+            onvalue=True,
+            offvalue=False,
             command=lambda: self._save_ai_metadata(self._ai_metadata_var.get()),
             progress_color=t.accent.blue,
             button_color=t.text.primary,
             button_hover_color=t.text.primary,
             fg_color=t.surface.elevated,
-            width=40, height=22,
+            width=40,
+            height=22,
         )
         self._ai_metadata_switch.pack()
 
@@ -350,7 +380,9 @@ class SettingsTab(ctk.CTkFrame):
     def _build_stems_section(self, parent, row: int) -> int:
         t = self._theme
         body = self._section_card(
-            parent, row, "Stem separation",
+            parent,
+            row,
+            "Stem separation",
             "Demucs configuration. Higher-quality models take longer to run.",
         )
 
@@ -377,14 +409,19 @@ class SettingsTab(ctk.CTkFrame):
             dropdown_hover_color=t.surface.overlay,
             font=t.font.body,
             corner_radius=max(0, t.radius.md - 2),
-            width=436, height=38,
+            width=436,
+            height=38,
         )
         self._stem_model_dropdown.pack(padx=2, pady=2)
 
         # Device dropdown
-        self._field_label(body, 2, "Compute device",
-                          "'Auto' picks the best available. "
-                          "Apple Silicon users: MPS is significantly faster than CPU.")
+        self._field_label(
+            body,
+            2,
+            "Compute device",
+            "'Auto' picks the best available. "
+            "Apple Silicon users: MPS is significantly faster than CPU.",
+        )
 
         _device_wrapper = ctk.CTkFrame(
             body,
@@ -406,7 +443,8 @@ class SettingsTab(ctk.CTkFrame):
             dropdown_hover_color=t.surface.overlay,
             font=t.font.body,
             corner_radius=max(0, t.radius.md - 2),
-            width=256, height=38,
+            width=256,
+            height=38,
         )
         self._device_dropdown.pack(padx=2, pady=2)
 
@@ -417,7 +455,9 @@ class SettingsTab(ctk.CTkFrame):
     def _build_discovery_section(self, parent, row: int) -> int:
         t = self._theme
         body = self._section_card(
-            parent, row, "Discovery",
+            parent,
+            row,
+            "Discovery",
             "Discogs API token is required for the Digital Crate 'Dig' feature.",
         )
 
@@ -425,17 +465,16 @@ class SettingsTab(ctk.CTkFrame):
         self._field_label(body, 0, "Discogs personal access token")
 
         token_row = ctk.CTkFrame(body, fg_color="transparent")
-        token_row.grid(row=1, column=0, sticky="ew",
-                       pady=(0, t.space.sm))
+        token_row.grid(row=1, column=0, sticky="ew", pady=(0, t.space.sm))
         token_row.grid_columnconfigure(0, weight=1)
 
         self._token_entry = GlowEntry(
-            token_row, t,
+            token_row,
+            t,
             placeholder="Paste token (stored securely in OS keyring)",
             show_clear_button=True,
         )
-        self._token_entry.grid(row=0, column=0, sticky="ew",
-                               padx=(0, t.space.sm))
+        self._token_entry.grid(row=0, column=0, sticky="ew", padx=(0, t.space.sm))
 
         # Token entry saves on focus-out rather than keystroke — safer
         # for secrets (no partial tokens written during typing).
@@ -451,7 +490,8 @@ class SettingsTab(ctk.CTkFrame):
         )
 
         ctk.CTkButton(
-            token_row, text="Get token",
+            token_row,
+            text="Get token",
             command=lambda: webbrowser.open(
                 "https://www.discogs.com/settings/developers",
             ),
@@ -460,12 +500,13 @@ class SettingsTab(ctk.CTkFrame):
 
         # Status label — shows 'stored in keyring' / 'not set' / 'plaintext fallback'
         self._token_status_label = ctk.CTkLabel(
-            body, text="",
+            body,
+            text="",
             text_color=t.text.muted,
-            font=t.font.caption, anchor="w",
+            font=t.font.caption,
+            anchor="w",
         )
-        self._token_status_label.grid(row=2, column=0, sticky="w",
-                                      pady=(0, t.space.xs))
+        self._token_status_label.grid(row=2, column=0, sticky="w", pady=(0, t.space.xs))
 
         # Keyring-availability warning (shown only when unavailable)
         self._keyring_warning_label = ctk.CTkLabel(
@@ -477,7 +518,8 @@ class SettingsTab(ctk.CTkFrame):
             ),
             text_color=t.status.warning,
             font=t.font.caption,
-            anchor="w", justify="left",
+            anchor="w",
+            justify="left",
             wraplength=680,
         )
         self._keyring_warning_label.grid(row=3, column=0, sticky="w")
@@ -497,16 +539,20 @@ class SettingsTab(ctk.CTkFrame):
         ver_row.grid_columnconfigure(1, weight=1)
 
         ctk.CTkLabel(
-            ver_row, text="Version",
+            ver_row,
+            text="Version",
             text_color=t.text.secondary,
             font=t.font.caption,
-            width=140, anchor="w",
+            width=140,
+            anchor="w",
         ).grid(row=0, column=0, sticky="w")
 
         ctk.CTkLabel(
-            ver_row, text="0.1.0",
+            ver_row,
+            text="0.1.0",
             text_color=t.text.primary,
-            font=t.font.mono_body, anchor="w",
+            font=t.font.mono_body,
+            anchor="w",
         ).grid(row=0, column=1, sticky="w")
 
         # Row 1: log path
@@ -515,21 +561,26 @@ class SettingsTab(ctk.CTkFrame):
         log_row.grid_columnconfigure(1, weight=1)
 
         ctk.CTkLabel(
-            log_row, text="Log file",
+            log_row,
+            text="Log file",
             text_color=t.text.secondary,
             font=t.font.caption,
-            width=140, anchor="w",
+            width=140,
+            anchor="w",
         ).grid(row=0, column=0, sticky="w")
 
-        log_path = str(Path.home() / ".cratedigger" / "cratedigger.log")
+        log_path = str(self._config.data_dir / "cratedigger.log")
         ctk.CTkLabel(
-            log_row, text=log_path,
+            log_row,
+            text=log_path,
             text_color=t.text.primary,
-            font=t.font.mono_body, anchor="w",
+            font=t.font.mono_body,
+            anchor="w",
         ).grid(row=0, column=1, sticky="w")
 
         ctk.CTkButton(
-            log_row, text="Open log",
+            log_row,
+            text="Open log",
             command=lambda: self._open_path(log_path),
             **style_ghost_button(t),
         ).grid(row=0, column=2, sticky="e")
@@ -539,7 +590,8 @@ class SettingsTab(ctk.CTkFrame):
         reset_row.grid(row=2, column=0, sticky="ew", pady=(t.space.md, 0))
 
         ctk.CTkButton(
-            reset_row, text="Reset all settings to defaults",
+            reset_row,
+            text="Reset all settings to defaults",
             command=self._confirm_reset,
             **style_danger_button(t),
         ).pack(anchor="w")
@@ -601,7 +653,8 @@ class SettingsTab(ctk.CTkFrame):
             Path(value).expanduser().mkdir(parents=True, exist_ok=True)
         except OSError as e:
             self._ctx.publish_toast(
-                f"Could not create folder: {e}", kind="error",
+                f"Could not create folder: {e}",
+                kind="error",
             )
             return
 
@@ -618,7 +671,8 @@ class SettingsTab(ctk.CTkFrame):
             Path(value).expanduser().mkdir(parents=True, exist_ok=True)
         except OSError as e:
             self._ctx.publish_toast(
-                f"Could not create folder: {e}", kind="error",
+                f"Could not create folder: {e}",
+                kind="error",
             )
             return
         try:
@@ -695,12 +749,14 @@ class SettingsTab(ctk.CTkFrame):
         if value:
             self._token_entry.set("•" * 20)
             self._ctx.publish_toast(
-                "Discogs token saved.", kind="success",
+                "Discogs token saved.",
+                kind="success",
             )
         else:
             self._token_entry.set("")
             self._ctx.publish_toast(
-                "Discogs token cleared.", kind="info",
+                "Discogs token cleared.",
+                kind="info",
             )
         self._refresh_token_status(snap)
 
@@ -754,7 +810,9 @@ class SettingsTab(ctk.CTkFrame):
             )
             self._config.update_stems(model="htdemucs_ft", device="auto")
             self._config.update_downloader(
-                retries=5, fragment_retries=5, concurrent_fragments=4,
+                retries=5,
+                fragment_retries=5,
+                concurrent_fragments=4,
             )
             # Don't clear the Discogs token on reset — user would lose
             # it and have to re-enter. Reset is for *preferences*, not
@@ -765,7 +823,8 @@ class SettingsTab(ctk.CTkFrame):
 
         self._populate_from_config()
         self._ctx.publish_toast(
-            "Settings reset to defaults.", kind="success",
+            "Settings reset to defaults.",
+            kind="success",
         )
 
     # ── Token status text ──
@@ -783,8 +842,7 @@ class SettingsTab(ctk.CTkFrame):
                 )
             else:
                 self._token_status_label.configure(
-                    text="⚠  Token stored in plaintext fallback "
-                         "(keyring unavailable).",
+                    text="⚠  Token stored in plaintext fallback (keyring unavailable).",
                     text_color=t.status.warning,
                 )
         else:
@@ -796,26 +854,31 @@ class SettingsTab(ctk.CTkFrame):
     # ── Helpers ──
 
     def _field_label(
-        self, parent, row: int, title: str, description: str = "",
+        self,
+        parent,
+        row: int,
+        title: str,
+        description: str = "",
     ) -> None:
         """Render a form-field title + optional description block."""
         t = self._theme
 
         ctk.CTkLabel(
-            parent, text=title,
+            parent,
+            text=title,
             **style_label_body(t),
             anchor="w",
-        ).grid(row=row, column=0, sticky="w",
-               pady=(t.space.xs, 0))
+        ).grid(row=row, column=0, sticky="w", pady=(t.space.xs, 0))
 
         if description:
             ctk.CTkLabel(
-                parent, text=description,
+                parent,
+                text=description,
                 **style_label_meta(t),
-                wraplength=680, justify="left",
+                wraplength=680,
+                justify="left",
                 anchor="w",
-            ).grid(row=row, column=0, sticky="w",
-                   pady=(18, t.space.xs))
+            ).grid(row=row, column=0, sticky="w", pady=(18, t.space.xs))
             # The description shares the row; the preceding title gets
             # pinned to top via pady. For a cleaner layout we could move
             # title/desc into their own subframe, but this is adequate.
@@ -879,6 +942,7 @@ class SettingsTab(ctk.CTkFrame):
 
 # ─── Confirm dialog for destructive actions ──────────────────────────
 
+
 class _ResetConfirmDialog(ctk.CTkToplevel):
     """Themed, modal confirmation for Reset."""
 
@@ -905,8 +969,7 @@ class _ResetConfirmDialog(ctk.CTkToplevel):
         self.geometry(f"+{px + (pw - 440) // 2}+{py + (ph - 200) // 2}")
 
         frame = ctk.CTkFrame(self, fg_color="transparent")
-        frame.pack(fill="both", expand=True,
-                   padx=t.space.xl, pady=t.space.xl)
+        frame.pack(fill="both", expand=True, padx=t.space.xl, pady=t.space.xl)
 
         ctk.CTkLabel(
             frame,
@@ -921,7 +984,8 @@ class _ResetConfirmDialog(ctk.CTkToplevel):
             text="Your Discogs token and Vault contents will be preserved.",
             text_color=t.text.secondary,
             font=t.font.body,
-            anchor="w", justify="left",
+            anchor="w",
+            justify="left",
             wraplength=380,
         ).pack(anchor="w", pady=(t.space.sm, t.space.xl))
 
@@ -929,13 +993,15 @@ class _ResetConfirmDialog(ctk.CTkToplevel):
         buttons.pack(fill="x")
 
         ctk.CTkButton(
-            buttons, text="Cancel",
+            buttons,
+            text="Cancel",
             command=self._cancel,
             **style_secondary_button(t),
         ).pack(side="right", padx=(t.space.sm, 0))
 
         ctk.CTkButton(
-            buttons, text="Reset",
+            buttons,
+            text="Reset",
             command=self._confirm,
             **style_danger_button(t),
         ).pack(side="right")

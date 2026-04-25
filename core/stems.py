@@ -22,9 +22,11 @@ Default model: htdemucs_ft (fine-tuned, highest production quality).
 The separator accepts a per-call model override so the pipeline can
 honor the user's Settings-tab choice without instance rebuild.
 """
+
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import re
 import shutil
@@ -38,19 +40,20 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Optional, Union
 
-
 # ─── Models ──────────────────────────────────────────────────────────
+
 
 class StemModel(str, Enum):
     """
     Demucs models. Listed in quality-descending / speed-ascending order
     so the Settings dropdown can render them in a sensible default order.
     """
-    HTDEMUCS_FT = "htdemucs_ft"    # Fine-tuned, highest quality (DEFAULT)
-    HTDEMUCS = "htdemucs"          # Demucs v4 default
-    HTDEMUCS_6S = "htdemucs_6s"    # 6-stem variant (+piano, +guitar)
-    MDX_EXTRA = "mdx_extra"        # MDX architecture; ~2x faster on CPU
-    MDX_EXTRA_Q = "mdx_extra_q"    # Quantized MDX; smallest memory, fastest
+
+    HTDEMUCS_FT = "htdemucs_ft"  # Fine-tuned, highest quality (DEFAULT)
+    HTDEMUCS = "htdemucs"  # Demucs v4 default
+    HTDEMUCS_6S = "htdemucs_6s"  # 6-stem variant (+piano, +guitar)
+    MDX_EXTRA = "mdx_extra"  # MDX architecture; ~2x faster on CPU
+    MDX_EXTRA_Q = "mdx_extra_q"  # Quantized MDX; smallest memory, fastest
 
     @property
     def produces_6_stems(self) -> bool:
@@ -63,6 +66,7 @@ _CORE_STEMS: tuple[str, ...] = ("vocals", "drums", "bass", "other")
 
 
 # ─── Public types ────────────────────────────────────────────────────
+
 
 class SeparationStage(str, Enum):
     PREPARING = "preparing"
@@ -84,12 +88,13 @@ class SeparationProgress:
 class StemsResult:
     model_used: str
     device_used: str
-    stems: dict[str, Path]         # {'vocals': Path, 'drums': Path, ...}
+    stems: dict[str, Path]  # {'vocals': Path, 'drums': Path, ...}
     output_dir: Path
     elapsed_seconds: float
 
 
 # ─── Public exceptions ───────────────────────────────────────────────
+
 
 class StemSeparationError(Exception):
     """Base class for stem-separation failures."""
@@ -110,8 +115,30 @@ class StemSeparationCancelledError(StemSeparationError):
 # tqdm progress line, e.g. " 43%|████▎     | 86/200 [00:12<00:16,  6.92it/s]"
 _PROGRESS_RE = re.compile(r"\b(\d{1,3})%\|")
 
+# Injected as `python -c _DEMUCS_RUNNER` so we can patch torchaudio.save
+# before demucs imports it.  torchaudio 2.8+ delegates save() to torchcodec
+# whose native DLL may fail to load on CPU-only or certain Windows builds.
+# soundfile writes 32-bit float WAV with zero native-DLL dependencies.
+# sys.argv layout when called via `python -c CODE arg1 arg2 …`:
+#   sys.argv == ['-c', arg1, arg2, …]
+# demucs.separate.main() reads sys.argv[1:], so the args land correctly.
+_DEMUCS_RUNNER = (
+    "import sys, torchaudio\n"
+    "def _sf_save(uri, src, sample_rate, channels_first=True,\n"
+    "             format=None, encoding=None, bits_per_sample=None,\n"
+    "             compression=None, backend=None):\n"
+    "    import soundfile as sf\n"
+    "    wav = src.numpy()\n"
+    "    if channels_first:\n"
+    "        wav = wav.T\n"
+    "    sf.write(str(uri), wav, sample_rate, subtype='FLOAT')\n"
+    "torchaudio.save = _sf_save\n"
+    "from demucs.__main__ import main; main()\n"
+)
+
 
 # ─── The Separator ──────────────────────────────────────────────────
+
 
 class StemSeparator:
     """
@@ -123,6 +150,7 @@ class StemSeparator:
         self,
         model: Union[StemModel, str] = StemModel.HTDEMUCS_FT,
         device: str = "auto",
+        ffmpeg_path: Optional[str] = None,
         python_executable: Optional[str] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
@@ -131,36 +159,66 @@ class StemSeparator:
             model: Default model; can be overridden per `separate()` call.
             device: 'auto' | 'cpu' | 'cuda' | 'mps'. 'auto' prefers CUDA,
                 then MPS (Apple Silicon), then CPU.
+            ffmpeg_path: Optional ffmpeg binary path. When set, the stem
+                subprocess gets this path prepended to PATH so demucs can
+                reliably decode audio on systems without global ffmpeg.
             python_executable: Python interpreter used to run demucs. In
                 a PyInstaller freeze this will need to point at the
                 bundled torch-enabled interpreter; defaults to sys.executable.
         """
         self._model = StemModel(model) if isinstance(model, str) else model
         self._device_pref = device
+        self._ffmpeg_path = ffmpeg_path
         self._python = python_executable or sys.executable
         self._log = logger or logging.getLogger("cratedigger.stems")
 
     # ── Availability probe ──
 
     def probe_availability(self, timeout: float = 15.0) -> tuple[bool, str]:
+        """Verify stems runtime health. Delegates to probe_runtime."""
+        return self.probe_runtime(timeout=timeout)
+
+    def probe_runtime(self, timeout: float = 20.0) -> tuple[bool, str]:
         """
-        Verify demucs + torch are importable in the target interpreter.
-        Called by the Settings UI to decide whether to enable or gray
-        out the "Split Stems" toggle. Fast: just runs an import check.
+        Probe whether torch, torchaudio, and demucs are importable.
+
+        Returns:
+            (ok, details)
+            ok=True  -> details has version info.
+            ok=False -> details has first actionable failure line.
+
+        Intentionally does NOT import torchcodec — its DLL may fail to load
+        on machines without the right CUDA runtime even when demucs works
+        fine (demucs decodes audio via ffmpeg, not torchcodec).
         """
+        script = (
+            "import json, sys\n"
+            "import torch, torchaudio, demucs\n"
+            "print(json.dumps({"
+            "'torch': torch.__version__, "
+            "'torchaudio': torchaudio.__version__, "
+            "'demucs': demucs.__version__, "
+            "'python': sys.version.split()[0]"
+            "}))\n"
+        )
+
         try:
             result = subprocess.run(
-                [self._python, "-c",
-                 "import torch, demucs; "
-                 "print(torch.__version__, demucs.__version__)"],
-                capture_output=True, text=True, timeout=timeout,
+                [self._python, "-c", script],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+                env=self._subprocess_env(),
                 **self._subprocess_platform_kwargs(),
             )
         except (FileNotFoundError, subprocess.TimeoutExpired) as e:
             return False, f"Interpreter probe failed: {e}"
 
         if result.returncode != 0:
-            return False, (result.stderr or result.stdout or "unknown error").strip()
+            raw = (result.stderr or result.stdout or "unknown error").strip()
+            return False, self._summarize_subprocess_error(raw)
         return True, result.stdout.strip()
 
     # ── Core API ──
@@ -202,11 +260,18 @@ class StemSeparator:
         else:
             active_model = model
 
+        active_model = self._prepare_runtime(active_model, progress_callback)
+
         device = self._resolve_device()
 
         started = time.monotonic()
-        self._emit(progress_callback, SeparationStage.PREPARING, 0.0, 0.0,
-                   f"Preparing (model={active_model.value}, device={device})")
+        self._emit(
+            progress_callback,
+            SeparationStage.PREPARING,
+            0.0,
+            0.0,
+            f"Preparing (model={active_model.value}, device={device})",
+        )
 
         # Staging root isolates demucs's nested output structure from
         # the caller's flat `output_dir`. Cleaned up after files move.
@@ -216,13 +281,15 @@ class StemSeparator:
         staging_root.mkdir(parents=True, exist_ok=True)
 
         cmd = [
-            self._python, "-m", "demucs",
+            self._python,
+            "-c", _DEMUCS_RUNNER,
             "-n", active_model.value,
             "-d", device,
             "-o", str(staging_root),
             str(audio_path),
         ]
-        self._log.debug("demucs command: %s", " ".join(cmd))
+        self._log.debug("demucs args: -n %s -d %s -o %s %s",
+                        active_model.value, device, staging_root, audio_path)
 
         try:
             self._run_demucs(cmd, progress_callback, cancel_event, started)
@@ -239,12 +306,20 @@ class StemSeparator:
             )
 
             elapsed = time.monotonic() - started
-            self._emit(progress_callback, SeparationStage.COMPLETE, 100.0, elapsed,
-                       f"Separation complete ({elapsed:.1f}s)")
+            self._emit(
+                progress_callback,
+                SeparationStage.COMPLETE,
+                100.0,
+                elapsed,
+                f"Separation complete ({elapsed:.1f}s)",
+            )
 
             self._log.debug(
                 "Stems complete: model=%s device=%s stems=%s elapsed=%.1fs",
-                active_model.value, device, list(stems.keys()), elapsed,
+                active_model.value,
+                device,
+                list(stems.keys()),
+                elapsed,
             )
 
             return StemsResult(
@@ -265,6 +340,89 @@ class StemSeparator:
 
     # ── Subprocess management ──
 
+    def _prepare_runtime(
+        self,
+        model: StemModel,
+        progress_callback: Optional[Callable[[SeparationProgress], None]],
+    ) -> StemModel:
+        """
+        Validate required runtime deps before launching demucs.
+
+        - `mdx_extra_q` requires `diffq`; automatically fall back to
+          `mdx_extra` when unavailable.
+        - torchaudio 2.9+ relies on `torchcodec`; fail early with an
+          actionable error when the import/runtime is broken.
+        """
+        active_model = model
+
+        if active_model is StemModel.MDX_EXTRA_Q:
+            ok, _ = self._python_module_check("diffq")
+            if not ok:
+                self._log.warning(
+                    "Model %s requested but 'diffq' is unavailable; "
+                    "falling back to %s.",
+                    StemModel.MDX_EXTRA_Q.value,
+                    StemModel.MDX_EXTRA.value,
+                )
+                active_model = StemModel.MDX_EXTRA
+                self._emit(
+                    progress_callback,
+                    SeparationStage.PREPARING,
+                    0.0,
+                    0.0,
+                    "Model mdx_extra_q requires diffq; using mdx_extra instead",
+                )
+
+        # torchcodec is an optional torchaudio 2.9+ backend; demucs itself
+        # decodes audio via ffmpeg, so missing torchcodec is non-fatal.
+        ok, details = self._python_module_check("torchcodec")
+        if not ok:
+            self._log.debug(
+                "torchcodec not available (%s); demucs will use ffmpeg backend.",
+                details,
+            )
+
+        return active_model
+
+    def _python_module_check(self, module_name: str) -> tuple[bool, str]:
+        """Check if a module can be imported by the demucs interpreter."""
+        try:
+            result = subprocess.run(
+                [self._python, "-c", f"import {module_name}"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+                env=self._subprocess_env(),
+                **self._subprocess_platform_kwargs(),
+            )
+        except Exception as e:
+            return False, str(e)
+
+        if result.returncode == 0:
+            return True, ""
+
+        details = (result.stderr or result.stdout or "import failed").strip()
+        return False, self._summarize_subprocess_error(details)[:400]
+
+    @staticmethod
+    def _summarize_subprocess_error(raw: str) -> str:
+        """Return the most actionable line from a Python traceback-like output."""
+        if not raw:
+            return "unknown error"
+
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        if not lines:
+            return "unknown error"
+
+        for line in reversed(lines):
+            if line.startswith("Traceback"):
+                continue
+            if ":" in line:
+                return line
+        return lines[-1]
+
     def _run_demucs(
         self,
         cmd: list[str],
@@ -277,9 +435,16 @@ class StemSeparator:
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,       # merge for single-reader simplicity
+                stderr=subprocess.STDOUT,
                 text=True,
+                # Must match PYTHONUTF8=1 set in _subprocess_env() so the
+                # parent reads the same UTF-8 bytes demucs writes. Without
+                # this, Python defaults to CP1252 on Windows and crashes on
+                # any non-ASCII character in paths or tqdm progress output.
+                encoding="utf-8",
+                errors="replace",
                 bufsize=1,
+                env=self._subprocess_env(),
                 **self._subprocess_platform_kwargs(with_process_group=True),
             )
         except FileNotFoundError as e:
@@ -300,13 +465,15 @@ class StemSeparator:
                 output_q.put(None)
 
         drain_thread = threading.Thread(
-            target=_drain, name="demucs-drain", daemon=True,
+            target=_drain,
+            name="demucs-drain",
+            daemon=True,
         )
         drain_thread.start()
 
         last_reported_pct = 0.0
         saw_model_load = False
-        output_lines: list[str] = []   # full buffer for error reporting
+        output_lines: list[str] = []  # full buffer for error reporting
 
         while True:
             if cancel_event is not None and cancel_event.is_set():
@@ -339,9 +506,13 @@ class StemSeparator:
                 lowered = line.lower()
                 if "download" in lowered or "loading" in lowered:
                     saw_model_load = True
-                    self._emit(progress_callback, SeparationStage.LOADING_MODEL,
-                               5.0, time.monotonic() - started,
-                               "Loading model weights")
+                    self._emit(
+                        progress_callback,
+                        SeparationStage.LOADING_MODEL,
+                        5.0,
+                        time.monotonic() - started,
+                        "Loading model weights",
+                    )
 
             # Parse tqdm progress. Map demucs's 0-100 onto our 10-95
             # range so PREPARING/LOADING_MODEL/WRITING have visual room.
@@ -349,19 +520,21 @@ class StemSeparator:
             if m:
                 demucs_pct = int(m.group(1))
                 mapped = 10.0 + (demucs_pct / 100.0) * 85.0
-                if mapped > last_reported_pct + 0.5:    # throttle UI spam
+                if mapped > last_reported_pct + 0.5:  # throttle UI spam
                     last_reported_pct = mapped
-                    self._emit(progress_callback, SeparationStage.SEPARATING,
-                               mapped, time.monotonic() - started,
-                               f"Separating ({demucs_pct}%)")
+                    self._emit(
+                        progress_callback,
+                        SeparationStage.SEPARATING,
+                        mapped,
+                        time.monotonic() - started,
+                        f"Separating ({demucs_pct}%)",
+                    )
 
         drain_thread.join(timeout=2.0)
         rc = proc.wait()
         if rc != 0:
             tail = "\n".join(output_lines[-30:]) if output_lines else "(no output)"
-            raise StemSeparationFailedError(
-                f"demucs exited with code {rc}.\n{tail}"
-            )
+            raise StemSeparationFailedError(f"demucs exited with code {rc}.\n{tail}")
 
     def _terminate_process(self, proc: subprocess.Popen) -> None:
         """Graceful terminate → 3s grace → kill. Cross-platform."""
@@ -398,6 +571,30 @@ class StemSeparator:
             flags |= CREATE_NEW_PROCESS_GROUP
         return {"creationflags": flags}
 
+    def _subprocess_env(self) -> dict[str, str]:
+        """Environment for demucs subprocesses with optional ffmpeg wiring."""
+        env = dict(os.environ)
+
+        # Force UTF-8 I/O so demucs's print() calls don't crash on
+        # non-ASCII characters in file paths (e.g. Greek, CJK track names)
+        # when the Windows console codec is CP1252.
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+
+        if not self._ffmpeg_path:
+            return env
+
+        ffmpeg = Path(self._ffmpeg_path)
+        ffmpeg_dir = str(ffmpeg.parent)
+        existing = env.get("PATH", "")
+        if ffmpeg_dir and ffmpeg_dir not in existing.split(os.pathsep):
+            env["PATH"] = ffmpeg_dir + os.pathsep + existing
+
+        # Common env hints consumed by audio stacks and wrappers.
+        env.setdefault("FFMPEG_BINARY", str(ffmpeg))
+        env.setdefault("IMAGEIO_FFMPEG_EXE", str(ffmpeg))
+        return env
+
     # ── Output collection ──
 
     def _collect_stems(
@@ -411,8 +608,13 @@ class StemSeparator:
         started: float,
     ) -> dict[str, Path]:
         """Locate demucs output, verify completeness, move into final layout."""
-        self._emit(progress_callback, SeparationStage.WRITING, 97.0,
-                   time.monotonic() - started, "Finalizing stems")
+        self._emit(
+            progress_callback,
+            SeparationStage.WRITING,
+            97.0,
+            time.monotonic() - started,
+            "Finalizing stems",
+        )
 
         expected_dir = staging_root / model_name / source_stem
         if not expected_dir.exists():
@@ -444,7 +646,8 @@ class StemSeparator:
         if expect_6 and len(stems) < 6:
             self._log.warning(
                 "htdemucs_6s produced only %d stems (expected 6): %s",
-                len(stems), list(stems.keys()),
+                len(stems),
+                list(stems.keys()),
             )
         return stems
 
@@ -459,10 +662,10 @@ class StemSeparator:
             return self._device_pref
         try:
             import torch
+
             if torch.cuda.is_available():
                 return "cuda"
-            if (hasattr(torch.backends, "mps")
-                    and torch.backends.mps.is_available()):
+            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
                 return "mps"
         except ImportError:
             pass
@@ -479,9 +682,11 @@ class StemSeparator:
         message: str,
     ) -> None:
         if cb is not None:
-            cb(SeparationProgress(
-                stage=stage,
-                percent=percent,
-                elapsed_seconds=elapsed,
-                message=message,
-            ))
+            cb(
+                SeparationProgress(
+                    stage=stage,
+                    percent=percent,
+                    elapsed_seconds=elapsed,
+                    message=message,
+                )
+            )

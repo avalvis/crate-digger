@@ -22,11 +22,16 @@ soundfile>=0.12.1
 audioread>=3.0.1
 
 # ─── Stem Separation ─────────────────────────────────────────────────
-# Torch pinned to a known-good combo with demucs 4.x
-# Upper bound relaxed: Python 3.14 wheels start at torch 2.9
-torch>=2.9,<3.0
-torchaudio>=2.9,<3.0
-demucs>=4.0.1
+# Pinned exact stack for reproducible Python 3.14 runtime behavior.
+# Keep torch / torchaudio / torchcodec aligned.
+torch==2.11.0
+torchaudio==2.11.0
+# torchcodec intentionally excluded — demucs decodes audio via ffmpeg,
+# not torchcodec, so the broken DLL is irrelevant to stem separation.
+demucs==4.0.1
+# Optional: needed only for mdx_extra_q model quality preset.
+# If unavailable, the app now falls back to mdx_extra at runtime.
+# diffq>=0.2
 
 # ─── Persistence & Config ────────────────────────────────────────────
 # sqlite3 is stdlib; no dependency needed

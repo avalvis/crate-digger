@@ -31,28 +31,37 @@ rate that actually reflects time-to-completion:
 This module owns vault-path construction. No other module decides
 where a file lives on disk.
 """
+
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Optional
 
 from core.analyzer import (
-    AnalysisCancelledError, AnalysisResult, AudioAnalyzer,
+    AnalysisCancelledError,
+    AnalysisResult,
+    AudioAnalyzer,
 )
 from core.artwork import ArtworkError, ArtworkProcessor
 from core.database import TrackRecord, VaultDatabase
 from core.downloader import (
-    DownloadCancelledError, DownloadResult, Downloader,
+    DownloadCancelledError,
+    Downloader,
+    DownloadResult,
 )
 from core.metadata import MetadataWriter, TrackTags
 from core.stems import (
-    StemModel, StemSeparationCancelledError, StemSeparator, StemsResult,
+    StemModel,
+    StemSeparationCancelledError,
+    StemSeparator,
+    StemsResult,
 )
 from utils.paths import build_vault_track_dir, sanitize_filename_component
 
@@ -60,8 +69,26 @@ from utils.paths import build_vault_track_dir, sanitize_filename_component
 # Callable[[youtube_title, uploader], (artist, title)] — empty strings mean "no result".
 _AiEnricher = Callable[[str, str], tuple[str, str]]
 
+# Matches channel/label brand names — both standalone words ("Universal Music")
+# and compound forms ("GRMusic", "MusicFactory"). The suffix alternation
+# catches the common "XYZMusic" / "XYZRecords" / "XYZTV" channel naming pattern.
+_CHANNEL_NAME_HINT_RE = re.compile(
+    r"\b(music|records?|tv|channel|official|vevo|sounds?|media|entertainment|"
+    r"label|studio|network|group|digital|worldwide|global|nation)\b"
+    r"|(?:music|records?|tv|media|entertainment|vevo|sounds?|label)$",
+    re.IGNORECASE,
+)
+
+# Bracketed suffixes in video titles that are generally not part of the song title.
+_TITLE_NOISE_SUFFIX_RE = re.compile(
+    r"\s*(?:\(|\[|\{).{0,120}(?:official|video|audio|lyrics?|live|remix|"
+    r"slowed|reverb|sped\s*up|nightcore|prod\.|clip|visualizer).{0,120}(?:\)|\]|\})\s*$",
+    re.IGNORECASE,
+)
+
 
 # ─── Public types ────────────────────────────────────────────────────
+
 
 class PipelineStage(str, Enum):
     PENDING = "pending"
@@ -80,9 +107,10 @@ class PipelineStage(str, Enum):
 @dataclass(slots=True)
 class PipelineProgress:
     """One event per pipeline update. UI-ready."""
+
     stage: PipelineStage
-    overall_percent: float         # 0..100 weighted by stage cost
-    stage_percent: float           # 0..100 within current stage
+    overall_percent: float  # 0..100 weighted by stage cost
+    stage_percent: float  # 0..100 within current stage
     message: str = ""
     # Optional enrichment surfaced as it becomes known
     display_name: Optional[str] = None
@@ -94,9 +122,14 @@ class PipelineProgress:
 @dataclass(slots=True, frozen=True)
 class PipelineRequest:
     """Everything needed to run the pipeline for one URL."""
+
     source_url: str
     enable_stems: bool = False
     stem_model: StemModel = StemModel.HTDEMUCS_FT
+    # Per-download AI metadata flag. When True (and the pipeline was
+    # constructed with an ai_enricher), DeepSeek is called to extract
+    # the original artist/title from the YouTube video title.
+    use_ai_metadata: bool = True
     # Optional metadata hints from upstream (e.g. Discogs Dig provides
     # genre/year that YouTube alone won't surface).
     hint_genre: Optional[str] = None
@@ -110,6 +143,7 @@ class PipelineRequest:
 @dataclass(slots=True, frozen=True)
 class PipelineResult:
     """Final outcome of a successful run."""
+
     track_id: int
     final_audio_path: Path
     stems_path: Optional[Path]
@@ -119,6 +153,7 @@ class PipelineResult:
 
 
 # ─── Exceptions ──────────────────────────────────────────────────────
+
 
 class PipelineError(Exception):
     """Base class for pipeline failures."""
@@ -135,26 +170,27 @@ class PipelineCancelledError(PipelineError):
 # redistributed proportionally across the remaining stages.
 
 _WEIGHTS_NO_STEMS = {
-    PipelineStage.DOWNLOADING:      40,
-    PipelineStage.ANALYZING:        40,
-    PipelineStage.FETCHING_ARTWORK:  6,
-    PipelineStage.TAGGING:           4,
-    PipelineStage.RELOCATING:        6,
-    PipelineStage.INDEXING:          4,
+    PipelineStage.DOWNLOADING: 40,
+    PipelineStage.ANALYZING: 40,
+    PipelineStage.FETCHING_ARTWORK: 6,
+    PipelineStage.TAGGING: 4,
+    PipelineStage.RELOCATING: 6,
+    PipelineStage.INDEXING: 4,
 }
 
 _WEIGHTS_WITH_STEMS = {
-    PipelineStage.DOWNLOADING:       20,
-    PipelineStage.ANALYZING:         20,
-    PipelineStage.FETCHING_ARTWORK:   3,
-    PipelineStage.TAGGING:            2,
-    PipelineStage.RELOCATING:         3,
-    PipelineStage.INDEXING:           2,
-    PipelineStage.SEPARATING_STEMS:  50,
+    PipelineStage.DOWNLOADING: 20,
+    PipelineStage.ANALYZING: 20,
+    PipelineStage.FETCHING_ARTWORK: 3,
+    PipelineStage.TAGGING: 2,
+    PipelineStage.RELOCATING: 3,
+    PipelineStage.INDEXING: 2,
+    PipelineStage.SEPARATING_STEMS: 50,
 }
 
 
 # ─── The Pipeline ────────────────────────────────────────────────────
+
 
 class IngestionPipeline:
     """
@@ -202,8 +238,7 @@ class IngestionPipeline:
         Run the full pipeline for one URL. On any failure, staging
         artifacts are cleaned up and a PipelineError is raised.
         """
-        weights = (_WEIGHTS_WITH_STEMS if request.enable_stems
-                   else _WEIGHTS_NO_STEMS)
+        weights = _WEIGHTS_WITH_STEMS if request.enable_stems else _WEIGHTS_NO_STEMS
         progress = _ProgressTracker(weights, progress_callback)
         started = time.monotonic()
 
@@ -217,7 +252,10 @@ class IngestionPipeline:
             # ── 1. DOWNLOAD ──
             progress.enter(PipelineStage.DOWNLOADING, "Downloading audio")
             download = self._run_download(
-                request, job_staging, progress, cancel_event,
+                request,
+                job_staging,
+                progress,
+                cancel_event,
             )
             progress.display_name = (
                 f"{(download.artist or download.uploader or 'Unknown')} — "
@@ -229,7 +267,9 @@ class IngestionPipeline:
             self._check_cancel(cancel_event)
             progress.enter(PipelineStage.ANALYZING, "Analyzing BPM + key")
             analysis = self._run_analysis(
-                download.audio_path, progress, cancel_event,
+                download.audio_path,
+                progress,
+                cancel_event,
             )
             progress.bpm = analysis.bpm
             progress.musical_key = analysis.musical_key
@@ -250,14 +290,19 @@ class IngestionPipeline:
             self._check_cancel(cancel_event)
             progress.enter(PipelineStage.TAGGING, "Writing metadata")
             resolved_artist, resolved_title = self._resolve_names(
-                download, request,
+                download,
+                request,
             )
             # Refresh display_name now that we have the resolved (possibly AI-
             # enriched) names — earlier we used the raw download fields.
             progress.display_name = f"{resolved_artist} — {resolved_title}"
             tags = self._build_tags(
-                download, analysis, request, artwork_bytes,
-                resolved_artist, resolved_title,
+                download,
+                analysis,
+                request,
+                artwork_bytes,
+                resolved_artist,
+                resolved_title,
             )
             self._meta.apply(download.audio_path, tags)
             progress.emit(100.0, "Metadata embedded")
@@ -279,8 +324,12 @@ class IngestionPipeline:
             self._check_cancel(cancel_event)
             progress.enter(PipelineStage.INDEXING, "Indexing in vault database")
             track_id = self._index_track(
-                final_audio_path, download, analysis, request,
-                resolved_artist, resolved_title,
+                final_audio_path,
+                download,
+                analysis,
+                request,
+                resolved_artist,
+                resolved_title,
             )
             progress.emit(100.0, f"Indexed (id={track_id})")
 
@@ -295,8 +344,11 @@ class IngestionPipeline:
                 stems_dir = track_dir / "stems"
                 stems_dir.mkdir(parents=True, exist_ok=True)
                 self._run_stems(
-                    final_audio_path, stems_dir, request.stem_model,
-                    progress, cancel_event,
+                    final_audio_path,
+                    stems_dir,
+                    request.stem_model,
+                    progress,
+                    cancel_event,
                 )
 
                 # Update index row with stems path + flag
@@ -308,14 +360,15 @@ class IngestionPipeline:
 
             # ── COMPLETE ──
             progress.complete(
-                f"Ready: {progress.display_name}"
-                if progress.display_name else "Ready"
+                f"Ready: {progress.display_name}" if progress.display_name else "Ready"
             )
 
             elapsed = time.monotonic() - started
             self._log.info(
                 "Pipeline complete for %s in %.1fs (track_id=%d, stems=%s)",
-                request.source_url, elapsed, track_id,
+                request.source_url,
+                elapsed,
+                track_id,
                 bool(request.enable_stems),
             )
             return PipelineResult(
@@ -355,7 +408,8 @@ class IngestionPipeline:
 
         try:
             return self._dl.download(
-                req.source_url, staging,
+                req.source_url,
+                staging,
                 progress_callback=on_dl_progress,
                 cancel_event=cancel_event,
             )
@@ -385,7 +439,9 @@ class IngestionPipeline:
             raise PipelineError(f"Analysis failed: {e}") from e
 
     def _run_artwork(
-        self, download: DownloadResult, progress: "_ProgressTracker",
+        self,
+        download: DownloadResult,
+        progress: "_ProgressTracker",
     ) -> Optional[bytes]:
         """Artwork is best-effort — missing cover never fails the pipeline."""
         if not download.thumbnail_url:
@@ -415,7 +471,8 @@ class IngestionPipeline:
 
         try:
             return self._stems.separate(
-                audio_path, output_dir,
+                audio_path,
+                output_dir,
                 progress_callback=on_s_progress,
                 cancel_event=cancel_event,
                 model=model,
@@ -437,32 +494,40 @@ class IngestionPipeline:
         """
         Pick the best Artist and Title candidates.
 
-        Priority:
-          1. YouTube Music structured fields (download.artist / download.track)
-             — these are already accurate; no AI needed.
-          2. AI enrichment via DeepSeek: parse artist/title from the raw video
-             title + uploader name when structured fields are absent.
-          3. Heuristic fallback: uploader name as artist, raw video title as title.
+                Priority:
+                    1. YouTube Music structured fields (download.artist / download.track).
+                    2. Deterministic title parsing (e.g. "Artist - Title").
+                    3. AI enrichment (optional) when deterministic parse is ambiguous.
+                    4. Conservative fallback that avoids channel-brand artist names.
         """
         # Structured fields present (YouTube Music, official uploads with tags).
         if download.artist and download.track:
             artist = download.artist.strip()
             title = download.track.strip()
             if artist.endswith(" - Topic"):
-                artist = artist[:-len(" - Topic")].strip()
+                artist = artist[: -len(" - Topic")].strip()
+            return artist or "Unknown Artist", title or "Unknown Title"
+
+        # Strong deterministic parse from raw title before paying for AI.
+        parsed = self._parse_artist_title_from_video_title(download.title or "")
+        if parsed is not None:
+            artist, title = parsed
             return artist or "Unknown Artist", title or "Unknown Title"
 
         # Try AI enrichment for untagged uploads (unofficial re-uploads, etc.)
-        if self._ai_enricher is not None:
+        if self._ai_enricher is not None and request.use_ai_metadata:
             raw_title = download.title or ""
             uploader = download.uploader or ""
             ai_artist, ai_title = self._ai_enricher(raw_title, uploader)
             if ai_artist or ai_title:
                 artist = (ai_artist or download.uploader or "Unknown Artist").strip()
-                title  = (ai_title  or raw_title or "Unknown Title").strip()
+                title = (ai_title or raw_title or "Unknown Title").strip()
                 self._log.info(
                     "AI metadata: '%s' + uploader '%s' → artist='%s' title='%s'",
-                    raw_title, uploader, artist, title,
+                    raw_title,
+                    uploader,
+                    artist,
+                    title,
                 )
                 return artist or "Unknown Artist", title or "Unknown Title"
             self._log.debug(
@@ -471,11 +536,75 @@ class IngestionPipeline:
             )
 
         # Heuristic fallback: prefer any partial structured fields, then uploader.
-        artist = (download.artist or download.uploader or "Unknown Artist").strip()
-        title  = (download.track  or download.title  or "Unknown Title").strip()
+        title = self._clean_video_title(
+            download.track or download.title or "Unknown Title"
+        )
+        artist = (download.artist or "").strip()
+        if not artist:
+            uploader = (download.uploader or "").strip()
+            # Avoid obvious channel-brand names as the canonical artist.
+            if uploader and not _CHANNEL_NAME_HINT_RE.search(uploader):
+                artist = uploader
+        if not artist:
+            artist = "Unknown Artist"
         if artist.endswith(" - Topic"):
-            artist = artist[:-len(" - Topic")].strip()
+            artist = artist[: -len(" - Topic")].strip()
         return artist or "Unknown Artist", title or "Unknown Title"
+
+    def _parse_artist_title_from_video_title(
+        self, raw_title: str
+    ) -> Optional[tuple[str, str]]:
+        """
+        Parse common title forms like "Artist - Title" or "Artist: Title".
+        Returns None when ambiguous.
+        """
+        title = self._clean_video_title(raw_title)
+        if not title:
+            return None
+
+        for sep in (" - ", " – ", " — ", ": ", " | "):
+            if sep not in title:
+                continue
+            left, right = title.split(sep, 1)
+            left = left.strip(" -–—:|\t")
+            right = right.strip(" -–—:|\t")
+            # Clean any pipe-brand residue from the title half.
+            pipe_m = re.search(r"\s*\|\s*(.+)$", right)
+            if pipe_m and _CHANNEL_NAME_HINT_RE.search(pipe_m.group(1)):
+                right = right[: pipe_m.start()].strip()
+            if not left or not right:
+                continue
+            # Guard against parsing noisy prefixes like "Official Video - ...".
+            if _CHANNEL_NAME_HINT_RE.search(left) and len(left) <= 20:
+                continue
+            if len(left) > 90 or len(right) > 160:
+                continue
+            return left, right
+        return None
+
+    def _clean_video_title(self, title: str) -> str:
+        """Strip common upload noise while preserving the core song title."""
+        cleaned = (title or "").strip()
+        if not cleaned:
+            return ""
+
+        # Remove repeated bracketed suffixes from the end.
+        for _ in range(3):
+            next_cleaned = _TITLE_NOISE_SUFFIX_RE.sub("", cleaned).strip()
+            if next_cleaned == cleaned:
+                break
+            cleaned = next_cleaned
+
+        # Strip pipe-separated channel branding only when what follows the
+        # pipe looks like a label/channel name. Checked against the same
+        # brand-hint regex used for uploader filtering. This avoids nuking
+        # "Artist | Title" formats while catching "Song - Title | GRMusic".
+        pipe_match = re.search(r"\s*\|\s*(.+)$", cleaned)
+        if pipe_match and _CHANNEL_NAME_HINT_RE.search(pipe_match.group(1)):
+            cleaned = cleaned[: pipe_match.start()].strip()
+
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned.strip(" -–—|\t")
 
     def _build_tags(
         self,
@@ -523,8 +652,11 @@ class IngestionPipeline:
         """
         track_dir = build_vault_track_dir(
             self._vault_root,
-            genre=genre, bpm=bpm, camelot_key=camelot_key,
-            artist=artist, title=title,
+            genre=genre,
+            bpm=bpm,
+            camelot_key=camelot_key,
+            artist=artist,
+            title=title,
         )
 
         # Collision avoidance at the directory level
@@ -534,15 +666,14 @@ class IngestionPipeline:
             track_dir = base_dir.with_name(f"{base_dir.name} ({n})")
             n += 1
             if n > 999:
-                raise PipelineError(
-                    f"Too many collisions at {base_dir.parent}"
-                )
+                raise PipelineError(f"Too many collisions at {base_dir.parent}")
 
         track_dir.mkdir(parents=True, exist_ok=True)
 
         # Final filename mirrors the track_dir name for easy browsing
         filename = sanitize_filename_component(
-            f"{artist} - {title}", max_length=180,
+            f"{artist} - {title}",
+            max_length=180,
         )
         dest = track_dir / f"{filename}.m4a"
 
@@ -573,9 +704,7 @@ class IngestionPipeline:
     ) -> int:
         file_size = final_path.stat().st_size
         platform = (
-            request.source_platform_override
-            or download.source_platform
-            or "manual"
+            request.source_platform_override or download.source_platform or "manual"
         )
         if request.hint_discogs_master_id:
             platform = "discogs_dig"
@@ -606,7 +735,8 @@ class IngestionPipeline:
         # Link discovery_history row back to the track, if applicable
         if request.hint_discogs_master_id:
             self._db.mark_discovery_queued(
-                request.hint_discogs_master_id, track_id,
+                request.hint_discogs_master_id,
+                track_id,
             )
         return track_id
 
@@ -620,6 +750,7 @@ class IngestionPipeline:
 
 # ─── Weighted-progress tracker ───────────────────────────────────────
 
+
 @dataclass(slots=True)
 class _ProgressTracker:
     """
@@ -627,6 +758,7 @@ class _ProgressTracker:
     Also carries enrichment (display_name, bpm, key) so every progress event
     emitted to the UI includes the freshest info.
     """
+
     weights: dict[PipelineStage, int]
     callback: Optional[Callable[[PipelineProgress], None]]
     current_stage: PipelineStage = PipelineStage.PENDING
@@ -653,8 +785,7 @@ class _ProgressTracker:
         if self.current_stage in self.weights:
             self.completed_weight += self.weights[self.current_stage]
         self.current_stage = PipelineStage.COMPLETE
-        self._send(stage_percent=100.0, message=message,
-                   force_overall=100.0)
+        self._send(stage_percent=100.0, message=message, force_overall=100.0)
 
     def failed(self, message: str) -> None:
         self.current_stage = PipelineStage.FAILED
@@ -665,7 +796,9 @@ class _ProgressTracker:
         self._send(stage_percent=0.0, message=message)
 
     def _send(
-        self, stage_percent: float, message: str,
+        self,
+        stage_percent: float,
+        message: str,
         force_overall: Optional[float] = None,
     ) -> None:
         if self.callback is None:
@@ -678,13 +811,15 @@ class _ProgressTracker:
             overall = self.completed_weight + (stage_percent / 100.0) * stage_weight
             overall = max(0.0, min(99.9, overall))
 
-        self.callback(PipelineProgress(
-            stage=self.current_stage,
-            overall_percent=overall,
-            stage_percent=max(0.0, min(100.0, stage_percent)),
-            message=message,
-            display_name=self.display_name,
-            bpm=self.bpm,
-            musical_key=self.musical_key,
-            camelot_key=self.camelot_key,
-        ))
+        self.callback(
+            PipelineProgress(
+                stage=self.current_stage,
+                overall_percent=overall,
+                stage_percent=max(0.0, min(100.0, stage_percent)),
+                message=message,
+                display_name=self.display_name,
+                bpm=self.bpm,
+                musical_key=self.musical_key,
+                camelot_key=self.camelot_key,
+            )
+        )

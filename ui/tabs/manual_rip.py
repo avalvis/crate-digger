@@ -35,6 +35,7 @@ destroyed until the user clicks "Dismiss" or "Clear completed".
 
 from __future__ import annotations
 
+import os
 import re
 import webbrowser
 from pathlib import Path
@@ -258,6 +259,56 @@ class ManualRipTab(ctk.CTkFrame):
         )
         self._stems_meta_label.pack(anchor="w")
 
+        # AI metadata toggle
+        snap = self._ctx.config.snapshot()
+        has_ai_key = bool(os.environ.get("DEEPSEEK_API_KEY", "").strip())
+        ai_enabled_in_config = snap.config.general.use_ai_metadata
+        # Default on only when the user has enabled it AND the key is present.
+        initial_ai = ai_enabled_in_config and has_ai_key
+
+        ai_toggle_row = ctk.CTkFrame(inner, fg_color="transparent")
+        ai_toggle_row.grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=(t.space.md, 0)
+        )
+
+        self._ai_var = ctk.BooleanVar(value=bool(initial_ai))
+        self._ai_switch = ctk.CTkSwitch(
+            ai_toggle_row,
+            text="",
+            variable=self._ai_var,
+            onvalue=True,
+            offvalue=False,
+            progress_color=t.accent.blue,
+            button_color=t.text.primary,
+            button_hover_color=t.text.primary,
+            fg_color=t.surface.elevated,
+            width=40,
+            height=22,
+            state="normal" if has_ai_key else "disabled",
+        )
+        self._ai_switch.pack(side="left", padx=(0, t.space.md))
+
+        ai_labels = ctk.CTkFrame(ai_toggle_row, fg_color="transparent")
+        ai_labels.pack(side="left")
+
+        ctk.CTkLabel(
+            ai_labels,
+            text="AI metadata enrichment",
+            **style_label_body(t),
+        ).pack(anchor="w")
+
+        ai_meta_text = (
+            "Uses DeepSeek AI to identify the original artist and title "
+            "from YouTube video titles."
+            if has_ai_key
+            else "Requires DEEPSEEK_API_KEY in your .env file to activate."
+        )
+        ctk.CTkLabel(
+            ai_labels,
+            text=ai_meta_text,
+            **style_label_meta(t),
+        ).pack(anchor="w")
+
     def _build_queue_drawer(self, parent, row: int) -> None:
         t = self._theme
 
@@ -348,6 +399,7 @@ class ManualRipTab(ctk.CTkFrame):
             source_url=value,
             enable_stems=bool(self._stems_var.get()),
             stem_model=stem_model,
+            use_ai_metadata=bool(self._ai_var.get()),
         )
 
         try:

@@ -26,6 +26,7 @@ Zero ties to ui/ or mutagen. Takes a path, returns an AnalysisResult.
 from __future__ import annotations
 
 import logging
+import subprocess
 import threading
 from dataclasses import dataclass
 from enum import Enum
@@ -33,6 +34,11 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import numpy as np
+
+# Formats that soundfile (libsndfile) cannot decode; we pipe these through
+# ffmpeg to raw PCM before handing to librosa. Without this, librosa falls
+# back to the deprecated audioread backend.
+_FFMPEG_DECODE_EXTS = frozenset({".m4a", ".mp3", ".aac", ".ogg", ".opus", ".wma"})
 
 
 # ─── Public types ────────────────────────────────────────────────────
@@ -130,6 +136,7 @@ class AudioAnalyzer:
         sample_rate: int = 22050,
         hpss_margin: Optional[float] = 4.0,
         chroma_bins_per_octave: int = 36,
+        ffmpeg_path: Optional[str] = None,
     ) -> None:
         """
         Args:
@@ -144,11 +151,16 @@ class AudioAnalyzer:
             chroma_bins_per_octave: CQT resolution. 36 (three bins per
                 semitone) is markedly more accurate than 12 for key
                 detection at negligible extra cost.
+            ffmpeg_path: Path to the ffmpeg binary. When provided, formats
+                that soundfile can't decode natively (e.g. .m4a, .mp3) are
+                piped through ffmpeg to raw PCM before librosa sees them.
+                This avoids the deprecated audioread fallback.
         """
         self._log = logger or logging.getLogger("cratedigger.analyzer")
         self._sr = int(sample_rate)
         self._hpss_margin = hpss_margin
         self._chroma_bpo = int(chroma_bins_per_octave)
+        self._ffmpeg_path = ffmpeg_path
 
         # Pre-compute the 24×12 profile matrix. Row layout:
         #   rows  0..11  → major key rooted at pitch class i
@@ -189,7 +201,9 @@ class AudioAnalyzer:
         self._emit(progress_callback, AnalysisStage.LOADING, 0.0, "Loading audio")
 
         try:
-            y, sr = librosa.load(str(path), sr=self._sr, mono=True)
+            y, sr = self._load_audio(path)
+        except AnalysisLoadError:
+            raise
         except Exception as e:
             raise AnalysisLoadError(f"Could not load audio: {e}") from e
 
@@ -341,6 +355,46 @@ class AudioAnalyzer:
         return key_name, camelot, confidence
 
     # ── Utilities ──
+
+    def _load_audio(self, path: Path) -> tuple[np.ndarray, int]:
+        """
+        Load audio as float32 mono at self._sr.
+
+        Uses ffmpeg → raw PCM pipe for compressed formats (.m4a, .mp3,
+        etc.) when an ffmpeg binary is available — this avoids librosa's
+        deprecated audioread fallback and is faster. Falls back to
+        librosa.load for WAV/FLAC or when ffmpeg is not configured.
+        """
+        import librosa
+
+        use_ffmpeg = (
+            self._ffmpeg_path is not None
+            and path.suffix.lower() in _FFMPEG_DECODE_EXTS
+        )
+        if use_ffmpeg:
+            cmd = [
+                self._ffmpeg_path,
+                "-i", str(path),
+                "-f", "f32le",      # raw 32-bit float LE
+                "-ac", "1",         # mono
+                "-ar", str(self._sr),
+                "-",                # stdout
+            ]
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    timeout=120,
+                )
+                if result.returncode == 0 and result.stdout:
+                    y = np.frombuffer(result.stdout, dtype=np.float32).copy()
+                    if y.size > 0:
+                        return y, self._sr
+            except Exception as exc:
+                self._log.debug("ffmpeg decode failed (%s); falling back to librosa", exc)
+
+        y, sr = librosa.load(str(path), sr=self._sr, mono=True)
+        return y, sr
 
     @staticmethod
     def _check_cancel(event: Optional[threading.Event]) -> None:
