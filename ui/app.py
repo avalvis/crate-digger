@@ -34,6 +34,7 @@ from utils.config import ConfigManager
 if TYPE_CHECKING:
     from core.discovery import DiscoveryEngine
     from core.exporter import MPCExporter
+    from core.pipeline import IngestionPipeline
 
 
 # ─── Nav configuration ──────────────────────────────────────────────
@@ -60,6 +61,7 @@ class AppContext:
     discovery: Optional["DiscoveryEngine"]
     exporter: Optional["MPCExporter"]
     logger: logging.Logger
+    pipeline: Optional["IngestionPipeline"] = None  # for live enricher updates
 
     _toast_publisher: Optional[Callable[[str, ToastKind], None]] = None
     _tab_switcher: Optional[Callable[[str], None]] = None
@@ -98,6 +100,7 @@ class CrateDiggerApp:
         queue_manager: QueueManager,
         database: VaultDatabase,
         config: ConfigManager,
+        pipeline: Optional["IngestionPipeline"] = None,
         discovery: Optional["DiscoveryEngine"] = None,
         exporter: Optional["MPCExporter"] = None,
         logger: Optional[logging.Logger] = None,
@@ -106,6 +109,7 @@ class CrateDiggerApp:
         self._queue = queue_manager
         self._db = database
         self._config = config
+        self._pipeline = pipeline
         self._discovery = discovery
         self._exporter = exporter
 
@@ -134,6 +138,7 @@ class CrateDiggerApp:
             discovery=self._discovery,
             exporter=self._exporter,
             logger=self._log.getChild("tabs"),
+            pipeline=self._pipeline,
         )
         self._context._toast_publisher = self._publish_toast
         self._context._tab_switcher = self._show_tab

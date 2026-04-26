@@ -230,6 +230,10 @@ class IngestionPipeline:
 
     # ── Public API ──
 
+    def update_ai_enricher(self, enricher: Optional[_AiEnricher]) -> None:
+        """Called by Settings when the DeepSeek key is saved or cleared."""
+        self._ai_enricher = enricher
+
     def run(
         self,
         request: PipelineRequest,
@@ -494,57 +498,58 @@ class IngestionPipeline:
         request: PipelineRequest,
     ) -> tuple[str, str]:
         """
-        Pick the best Artist and Title candidates.
+        Resolve the best artist + title for this track.
 
-                Priority:
-                    1. YouTube Music structured fields (download.artist / download.track).
-                    2. Deterministic title parsing (e.g. "Artist - Title").
-                    3. AI enrichment (optional) when deterministic parse is ambiguous.
-                    4. Conservative fallback that avoids channel-brand artist names.
+        When AI is ON (use_ai_metadata=True and enricher present):
+            AI is called first. If it returns a result, that wins.
+            Falls through to the heuristic chain only if AI returns empty.
+
+        When AI is OFF:
+            1. YouTube Music structured fields (artist / track atoms).
+            2. Deterministic "Artist - Title" parse from the video title.
+            3. Uploader-based conservative fallback.
         """
-        # Structured fields present (YouTube Music, official uploads with tags).
+        raw_title = download.title or ""
+        uploader  = download.uploader or ""
+
+        # ── AI path (explicit user preference — tried first) ──
+        if self._ai_enricher is not None and request.use_ai_metadata:
+            ai_artist, ai_title = self._ai_enricher(raw_title, uploader)
+            if ai_artist or ai_title:
+                artist = (ai_artist or download.artist or uploader or "Unknown Artist").strip()
+                title  = (ai_title  or raw_title or "Unknown Title").strip()
+                if artist.endswith(" - Topic"):
+                    artist = artist[: -len(" - Topic")].strip()
+                self._log.info(
+                    "AI metadata: %r → artist=%r title=%r",
+                    raw_title, artist, title,
+                )
+                return artist or "Unknown Artist", title or "Unknown Title"
+            self._log.debug(
+                "AI returned no result for %r; falling back to heuristic.",
+                raw_title,
+            )
+
+        # ── Heuristic path ──
+
+        # Structured fields (YouTube Music official uploads).
         if download.artist and download.track:
             artist = download.artist.strip()
-            title = download.track.strip()
+            title  = download.track.strip()
             if artist.endswith(" - Topic"):
                 artist = artist[: -len(" - Topic")].strip()
             return artist or "Unknown Artist", title or "Unknown Title"
 
-        # Strong deterministic parse from raw title before paying for AI.
-        parsed = self._parse_artist_title_from_video_title(download.title or "")
+        # Deterministic "Artist - Title" parse from the raw video title.
+        parsed = self._parse_artist_title_from_video_title(raw_title)
         if parsed is not None:
             artist, title = parsed
             return artist or "Unknown Artist", title or "Unknown Title"
 
-        # Try AI enrichment for untagged uploads (unofficial re-uploads, etc.)
-        if self._ai_enricher is not None and request.use_ai_metadata:
-            raw_title = download.title or ""
-            uploader = download.uploader or ""
-            ai_artist, ai_title = self._ai_enricher(raw_title, uploader)
-            if ai_artist or ai_title:
-                artist = (ai_artist or download.uploader or "Unknown Artist").strip()
-                title = (ai_title or raw_title or "Unknown Title").strip()
-                self._log.info(
-                    "AI metadata: '%s' + uploader '%s' → artist='%s' title='%s'",
-                    raw_title,
-                    uploader,
-                    artist,
-                    title,
-                )
-                return artist or "Unknown Artist", title or "Unknown Title"
-            self._log.debug(
-                "AI metadata returned no result for '%s'; using heuristic fallback.",
-                raw_title,
-            )
-
-        # Heuristic fallback: prefer any partial structured fields, then uploader.
-        title = self._clean_video_title(
-            download.track or download.title or "Unknown Title"
-        )
+        # Conservative uploader fallback — avoid channel-brand names.
+        title  = self._clean_video_title(download.track or raw_title or "Unknown Title")
         artist = (download.artist or "").strip()
         if not artist:
-            uploader = (download.uploader or "").strip()
-            # Avoid obvious channel-brand names as the canonical artist.
             if uploader and not _CHANNEL_NAME_HINT_RE.search(uploader):
                 artist = uploader
         if not artist:

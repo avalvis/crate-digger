@@ -262,11 +262,12 @@ class ManualRipTab(ctk.CTkFrame):
         )
         self._stems_meta_label.pack(anchor="w")
 
-        # AI metadata toggle
+        # AI metadata toggle — key can come from Settings UI or the .env fallback.
         snap = self._ctx.config.snapshot()
-        has_ai_key = bool(os.environ.get("DEEPSEEK_API_KEY", "").strip())
+        has_ai_key = bool(
+            snap.deepseek_key or os.environ.get("DEEPSEEK_API_KEY", "")
+        )
         ai_enabled_in_config = snap.config.general.use_ai_metadata
-        # Default on only when the user has enabled it AND the key is present.
         initial_ai = ai_enabled_in_config and has_ai_key
 
         ai_toggle_row = ctk.CTkFrame(inner, fg_color="transparent")
@@ -315,7 +316,7 @@ class ManualRipTab(ctk.CTkFrame):
             "Sends the YouTube video title to DeepSeek AI to recover the "
             "original artist name and song title. Results appear as ✦ AI in the queue."
             if has_ai_key
-            else "Set DEEPSEEK_API_KEY in your .env file to enable AI title extraction."
+            else "Add your DeepSeek API key in Settings → API keys to enable this."
         )
         ctk.CTkLabel(
             ai_labels,

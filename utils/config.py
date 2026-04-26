@@ -51,6 +51,7 @@ CONFIG_SCHEMA_VERSION = 1
 # without dbus/libsecret (CI, minimal Docker images) don't break app boot.
 _KEYRING_SERVICE = "com.crate-digger.app"
 _KEYRING_USER_DISCOGS_TOKEN = "discogs_token"
+_KEYRING_USER_DEEPSEEK_KEY  = "deepseek_key"
 
 
 def _keyring_available() -> bool:
@@ -129,6 +130,10 @@ class GeneralConfig(BaseModel):
             "One of the keys listed in utils.paths.VAULT_FOLDER_SCHEMES."
         ),
     )
+    has_deepseek_key: bool = Field(
+        default=False,
+        description="Whether a DeepSeek API key is stored in the OS keyring or plaintext fallback.",
+    )
 
 
 class DownloaderConfig(BaseModel):
@@ -159,7 +164,7 @@ class DiscoveryConfig(BaseModel):
     # `True`, the loader fetches the token from the OS keyring.
     # `False` means the user hasn't entered one yet.
     has_token: bool = False
-    default_min_have: int = Field(default=50, ge=1)
+    default_min_have: int = Field(default=10, ge=1)
 
 
 class UIConfig(BaseModel):
@@ -209,8 +214,9 @@ class ConfigSnapshot:
     """
 
     config: AppConfig
-    discogs_token: Optional[str]  # materialized from keyring; None if unset
-    keyring_available: bool  # used by Settings UI to warn user
+    discogs_token: Optional[str]   # materialized from keyring; None if unset
+    deepseek_key: Optional[str]    # materialized from keyring; None if unset
+    keyring_available: bool        # used by Settings UI to warn user
 
 
 class ConfigManager:
@@ -230,6 +236,7 @@ class ConfigManager:
         self._lock = threading.RLock()
         self._config: AppConfig = AppConfig()  # defaults until load()
         self._token: Optional[str] = None
+        self._deepseek_key: Optional[str] = None
         self._loaded = False
 
     @property
@@ -278,8 +285,9 @@ class ConfigManager:
                 )
                 self._config = AppConfig()
 
-            # Materialize the Discogs token from the keyring (or leave None).
+            # Materialize credentials from the keyring (or leave None).
             self._token = self._load_token()
+            self._deepseek_key = self._load_deepseek_key()
             self._loaded = True
 
             return self._snapshot()
@@ -355,6 +363,42 @@ class ConfigManager:
             self._save()
             return self._snapshot()
 
+    def set_deepseek_key(self, key: Optional[str]) -> ConfigSnapshot:
+        """Store or clear the DeepSeek API key via keyring / plaintext fallback."""
+        with self._lock:
+            key = (key or "").strip() or None
+            if key is None:
+                _keyring_delete(_KEYRING_USER_DEEPSEEK_KEY)
+                self._deepseek_key = None
+                self._config = self._config.model_copy(
+                    update={
+                        "general": self._config.general.model_copy(
+                            update={"has_deepseek_key": False},
+                        ),
+                    }
+                )
+                self._save()
+                return self._snapshot()
+
+            stored_in_keyring = _keyring_set(_KEYRING_USER_DEEPSEEK_KEY, key)
+            if not stored_in_keyring:
+                self._log.warning(
+                    "OS keyring unavailable — storing DeepSeek key in "
+                    "plaintext fallback.",
+                )
+                self._fallback_write_deepseek_key(key)
+
+            self._deepseek_key = key
+            self._config = self._config.model_copy(
+                update={
+                    "general": self._config.general.model_copy(
+                        update={"has_deepseek_key": True},
+                    ),
+                }
+            )
+            self._save()
+            return self._snapshot()
+
     # ── Internals ──
 
     def _update_section(
@@ -384,6 +428,7 @@ class ConfigManager:
         return ConfigSnapshot(
             config=self._config,
             discogs_token=self._token,
+            deepseek_key=self._deepseek_key,
             keyring_available=_keyring_available(),
         )
 
@@ -393,8 +438,15 @@ class ConfigManager:
             token = _keyring_get(_KEYRING_USER_DISCOGS_TOKEN)
             if token:
                 return token
-            # Keyring says "not found" — check the plaintext fallback.
             return self._fallback_read_plaintext_token()
+        return None
+
+    def _load_deepseek_key(self) -> Optional[str]:
+        if self._config.general.has_deepseek_key:
+            key = _keyring_get(_KEYRING_USER_DEEPSEEK_KEY)
+            if key:
+                return key
+            return self._fallback_read_deepseek_key()
         return None
 
     # ── Atomic save ──
@@ -484,6 +536,26 @@ class ConfigManager:
 
     def _fallback_read_plaintext_token(self) -> Optional[str]:
         path = self._path.parent / ".discogs_token"
+        if not path.exists():
+            return None
+        try:
+            return path.read_text(encoding="utf-8").strip() or None
+        except OSError:
+            return None
+
+    def _fallback_write_deepseek_key(self, key: str) -> None:
+        path = self._path.parent / ".deepseek_key"
+        try:
+            path.write_text(key, encoding="utf-8")
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+        except OSError as e:
+            self._log.error("Could not write DeepSeek key fallback: %s", e)
+
+    def _fallback_read_deepseek_key(self) -> Optional[str]:
+        path = self._path.parent / ".deepseek_key"
         if not path.exists():
             return None
         try:

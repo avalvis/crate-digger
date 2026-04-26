@@ -483,14 +483,19 @@ def _bootstrap(splash: _SplashWindow, log: logging.Logger) -> int:
     vault_root = Path(snap.config.general.vault_root).expanduser()
     staging_root = Path(snap.config.general.staging_root).expanduser()
 
-    # AI metadata enricher — opt-in via Settings; requires DEEPSEEK_API_KEY.
+    # AI metadata enricher — opt-in via Settings; key stored in keyring or env.
+    # Config-stored key (set via Settings UI) takes precedence over the env var.
     ai_enricher = None
     if snap.config.general.use_ai_metadata:
-        ai_enricher = make_ai_enricher(logger=log.getChild("ai_metadata"))
+        deepseek_key = snap.deepseek_key or os.environ.get("DEEPSEEK_API_KEY", "")
+        ai_enricher = make_ai_enricher(
+            api_key=deepseek_key or None,
+            logger=log.getChild("ai_metadata"),
+        )
         if ai_enricher is None:
             log.info(
-                "AI metadata enrichment enabled in config but DEEPSEEK_API_KEY "
-                "is not set — falling back to heuristic name resolution."
+                "AI metadata enrichment enabled but no DeepSeek API key found "
+                "(set one in Settings or DEEPSEEK_API_KEY env var)."
             )
         else:
             log.info("AI metadata enricher ready (DeepSeek).")
@@ -539,6 +544,7 @@ def _bootstrap(splash: _SplashWindow, log: logging.Logger) -> int:
         queue_manager=queue_manager,
         database=database,
         config=config,
+        pipeline=pipeline,
         discovery=discovery,
         exporter=exporter,
         logger=log.getChild("app"),

@@ -95,6 +95,8 @@ class SettingsTab(ctk.CTkFrame):
         self._token_status_label: Optional[ctk.CTkLabel] = None
         self._keyring_warning_label: Optional[ctk.CTkLabel] = None
         self._folder_scheme_dropdown: Optional[ctk.CTkOptionMenu] = None
+        self._deepseek_entry: Optional[GlowEntry] = None
+        self._deepseek_status_label: Optional[ctk.CTkLabel] = None
 
         self._build_body()
         self._populate_from_config()
@@ -384,8 +386,8 @@ class SettingsTab(ctk.CTkFrame):
             body,
             4,
             "AI title extraction  (✦ DeepSeek)",
-            "Sends the YouTube video title to DeepSeek AI to recover the original "
-            "artist name and song title. Requires DEEPSEEK_API_KEY in your .env file. "
+            "Sends the YouTube video title to DeepSeek to recover the original artist "
+            "and song title. Requires a DeepSeek API key — set it in API keys below. "
             "Completed jobs show a ✦ AI badge when this was used.",
         )
 
@@ -486,34 +488,33 @@ class SettingsTab(ctk.CTkFrame):
 
         return row + 3
 
-    # ── Discovery section ──
+    # ── Discovery & AI section ──
 
     def _build_discovery_section(self, parent, row: int) -> int:
         t = self._theme
         body = self._section_card(
             parent,
             row,
-            "Discovery",
-            "Discogs API token is required for the Digital Crate 'Dig' feature.",
+            "API keys",
+            "Credentials for Discogs discovery and DeepSeek AI title extraction.",
         )
 
-        # Token field
-        self._field_label(body, 0, "Discogs personal access token")
+        # ── Discogs token ──
+        self._field_label(body, 0, "Discogs personal access token",
+                          "Required for the Digital Crate 'Dig' feature.")
 
         token_row = ctk.CTkFrame(body, fg_color="transparent")
-        token_row.grid(row=1, column=0, sticky="ew", pady=(0, t.space.sm))
+        token_row.grid(row=1, column=0, sticky="ew", pady=(0, t.space.xs))
         token_row.grid_columnconfigure(0, weight=1)
 
         self._token_entry = GlowEntry(
             token_row,
             t,
-            placeholder="Paste token (stored securely in OS keyring)",
+            placeholder="Paste token (stored in OS keyring or local file)",
             show_clear_button=True,
         )
         self._token_entry.grid(row=0, column=0, sticky="ew", padx=(0, t.space.sm))
 
-        # Token entry saves on focus-out rather than keystroke — safer
-        # for secrets (no partial tokens written during typing).
         self._token_entry._entry.bind(
             "<FocusOut>",
             lambda _e: self._save_discogs_token(self._token_entry.get()),
@@ -534,7 +535,6 @@ class SettingsTab(ctk.CTkFrame):
             **style_ghost_button(t),
         ).grid(row=0, column=1, sticky="e")
 
-        # Status label — shows 'stored in keyring' / 'not set' / 'plaintext fallback'
         self._token_status_label = ctk.CTkLabel(
             body,
             text="",
@@ -544,13 +544,11 @@ class SettingsTab(ctk.CTkFrame):
         )
         self._token_status_label.grid(row=2, column=0, sticky="w", pady=(0, t.space.xs))
 
-        # Keyring-availability warning (shown only when unavailable)
         self._keyring_warning_label = ctk.CTkLabel(
             body,
             text=(
                 "⚠  OS keyring is unavailable on this system. "
-                "The token will be stored in a plaintext sibling file "
-                "restricted to your user account."
+                "Keys will be stored in plaintext files restricted to your user account."
             ),
             text_color=t.status.warning,
             font=t.font.caption,
@@ -558,8 +556,53 @@ class SettingsTab(ctk.CTkFrame):
             justify="left",
             wraplength=680,
         )
-        self._keyring_warning_label.grid(row=3, column=0, sticky="w")
+        self._keyring_warning_label.grid(row=3, column=0, sticky="w",
+                                          pady=(0, t.space.lg))
         self._keyring_warning_label.grid_remove()
+
+        # ── DeepSeek API key ──
+        self._field_label(body, 4, "DeepSeek API key  (✦ AI title extraction)",
+                          "Requires a key from platform.deepseek.com — only DeepSeek keys work here. "
+                          "Takes effect immediately; no restart required.")
+
+        ds_row = ctk.CTkFrame(body, fg_color="transparent")
+        ds_row.grid(row=5, column=0, sticky="ew", pady=(0, t.space.xs))
+        ds_row.grid_columnconfigure(0, weight=1)
+
+        self._deepseek_entry = GlowEntry(
+            ds_row,
+            t,
+            placeholder="DeepSeek key  (sk-…)",
+            show_clear_button=True,
+        )
+        self._deepseek_entry.grid(row=0, column=0, sticky="ew", padx=(0, t.space.sm))
+
+        self._deepseek_entry._entry.bind(
+            "<FocusOut>",
+            lambda _e: self._save_deepseek_key(self._deepseek_entry.get()),
+            add="+",
+        )
+        self._deepseek_entry._entry.bind(
+            "<Return>",
+            lambda _e: self._save_deepseek_key(self._deepseek_entry.get()),
+            add="+",
+        )
+
+        ctk.CTkButton(
+            ds_row,
+            text="Get key",
+            command=lambda: webbrowser.open("https://platform.deepseek.com/api_keys"),
+            **style_ghost_button(t),
+        ).grid(row=0, column=1, sticky="e")
+
+        self._deepseek_status_label = ctk.CTkLabel(
+            body,
+            text="",
+            text_color=t.text.muted,
+            font=t.font.caption,
+            anchor="w",
+        )
+        self._deepseek_status_label.grid(row=6, column=0, sticky="w")
 
         return row + 3
 
@@ -668,9 +711,10 @@ class SettingsTab(ctk.CTkFrame):
             self._device_dropdown.set(label)
 
         if self._token_entry is not None and snap.discogs_token:
-            # Show a masked representation so the user knows something
-            # is stored, but never the actual token in case of screenshots.
             self._token_entry.set("•" * 20)
+
+        if self._deepseek_entry is not None and snap.deepseek_key:
+            self._deepseek_entry.set("•" * 20)
 
         # Keyring warning visibility
         if self._keyring_warning_label is not None:
@@ -679,8 +723,9 @@ class SettingsTab(ctk.CTkFrame):
             else:
                 self._keyring_warning_label.grid()
 
-        # Token status text
+        # Status labels
         self._refresh_token_status(snap)
+        self._refresh_deepseek_status(snap)
 
     # ── Save handlers ──
 
@@ -779,8 +824,6 @@ class SettingsTab(ctk.CTkFrame):
 
     def _save_discogs_token(self, value: str) -> None:
         value = (value or "").strip()
-        # If the field currently shows the masked value we rendered on
-        # load, don't treat that as a real token.
         if value and set(value) == {"•"}:
             return
 
@@ -790,28 +833,71 @@ class SettingsTab(ctk.CTkFrame):
             self._ctx.publish_toast(str(e), kind="error")
             return
 
-        # Notify the live discovery engine so the user doesn't have to
-        # restart the app to use the new token.
-        if self._ctx.discovery is not None:
-            try:
-                self._ctx.discovery.update_discogs_token(snap.discogs_token)
-            except Exception:
-                self._log.exception("Failed to propagate token to DiscoveryEngine")
-
-        # Reflect the save in UI
-        if value:
+        if snap.discogs_token:
+            # Update existing engine or create a new one (first-time token save).
+            if self._ctx.discovery is not None:
+                try:
+                    self._ctx.discovery.update_discogs_token(snap.discogs_token)
+                except Exception:
+                    self._log.exception("Failed to update DiscoveryEngine token")
+            else:
+                try:
+                    from core.discovery import DiscoveryEngine
+                    self._ctx.discovery = DiscoveryEngine(
+                        db=self._ctx.database,
+                        discogs_token=snap.discogs_token,
+                        logger=self._log.getChild("discovery"),
+                    )
+                    self._log.info("DiscoveryEngine created after first token save.")
+                except Exception:
+                    self._log.exception("Failed to create DiscoveryEngine")
             self._token_entry.set("•" * 20)
+            self._ctx.publish_toast("Discogs token saved.", kind="success")
+        else:
+            if self._ctx.discovery is not None:
+                try:
+                    self._ctx.discovery.update_discogs_token(None)
+                except Exception:
+                    pass
+            self._token_entry.set("")
+            self._ctx.publish_toast("Discogs token cleared.", kind="info")
+
+        self._refresh_token_status(snap)
+
+    def _save_deepseek_key(self, value: str) -> None:
+        value = (value or "").strip()
+        if value and set(value) == {"•"}:
+            return
+
+        try:
+            snap = self._config.set_deepseek_key(value or None)
+        except ConfigError as e:
+            self._ctx.publish_toast(str(e), kind="error")
+            return
+
+        # Rebuild the AI enricher and push it to the pipeline immediately.
+        if self._ctx.pipeline is not None:
+            try:
+                from core.ai_metadata import make_ai_enricher
+                enricher = make_ai_enricher(
+                    api_key=snap.deepseek_key or None,
+                    logger=self._log.getChild("ai_metadata"),
+                )
+                self._ctx.pipeline.update_ai_enricher(enricher)
+            except Exception:
+                self._log.exception("Failed to update AI enricher")
+
+        if value:
+            self._deepseek_entry.set("•" * 20)
             self._ctx.publish_toast(
-                "Discogs token saved.",
+                "DeepSeek key saved. AI title extraction is now active.",
                 kind="success",
             )
         else:
-            self._token_entry.set("")
-            self._ctx.publish_toast(
-                "Discogs token cleared.",
-                kind="info",
-            )
-        self._refresh_token_status(snap)
+            self._deepseek_entry.set("")
+            self._ctx.publish_toast("DeepSeek key cleared.", kind="info")
+
+        self._refresh_deepseek_status(snap)
 
     # ── Browse buttons ──
 
@@ -861,6 +947,7 @@ class SettingsTab(ctk.CTkFrame):
                 enable_stems_by_default=False,
                 use_ai_metadata=True,
                 vault_folder_scheme="genre/bpm_key_artist_title",
+                # Note: has_deepseek_key is not reset — credentials are preserved.
             )
             self._config.update_stems(model="htdemucs_ft", device="auto")
             self._config.update_downloader(
@@ -902,6 +989,28 @@ class SettingsTab(ctk.CTkFrame):
         else:
             self._token_status_label.configure(
                 text="No token set. Digital Crate discovery will be disabled.",
+                text_color=t.text.muted,
+            )
+
+    def _refresh_deepseek_status(self, snap) -> None:
+        t = self._theme
+        if self._deepseek_status_label is None:
+            return
+
+        if snap.deepseek_key:
+            if snap.keyring_available:
+                self._deepseek_status_label.configure(
+                    text="✓  Key stored securely in OS keyring. AI title extraction is active.",
+                    text_color=t.status.success,
+                )
+            else:
+                self._deepseek_status_label.configure(
+                    text="⚠  Key stored in plaintext fallback. AI title extraction is active.",
+                    text_color=t.status.warning,
+                )
+        else:
+            self._deepseek_status_label.configure(
+                text="No key set. AI title extraction will be disabled.",
                 text_color=t.text.muted,
             )
 
