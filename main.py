@@ -505,6 +505,7 @@ def _bootstrap(splash: _SplashWindow, log: logging.Logger) -> int:
         vault_root=vault_root,
         staging_root=staging_root,
         ai_enricher=ai_enricher,
+        folder_scheme=snap.config.general.vault_folder_scheme,
         logger=log.getChild("pipeline"),
     )
 

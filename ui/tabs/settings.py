@@ -29,6 +29,7 @@ import customtkinter as ctk
 
 from core.stems import StemModel
 from ui.components.glow_entry import GlowEntry
+from utils.paths import VAULT_FOLDER_SCHEMES
 from ui.theme import (
     style_card_elevated,
     style_danger_button,
@@ -93,6 +94,7 @@ class SettingsTab(ctk.CTkFrame):
         self._device_dropdown: Optional[ctk.CTkOptionMenu] = None
         self._token_status_label: Optional[ctk.CTkLabel] = None
         self._keyring_warning_label: Optional[ctk.CTkLabel] = None
+        self._folder_scheme_dropdown: Optional[ctk.CTkOptionMenu] = None
 
         self._build_body()
         self._populate_from_config()
@@ -267,6 +269,40 @@ class SettingsTab(ctk.CTkFrame):
             width=100,
         ).grid(row=0, column=1, sticky="e")
 
+        # Vault folder naming scheme
+        self._field_label(
+            body,
+            4,
+            "Vault folder naming",
+            "Controls how new tracks are organized on disk. "
+            "Existing tracks are not moved when you change this.",
+        )
+
+        _scheme_wrapper = ctk.CTkFrame(
+            body,
+            fg_color=t.border.strong,
+            border_width=0,
+            corner_radius=t.radius.md,
+        )
+        _scheme_wrapper.grid(row=5, column=0, sticky="w")
+        self._folder_scheme_dropdown = ctk.CTkOptionMenu(
+            _scheme_wrapper,
+            values=[label for _key, label in VAULT_FOLDER_SCHEMES],
+            command=self._save_folder_scheme,
+            fg_color=t.surface.raised,
+            button_color=t.surface.raised,
+            button_hover_color=t.surface.elevated,
+            dropdown_fg_color=t.surface.elevated,
+            text_color=t.text.primary,
+            dropdown_text_color=t.text.primary,
+            dropdown_hover_color=t.surface.overlay,
+            font=t.font.body,
+            corner_radius=max(0, t.radius.md - 2),
+            width=480,
+            height=38,
+        )
+        self._folder_scheme_dropdown.pack(padx=2, pady=2)
+
         return row + 3  # heading + subtitle + card row
 
     # ── Ingestion section ──
@@ -347,10 +383,10 @@ class SettingsTab(ctk.CTkFrame):
         self._field_label(
             body,
             4,
-            "AI metadata enrichment",
-            "Use DeepSeek AI to extract the original artist name and title from "
-            "YouTube video titles. Requires DEEPSEEK_API_KEY in your .env file. "
-            "Disable if you prefer the raw upload metadata or have no API key.",
+            "AI title extraction  (✦ DeepSeek)",
+            "Sends the YouTube video title to DeepSeek AI to recover the original "
+            "artist name and song title. Requires DEEPSEEK_API_KEY in your .env file. "
+            "Completed jobs show a ✦ AI badge when this was used.",
         )
 
         ai_toggle_row = ctk.CTkFrame(body, fg_color="transparent")
@@ -619,6 +655,10 @@ class SettingsTab(ctk.CTkFrame):
         if self._ai_metadata_var is not None:
             self._ai_metadata_var.set(cfg.general.use_ai_metadata)
 
+        if self._folder_scheme_dropdown is not None:
+            label = self._label_for_folder_scheme(cfg.general.vault_folder_scheme)
+            self._folder_scheme_dropdown.set(label)
+
         if self._stem_model_dropdown is not None:
             label = self._label_for_stem_model(cfg.stems.model)
             self._stem_model_dropdown.set(label)
@@ -703,6 +743,19 @@ class SettingsTab(ctk.CTkFrame):
     def _save_ai_metadata(self, value: bool) -> None:
         try:
             self._config.update_general(use_ai_metadata=bool(value))
+        except ConfigError as e:
+            self._ctx.publish_toast(str(e), kind="error")
+
+    def _save_folder_scheme(self, label: str) -> None:
+        key = self._folder_scheme_key_from_label(label)
+        if key is None:
+            return
+        try:
+            self._config.update_general(vault_folder_scheme=key)
+            self._ctx.publish_toast(
+                "Folder scheme updated. New tracks will use this layout.",
+                kind="info",
+            )
         except ConfigError as e:
             self._ctx.publish_toast(str(e), kind="error")
 
@@ -807,6 +860,7 @@ class SettingsTab(ctk.CTkFrame):
                 concurrent_workers=2,
                 enable_stems_by_default=False,
                 use_ai_metadata=True,
+                vault_folder_scheme="genre/bpm_key_artist_title",
             )
             self._config.update_stems(model="htdemucs_ft", device="auto")
             self._config.update_downloader(
@@ -922,6 +976,20 @@ class SettingsTab(ctk.CTkFrame):
     def _device_key_from_label(label: str) -> Optional[str]:
         for key, device_label in _DEVICE_CHOICES:
             if device_label == label:
+                return key
+        return None
+
+    @staticmethod
+    def _label_for_folder_scheme(scheme_key: str) -> str:
+        for key, label in VAULT_FOLDER_SCHEMES:
+            if key == scheme_key:
+                return label
+        return VAULT_FOLDER_SCHEMES[0][1]
+
+    @staticmethod
+    def _folder_scheme_key_from_label(label: str) -> Optional[str]:
+        for key, scheme_label in VAULT_FOLDER_SCHEMES:
+            if scheme_label == label:
                 return key
         return None
 

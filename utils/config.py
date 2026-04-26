@@ -122,6 +122,13 @@ class GeneralConfig(BaseModel):
             "titles when the track has no structured metadata."
         ),
     )
+    vault_folder_scheme: str = Field(
+        default="genre/bpm_key_artist_title",
+        description=(
+            "Folder-structure convention used when filing new tracks in the Vault. "
+            "One of the keys listed in utils.paths.VAULT_FOLDER_SCHEMES."
+        ),
+    )
 
 
 class DownloaderConfig(BaseModel):

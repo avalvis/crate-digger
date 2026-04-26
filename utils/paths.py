@@ -65,6 +65,19 @@ def sanitize_filename_component(
     return s
 
 
+# Ordered list of (scheme_key, human_label) pairs for UI dropdowns.
+# The first entry is the default used on fresh installs.
+VAULT_FOLDER_SCHEMES: list[tuple[str, str]] = [
+    ("genre/bpm_key_artist_title", "Genre / BPM · Key · Artist – Title  (default)"),
+    ("artist/bpm_key_title",       "Artist / BPM · Key – Title"),
+    ("genre/artist/bpm_key_title", "Genre / Artist / BPM · Key – Title"),
+    ("bpm_key_artist_title",       "BPM · Key · Artist – Title  (flat)"),
+    ("artist_title",               "Artist – Title  (simple)"),
+]
+
+_DEFAULT_SCHEME = VAULT_FOLDER_SCHEMES[0][0]
+
+
 def build_vault_track_dir(
     vault_root: Path,
     *,
@@ -73,23 +86,42 @@ def build_vault_track_dir(
     camelot_key: str | None,
     artist: str,
     title: str,
+    scheme: str = _DEFAULT_SCHEME,
 ) -> Path:
     """
-    Construct `[vault_root]/[Genre]/[BPM]_[Key]_[Artist]_[Title]/` with
-    every component OS-sanitized.
+    Construct the vault directory for one track according to `scheme`.
+
+    Schemes
+    -------
+    genre/bpm_key_artist_title  → Genre/BPM_Key_Artist_Title  (default)
+    artist/bpm_key_title        → Artist/BPM_Key_Title
+    genre/artist/bpm_key_title  → Genre/Artist/BPM_Key_Title
+    bpm_key_artist_title        → BPM_Key_Artist_Title  (flat, no subfolder)
+    artist_title                → Artist_Title  (simple)
+
+    Every component is OS-sanitized. Unknown genre falls back to
+    "Untagged" (not "Unknown") so it reads clearly in File Explorer.
     """
-    genre_dir = sanitize_filename_component(genre or "Unknown", max_length=60)
+    san = sanitize_filename_component
 
-    bpm_part = f"{int(round(bpm))}" if bpm else "??"
-    key_part = sanitize_filename_component(
-        camelot_key or "??", max_length=4, fallback="??",
-    )
-    artist_part = sanitize_filename_component(artist, max_length=60)
-    title_part = sanitize_filename_component(title, max_length=80)
+    genre_dir  = san(genre or "Untagged", max_length=60)
+    bpm_part   = f"{int(round(bpm))}" if bpm else "??"
+    key_part   = san(camelot_key or "??", max_length=4, fallback="??")
+    artist_part = san(artist, max_length=60)
+    title_part  = san(title, max_length=80)
 
-    track_dir_name = f"{bpm_part}_{key_part}_{artist_part}_{title_part}"
-    # Re-sanitize the whole assembled name to catch edge cases where
-    # two sanitized components joined by "_" produce something weird.
-    track_dir_name = sanitize_filename_component(track_dir_name, max_length=180)
+    bpm_key              = f"{bpm_part}_{key_part}"
+    bpm_key_artist_title = san(f"{bpm_key}_{artist_part}_{title_part}", max_length=180)
+    bpm_key_title        = san(f"{bpm_key}_{title_part}", max_length=180)
+    artist_title         = san(f"{artist_part}_{title_part}", max_length=180)
 
-    return vault_root / genre_dir / track_dir_name
+    if scheme == "artist/bpm_key_title":
+        return vault_root / artist_part / bpm_key_title
+    if scheme == "genre/artist/bpm_key_title":
+        return vault_root / genre_dir / artist_part / bpm_key_title
+    if scheme == "bpm_key_artist_title":
+        return vault_root / bpm_key_artist_title
+    if scheme == "artist_title":
+        return vault_root / artist_title
+    # Default: genre/bpm_key_artist_title (also catches unknown scheme values)
+    return vault_root / genre_dir / bpm_key_artist_title

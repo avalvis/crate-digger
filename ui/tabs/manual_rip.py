@@ -37,7 +37,8 @@ from __future__ import annotations
 
 import os
 import re
-import webbrowser
+import subprocess
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
@@ -89,6 +90,8 @@ class ManualRipTab(ctk.CTkFrame):
         # Remember job_ids we've dismissed so late-arriving events don't
         # resurrect them.
         self._dismissed: set[int] = set()
+        # job_id → whether AI enrichment was requested for that job
+        self._job_ai_flags: dict[int, bool] = {}
 
         self._build_body()
 
@@ -291,17 +294,28 @@ class ManualRipTab(ctk.CTkFrame):
         ai_labels = ctk.CTkFrame(ai_toggle_row, fg_color="transparent")
         ai_labels.pack(side="left")
 
+        ai_title_row = ctk.CTkFrame(ai_labels, fg_color="transparent")
+        ai_title_row.pack(anchor="w")
+
         ctk.CTkLabel(
-            ai_labels,
-            text="AI metadata enrichment",
+            ai_title_row,
+            text="AI title extraction",
             **style_label_body(t),
-        ).pack(anchor="w")
+        ).pack(side="left")
+
+        if has_ai_key:
+            ctk.CTkLabel(
+                ai_title_row,
+                text="  ✦ DeepSeek",
+                text_color=t.accent.blue,
+                font=t.font.caption,
+            ).pack(side="left")
 
         ai_meta_text = (
-            "Uses DeepSeek AI to identify the original artist and title "
-            "from YouTube video titles."
+            "Sends the YouTube video title to DeepSeek AI to recover the "
+            "original artist name and song title. Results appear as ✦ AI in the queue."
             if has_ai_key
-            else "Requires DEEPSEEK_API_KEY in your .env file to activate."
+            else "Set DEEPSEEK_API_KEY in your .env file to enable AI title extraction."
         )
         ctk.CTkLabel(
             ai_labels,
@@ -403,7 +417,8 @@ class ManualRipTab(ctk.CTkFrame):
         )
 
         try:
-            self._ctx.queue_manager.enqueue(request)
+            job_id = self._ctx.queue_manager.enqueue(request)
+            self._job_ai_flags[job_id] = bool(self._ai_var.get())
         except Exception as e:
             self._log.exception("Enqueue failed")
             self._ctx.publish_toast(f"Could not enqueue: {e}", kind="error")
@@ -454,6 +469,7 @@ class ManualRipTab(ctk.CTkFrame):
             except Exception:
                 pass
             self._dismissed.add(job_id)
+            self._job_ai_flags.pop(job_id, None)
             self._reflow_rows()
 
     def _open_in_vault(self, track_id: Optional[int]) -> None:
@@ -472,7 +488,12 @@ class ManualRipTab(ctk.CTkFrame):
 
         parent_dir = Path(track.file_path).parent
         try:
-            webbrowser.open(parent_dir.as_uri())
+            if sys.platform == "win32":
+                os.startfile(str(parent_dir))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(parent_dir)])
+            else:
+                subprocess.Popen(["xdg-open", str(parent_dir)])
         except Exception as e:
             self._log.warning("Could not open %s: %s", parent_dir, e)
             self._ctx.publish_toast(
@@ -518,15 +539,16 @@ class ManualRipTab(ctk.CTkFrame):
     def _create_row(self, event: QueueEvent) -> ProgressRow:
         """Instantiate a ProgressRow, insert at the top of the stack."""
         t = self._theme
-        # Discovery-originated jobs get the purple progress bar variant.
-        is_discovery = False  # Manual Rip is always direct submissions
+        job_id: int = event.job_id  # type: ignore[assignment]
+        ai_enriched = self._job_ai_flags.get(job_id, False)
 
         row = ProgressRow(
             self._rows_container,
             t,
-            job_id=event.job_id,  # type: ignore[arg-type]
+            job_id=job_id,
             source_url=event.source_url or "",
-            is_discovery=is_discovery,
+            is_discovery=False,
+            ai_enriched=ai_enriched,
             on_cancel=self._cancel_job,
             on_open_in_vault=self._open_in_vault,
             on_dismiss=self._dismiss_row,

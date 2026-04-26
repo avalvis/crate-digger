@@ -210,6 +210,7 @@ class IngestionPipeline:
         vault_root: Path,
         staging_root: Path,
         ai_enricher: Optional[_AiEnricher] = None,
+        folder_scheme: str = "genre/bpm_key_artist_title",
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self._dl = downloader
@@ -221,6 +222,7 @@ class IngestionPipeline:
         self._vault_root = Path(vault_root)
         self._staging_root = Path(staging_root)
         self._ai_enricher = ai_enricher
+        self._folder_scheme = folder_scheme
         self._log = logger or logging.getLogger("cratedigger.pipeline")
 
         self._vault_root.mkdir(parents=True, exist_ok=True)
@@ -657,6 +659,7 @@ class IngestionPipeline:
             camelot_key=camelot_key,
             artist=artist,
             title=title,
+            scheme=self._folder_scheme,
         )
 
         # Collision avoidance at the directory level

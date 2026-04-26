@@ -74,6 +74,7 @@ class ProgressRowState:
     track_id: Optional[int] = None
     final_path: Optional[str] = None
     is_discovery: bool = False       # affects progress bar color
+    ai_enriched: bool = False        # shows ✦ AI chip on completion
 
 
 class ProgressRow(ctk.CTkFrame):
@@ -92,6 +93,7 @@ class ProgressRow(ctk.CTkFrame):
         job_id: int,
         source_url: str,
         is_discovery: bool = False,
+        ai_enriched: bool = False,
         on_cancel: Optional[Callable[[int], None]] = None,
         on_open_in_vault: Optional[Callable[[int], None]] = None,
         on_dismiss: Optional[Callable[[int], None]] = None,
@@ -111,6 +113,7 @@ class ProgressRow(ctk.CTkFrame):
             job_id=job_id,
             source_url=source_url,
             is_discovery=is_discovery,
+            ai_enriched=ai_enriched,
         )
         self._on_cancel = on_cancel
         self._on_open_in_vault = on_open_in_vault
@@ -251,6 +254,7 @@ class ProgressRow(ctk.CTkFrame):
 
         self._chip_bpm: Optional[ctk.CTkLabel] = None
         self._chip_key: Optional[ctk.CTkLabel] = None
+        self._chip_ai: Optional[ctk.CTkLabel] = None
 
         self._actions_row = ctk.CTkFrame(right, fg_color="transparent")
         self._actions_row.pack(side="top", anchor="e", pady=(t.space.xs, 0))
@@ -350,6 +354,13 @@ class ProgressRow(ctk.CTkFrame):
                 self._chip_key.pack(side="left", padx=(0, t.space.xs))
             else:
                 self._chip_key.configure(text=key_text)
+
+        # ✦ AI chip — appears only after the job completes so we know
+        # AI enrichment was actually requested and ran for this track.
+        if s.ai_enriched and s.is_complete:
+            if self._chip_ai is None:
+                self._chip_ai = self._make_chip("✦ AI", t.accent.blue)
+                self._chip_ai.pack(side="left", padx=(0, t.space.xs))
 
     def _render_actions(self) -> None:
         t = self._theme
