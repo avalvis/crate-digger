@@ -50,10 +50,12 @@ from core.database import DiscoveryRecord, VaultDatabase
 @dataclass(slots=True, frozen=True)
 class DiscoveryFilters:
     """User-selected filters from the Digital Crate tab."""
-    decade: Optional[int] = None           # e.g. 1970 = "the 70s"
-    country: Optional[str] = None          # Discogs country string, e.g. "Brazil"
-    genre: Optional[str] = None            # Discogs top-level genre, e.g. "Jazz"
-    style: Optional[str] = None            # Discogs style, e.g. "Bossa Nova"
+    year: Optional[int] = None             # Exact year
+    country: Optional[str] = None          # Discogs country string
+    genre: Optional[str] = None            # Discogs top-level genre
+    style: Optional[str] = None            # Discogs style
+    format: Optional[str] = None           # Discogs format (Vinyl, CD, etc.)
+    query: Optional[str] = None            # Free-text keyword search
     min_have: int = 50                     # min community `have` count
 
 
@@ -349,19 +351,19 @@ class DiscoveryEngine:
         params: dict[str, Any] = {
             "type": "master",
             "per_page": 50,
-            # No format filter — LPs, EPs, 7-inch singles, and 10-inches
-            # are all valid targets. "format=album" silently excludes most
-            # non-Western and pre-1960s content which is predominantly singles.
         }
-        if filters.decade is not None:
-            # Discogs supports range syntax in the year param: "1970-1979"
-            params["year"] = f"{filters.decade}-{filters.decade + 9}"
+        if filters.year is not None:
+            params["year"] = filters.year
         if filters.country:
             params["country"] = filters.country
         if filters.genre:
             params["genre"] = filters.genre
         if filters.style:
             params["style"] = filters.style
+        if filters.format:
+            params["format"] = filters.format
+        if filters.query:
+            params["q"] = filters.query
 
         candidates: list[DiscogsCandidate] = []
         for page in range(1, self.MAX_SEARCH_PAGES + 1):
