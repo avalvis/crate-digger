@@ -557,6 +557,9 @@ class VaultTab(ctk.CTkFrame):
     def _refresh_data(self) -> None:
         """Query the DB and repopulate the table."""
         try:
+            # Ensure geometry is settled so the virtual table knows its viewport size.
+            self.update_idletasks()
+
             db_filter = self._filters.to_track_filter(limit=self._MAX_ROWS)
             self._rows = self._ctx.database.list_tracks(db_filter)
             total_unfiltered = self._ctx.database.count_tracks()

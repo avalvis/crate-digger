@@ -150,7 +150,7 @@ class VirtualDataTable(ctk.CTkFrame):
         self._build_body(theme)
 
         # Track viewport resize so pool adapts to window height changes.
-        self.bind("<Configure>", self._on_resize, add="+")
+        self._viewport.bind("<Configure>", self._on_resize, add="+")
 
     # ── Public API ──
 
@@ -165,6 +165,11 @@ class VirtualDataTable(ctk.CTkFrame):
         self._update_scrollbar()
         self._render_visible()
         self._fire_selection_changed()
+
+        # If we rendered while the widget was unmapped (h=1), schedule a
+        # follow-up render for once it's likely mapped and has its real size.
+        if self._viewport.winfo_height() <= 1:
+            self.after(200, self._render_visible)
 
     def set_sort(
         self, column_key: str, direction: SortDirection,
