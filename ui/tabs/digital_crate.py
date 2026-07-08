@@ -32,7 +32,7 @@ from core.discovery import (
 )
 from core.pipeline import PipelineRequest
 from core.sampling_taxonomy import sample_affinity
-from ui.components.spinner import Spinner
+from ui.components.dig_roulette_spinner import DigRouletteSpinner
 from ui.components.waveform_player import WaveformPlayer
 from ui.components.year_spinner import YearSpinner
 from ui.theme import (
@@ -140,8 +140,10 @@ class DigitalCrateTab(ctk.CTkFrame):
         self._intensity_slider: Optional[ctk.CTkSlider] = None
         self._reel_size_var: Optional[ctk.StringVar] = None
         self._dig_button: Optional[ctk.CTkButton] = None
-        self._dig_spinner: Optional[Spinner] = None
+        self._dig_spinner: Optional[DigRouletteSpinner] = None
         self._dig_status_label: Optional[ctk.CTkLabel] = None
+        self._filters_card: Optional[ctk.CTkFrame] = None
+        self._preset_buttons: list[ctk.CTkButton] = []
         self._health_label: Optional[ctk.CTkLabel] = None
         self._reel_frame: Optional[ctk.CTkFrame] = None
         self._reel_empty: Optional[ctk.CTkFrame] = None
@@ -149,8 +151,31 @@ class DigitalCrateTab(ctk.CTkFrame):
         self._token_warning_card: Optional[ctk.CTkFrame] = None
 
         self._build_body()
+        self._ctx.on_config_changed(self._on_config_changed)
         self._refresh_token_gate()
+        self._update_health()
         self._refresh_recent_digs()
+
+    # ── Tab lifecycle (app shell calls on show / re-click) ──
+
+    def on_tab_visible(self) -> None:
+        """Refresh gate, prefs, and health when the user returns to this tab."""
+        self._sync_discovery_prefs()
+        self._refresh_token_gate()
+        self._update_health()
+
+    def on_tab_hidden(self) -> None:
+        """Pause reel previews when leaving the tab."""
+        for card in self._cards:
+            try:
+                card.pause_preview()
+            except Exception:
+                pass
+
+    def _on_config_changed(self) -> None:
+        self._sync_discovery_prefs()
+        self._refresh_token_gate()
+        self._update_health()
 
     # ── Body construction ──
 
@@ -226,6 +251,18 @@ class DigitalCrateTab(ctk.CTkFrame):
             row=0, column=2, sticky="e", padx=(0, t.space.lg), pady=t.space.md)
         self._token_warning_card = card
 
+    def _sync_discovery_prefs(self) -> None:
+        """Pull discovery prefs from config (e.g. after Settings changes)."""
+        disc = self._ctx.config.snapshot().config.discovery
+        if self._prioritize_var is not None:
+            self._prioritize_var.set(disc.prioritize_samples)
+        if self._intensity_slider is not None:
+            self._intensity_slider.set(disc.sample_weight_intensity)
+        if self._compilations_var is not None:
+            self._compilations_var.set(disc.allow_compilations)
+        if self._reel_size_var is not None:
+            self._reel_size_var.set(str(disc.reel_size))
+
     def _build_presets(self, parent, row: int) -> None:
         t = self._theme
         ctk.CTkLabel(parent, text="Era presets",
@@ -236,6 +273,7 @@ class DigitalCrateTab(ctk.CTkFrame):
         wrap.grid(row=row + 1, column=0, sticky="ew", pady=(0, t.space.lg))
         # Use a flowing row of chip buttons.
         col = 0
+        self._preset_buttons = []
         for preset in _PRESETS:
             btn = ctk.CTkButton(
                 wrap, text=preset.label,
@@ -247,6 +285,7 @@ class DigitalCrateTab(ctk.CTkFrame):
             )
             btn.grid(row=0, column=col, padx=(0, t.space.sm), pady=t.space.xxs,
                      sticky="w")
+            self._preset_buttons.append(btn)
             col += 1
 
     def _build_filters_card(self, parent, row: int) -> None:
@@ -254,6 +293,7 @@ class DigitalCrateTab(ctk.CTkFrame):
         card = ctk.CTkFrame(parent, **style_card_elevated(t))
         card.grid(row=row, column=0, sticky="ew", pady=(0, t.space.lg))
         card.grid_columnconfigure(0, weight=1)
+        self._filters_card = card
 
         inner = ctk.CTkFrame(card, fg_color="transparent")
         inner.grid(row=0, column=0, sticky="ew", padx=t.space.xl, pady=t.space.xl)
@@ -441,9 +481,7 @@ class DigitalCrateTab(ctk.CTkFrame):
 
         status_frame = ctk.CTkFrame(dig_row, fg_color="transparent")
         status_frame.pack(side="left", padx=(t.space.lg, 0))
-        self._dig_spinner = Spinner(status_frame, t, size="md",
-                                    color=t.accent.purple)
-        self._dig_spinner.pack(side="left", padx=(0, t.space.sm))
+        self._dig_spinner = DigRouletteSpinner(status_frame, t)
         self._dig_status_label = ctk.CTkLabel(
             status_frame, text="", text_color=t.text.secondary,
             font=t.font.body, anchor="w")
@@ -514,11 +552,31 @@ class DigitalCrateTab(ctk.CTkFrame):
 
     def _refresh_token_gate(self) -> None:
         snap = self._ctx.config.snapshot()
-        if self._token_warning_card:
-            if snap.discogs_token:
+        ready = bool(snap.discogs_token and self._ctx.discovery)
+
+        if self._token_warning_card is not None:
+            if ready:
                 self._token_warning_card.grid_remove()
             else:
                 self._token_warning_card.grid()
+
+        if self._dig_button is not None and not self._digging:
+            self._dig_button.configure(
+                state="normal" if ready else "disabled",
+            )
+
+        for btn in self._preset_buttons:
+            if not self._digging:
+                btn.configure(state="normal" if ready else "disabled")
+
+    def _set_filters_enabled(self, enabled: bool) -> None:
+        for btn in self._preset_buttons:
+            if enabled:
+                snap = self._ctx.config.snapshot()
+                ready = bool(snap.discogs_token and self._ctx.discovery)
+                btn.configure(state="normal" if ready else "disabled")
+            else:
+                btn.configure(state="disabled")
 
     def _on_dig_clicked(self) -> None:
         with self._dig_lock:
@@ -538,6 +596,18 @@ class DigitalCrateTab(ctk.CTkFrame):
 
         filters = self._collect_filters()
         count = self._collect_reel_size()
+        try:
+            self._ctx.config.update_discovery(
+                prioritize_samples=bool(self._prioritize_var.get()),
+                sample_weight_intensity=round(float(intensity := (
+                    self._intensity_slider.get()
+                    if self._intensity_slider is not None else 0.6
+                )), 2),
+                allow_compilations=bool(self._compilations_var.get()),
+                reel_size=count,
+            )
+        except Exception:
+            self._log.debug("Could not persist discovery prefs", exc_info=True)
         threading.Thread(target=self._run_dig_worker, args=(filters, count),
                          daemon=True).start()
 
@@ -658,11 +728,15 @@ class DigitalCrateTab(ctk.CTkFrame):
     # ── Health ──
 
     def _update_health(self) -> None:
-        if self._health_label is None or self._ctx.discovery is None:
+        if self._health_label is None:
+            return
+        if self._ctx.discovery is None:
+            self._health_label.configure(text="Discovery offline — add API token")
             return
         try:
             stats = self._ctx.discovery.get_stats()
         except Exception:
+            self._health_label.configure(text="")
             return
         parts = [
             f"Discogs {stats.discogs_requests}",
@@ -676,12 +750,14 @@ class DigitalCrateTab(ctk.CTkFrame):
 
     def _set_dig_in_flight(self, in_flight: bool) -> None:
         t = self._theme
+        self._set_filters_enabled(not in_flight)
         if in_flight:
             self._dig_button.configure(text="Digging…", state="disabled",
                                        fg_color=t.accent.blue_dim)
-            self._set_dig_status("Searching Discogs and YouTube Music…")
+            self._set_dig_status("Spinning the crate — searching Discogs & YouTube Music…")
         else:
-            self._dig_button.configure(text="◆   Dig the crate", state="normal",
+            self._refresh_token_gate()
+            self._dig_button.configure(text="◆   Dig the crate",
                                        fg_color=t.accent.blue)
             self._set_dig_status(None)
 
@@ -937,6 +1013,14 @@ class _ReelCard(ctk.CTkFrame):
         webbrowser.open(self._s.youtube_url)
 
     # ── Teardown ──
+
+    def pause_preview(self) -> None:
+        """Stop playback when the tab is hidden (keeps the card alive)."""
+        if self._player is not None:
+            try:
+                self._player.stop()
+            except Exception:
+                pass
 
     def teardown(self) -> None:
         self._cancel_event.set()

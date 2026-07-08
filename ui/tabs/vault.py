@@ -257,6 +257,11 @@ class VaultTab(ctk.CTkFrame):
         # we can find it.
         self._refresh_data()
 
+    def on_tab_visible(self) -> None:
+        """Refresh dynamic filter choices when returning to the Vault."""
+        self._refresh_tag_choices()
+        self._refresh_crate_choices()
+
     # ── Body construction ──
 
     def _build_body(self) -> None:
@@ -1008,10 +1013,7 @@ class VaultTab(ctk.CTkFrame):
                 # way from here, so we accept a mild layering compromise.
                 try:
                     self._table.focus_set()
-                    # Access the private helper directly — it's the right
-                    # tool, and exposing a public scroll_to_and_select
-                    # method in data_table.py is a trivial future follow-up.
-                    self._table._set_cursor(idx)  # type: ignore[attr-defined]
+                    self._table.scroll_to_and_select(idx)
                 except Exception:
                     self._log.debug("Could not focus row %d", idx)
                 return

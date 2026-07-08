@@ -24,6 +24,7 @@ WaveformPlayer that's currently playing (class-level registry).
 
 from __future__ import annotations
 
+import logging
 import threading
 import weakref
 from typing import TYPE_CHECKING, Optional
@@ -35,6 +36,8 @@ import tkinter as tk
 if TYPE_CHECKING:
     from core.preview import PreviewData
     from ui.theme import Theme
+
+_log = logging.getLogger("cratedigger.ui.waveform_player")
 
 
 class WaveformPlayer(ctk.CTkFrame):
@@ -273,6 +276,7 @@ class WaveformPlayer(ctk.CTkFrame):
         try:
             import sounddevice as sd
         except Exception:
+            _log.exception("sounddevice import failed")
             return False
         if self._data is None:
             return False
@@ -286,6 +290,10 @@ class WaveformPlayer(ctk.CTkFrame):
             )
             return True
         except Exception:
+            _log.exception(
+                "Could not open OutputStream (samplerate=%s, channels=%s)",
+                self._data.samplerate, self._data.channels,
+            )
             self._stream = None
             return False
 

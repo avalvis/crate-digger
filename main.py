@@ -171,7 +171,10 @@ def _setup_logging(data_dir: Path) -> logging.Logger:
 
     # Noisy libraries demoted to WARN — we still capture their DEBUG
     # via the file handler's higher level if we ever need them.
-    for noisy in ("urllib3", "requests", "yt_dlp", "PIL", "matplotlib"):
+    # numba is critical here: at DEBUG it dumps full SSA/bytecode traces
+    # for every JIT compilation (librosa's beat/key analysis triggers
+    # this), which floods the log and visibly stalls analysis.
+    for noisy in ("urllib3", "requests", "yt_dlp", "PIL", "matplotlib", "numba"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     app_log = logging.getLogger("cratedigger")

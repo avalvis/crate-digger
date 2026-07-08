@@ -44,7 +44,7 @@ from typing import TYPE_CHECKING, Optional
 
 import customtkinter as ctk
 
-from core.pipeline import PipelineRequest
+from core.pipeline import PipelineRequest, PipelineStage
 from core.queue_manager import QueueEvent, QueueEventType
 from core.stems import StemModel
 from ui.components.glow_entry import GlowEntry
@@ -94,6 +94,13 @@ class ManualRipTab(ctk.CTkFrame):
         self._job_ai_flags: dict[int, bool] = {}
 
         self._build_body()
+
+        # Tabs build lazily on first visit, so a job started from Digital
+        # Crate or Vault before Manual Rip was ever opened would otherwise
+        # never get a row here — the event bridge only forwards events to
+        # subscribers that already existed when they fired. Backfill from
+        # the DB for anything still in flight.
+        self._seed_active_jobs()
 
         # Subscribe to the UI-safe event bridge. weak=True so if this
         # tab were ever destroyed, the subscription clears automatically.
@@ -297,6 +304,7 @@ class ManualRipTab(ctk.CTkFrame):
 
         ai_title_row = ctk.CTkFrame(ai_labels, fg_color="transparent")
         ai_title_row.pack(anchor="w")
+        self._ai_title_row = ai_title_row
 
         ctk.CTkLabel(
             ai_title_row,
@@ -304,25 +312,70 @@ class ManualRipTab(ctk.CTkFrame):
             **style_label_body(t),
         ).pack(side="left")
 
-        if has_ai_key:
-            ctk.CTkLabel(
-                ai_title_row,
-                text="  ✦ DeepSeek",
-                text_color=t.accent.blue,
-                font=t.font.caption,
-            ).pack(side="left")
-
         ai_meta_text = (
             "Sends the YouTube video title to DeepSeek AI to recover the "
             "original artist name and song title. Results appear as ✦ AI in the queue."
             if has_ai_key
             else "Add your DeepSeek API key in Settings → API keys to enable this."
         )
-        ctk.CTkLabel(
+        self._ai_meta_label = ctk.CTkLabel(
             ai_labels,
             text=ai_meta_text,
             **style_label_meta(t),
-        ).pack(anchor="w")
+        )
+        self._ai_meta_label.pack(anchor="w")
+        self._ai_badge_label = None
+        if has_ai_key:
+            self._ai_badge_label = ctk.CTkLabel(
+                ai_title_row,
+                text="  ✦ DeepSeek",
+                text_color=t.accent.blue,
+                font=t.font.caption,
+            )
+            self._ai_badge_label.pack(side="left")
+
+        self._ctx.on_config_changed(self._refresh_ai_toggle)
+
+    def on_tab_visible(self) -> None:
+        self._refresh_ai_toggle()
+        if self._stems_meta_label is not None:
+            self._stems_meta_label.configure(text=self._stems_meta_text())
+
+    def _refresh_ai_toggle(self) -> None:
+        """Re-read API key state after Settings saves a DeepSeek key."""
+        if self._ai_switch is None or self._ai_meta_label is None:
+            return
+        t = self._theme
+        snap = self._ctx.config.snapshot()
+        has_ai_key = bool(
+            snap.deepseek_key or os.environ.get("DEEPSEEK_API_KEY", "")
+        )
+        self._ai_switch.configure(state="normal" if has_ai_key else "disabled")
+        if has_ai_key and not self._ai_var.get():
+            if snap.config.general.use_ai_metadata:
+                self._ai_var.set(True)
+        if has_ai_key:
+            self._ai_meta_label.configure(
+                text=(
+                    "Sends the YouTube video title to DeepSeek AI to recover the "
+                    "original artist name and song title. Results appear as ✦ AI "
+                    "in the queue."
+                ),
+                text_color=t.text.secondary,
+            )
+            if self._ai_badge_label is None and self._ai_title_row is not None:
+                self._ai_badge_label = ctk.CTkLabel(
+                    self._ai_title_row,
+                    text="  ✦ DeepSeek",
+                    text_color=t.accent.blue,
+                    font=t.font.caption,
+                )
+                self._ai_badge_label.pack(side="left")
+        else:
+            self._ai_meta_label.configure(
+                text="Add your DeepSeek API key in Settings → API keys to enable this.",
+                text_color=t.text.muted,
+            )
 
     def _build_queue_drawer(self, parent, row: int) -> None:
         t = self._theme
@@ -474,33 +527,9 @@ class ManualRipTab(ctk.CTkFrame):
             self._reflow_rows()
 
     def _open_in_vault(self, track_id: Optional[int]) -> None:
-        """
-        ProgressRow "Open in Vault" callback. For MVP, this opens the
-        containing folder in the OS file manager. Once the Vault tab
-        is built, we'll switch this to selecting-and-focusing the row.
-        """
         if track_id is None:
             return
-        try:
-            track = self._ctx.database.get_track(track_id)
-        except Exception as e:
-            self._log.warning("Could not load track %d: %s", track_id, e)
-            return
-
-        parent_dir = Path(track.file_path).parent
-        try:
-            if sys.platform == "win32":
-                os.startfile(str(parent_dir))
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", str(parent_dir)])
-            else:
-                subprocess.Popen(["xdg-open", str(parent_dir)])
-        except Exception as e:
-            self._log.warning("Could not open %s: %s", parent_dir, e)
-            self._ctx.publish_toast(
-                f"Could not open folder: {e}",
-                kind="error",
-            )
+        self._ctx.focus_vault_track(track_id)
 
     # ── Event handling (runs on Tk thread via bridge) ──
 
@@ -536,6 +565,36 @@ class ManualRipTab(ctk.CTkFrame):
             row = self._create_row(event)
 
         row.apply_event(event)
+
+    def _seed_active_jobs(self) -> None:
+        """Backfill rows for jobs already pending/running when this tab
+        is first built, so the queue drawer isn't blank just because
+        the job started before the user ever opened Manual Rip."""
+        _TERMINAL_STATUSES = {"complete", "failed", "cancelled"}
+        try:
+            records = self._ctx.queue_manager.list_jobs(limit=50)
+        except Exception:
+            self._log.exception("Could not list active jobs for seeding")
+            return
+        for record in records:
+            if record.id is None or record.status in _TERMINAL_STATUSES:
+                continue
+            try:
+                stage = PipelineStage(record.current_stage) if record.current_stage \
+                    else PipelineStage.PENDING
+            except ValueError:
+                stage = PipelineStage.PENDING
+            event = QueueEvent(
+                type=QueueEventType.JOB_PROGRESS,
+                job_id=record.id,
+                source_url=record.source_url,
+                display_name=record.display_name,
+                stage=stage,
+                overall_percent=record.progress_pct,
+            )
+            self._job_ai_flags.setdefault(record.id, False)
+            row = self._create_row(event)
+            row.apply_event(event)
 
     def _create_row(self, event: QueueEvent) -> ProgressRow:
         """Instantiate a ProgressRow, insert at the top of the stack."""

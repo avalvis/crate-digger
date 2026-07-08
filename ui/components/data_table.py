@@ -507,6 +507,15 @@ class VirtualDataTable(ctk.CTkFrame):
         self._scroll_to_row(row_index)
         self._fire_selection_changed()
 
+    def scroll_to_and_select(self, row_index: int) -> None:
+        """Public API: scroll a row into view and select it."""
+        if not self._rows:
+            return
+        row_index = max(0, min(row_index, len(self._rows) - 1))
+        self._set_cursor(row_index)
+        self.focus_set()
+        self._render_visible()
+
     # ── Row click handling ──
 
     def _on_row_clicked(self, row_index: int, event) -> None:

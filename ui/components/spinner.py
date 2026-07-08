@@ -81,7 +81,7 @@ class Spinner(ctk.CTkFrame):
         self._canvas.pack(fill="both", expand=True)
 
         # Draw initial frame so the spinner is visible even before start()
-        self._draw()
+        self._paint_arc()
 
         # Auto-pause when unmapped (hidden tab), auto-resume when re-mapped.
         self.bind("<Map>", self._on_map, add="+")
@@ -103,6 +103,8 @@ class Spinner(ctk.CTkFrame):
             except Exception:
                 pass
             self._after_handle = None
+        if hasattr(self, "_canvas"):
+            self._canvas.delete("all")
 
     # ── Internals ──
 
@@ -110,10 +112,14 @@ class Spinner(ctk.CTkFrame):
         if not self._running:
             return
         self._angle = (self._angle + self._DEGREES_PER_TICK) % 360
-        self._draw()
+        self._paint_arc()
         self._after_handle = self.after(self._TICK_MS, self._tick)
 
-    def _draw(self, *args, **kwargs) -> None:
+    def _draw(self, no_color_updates: bool = False) -> None:
+        """CustomTkinter internal hook — delegate to base frame drawing."""
+        super()._draw(no_color_updates=no_color_updates)
+
+    def _paint_arc(self, *args, **kwargs) -> None:
         if not hasattr(self, "_canvas"):
             return
         self._canvas.delete("all")

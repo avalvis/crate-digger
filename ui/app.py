@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Optional
 
 import customtkinter as ctk
@@ -67,6 +67,22 @@ class AppContext:
 
     _toast_publisher: Optional[Callable[[str, ToastKind], None]] = None
     _tab_switcher: Optional[Callable[[str], None]] = None
+    _vault_focuser: Optional[Callable[[int], None]] = None
+    _config_listeners: list[Callable[[], None]] = field(
+        default_factory=list, repr=False,
+    )
+
+    def on_config_changed(self, listener: Callable[[], None]) -> None:
+        """Register a callback fired after credentials or prefs change."""
+        if listener not in self._config_listeners:
+            self._config_listeners.append(listener)
+
+    def notify_config_changed(self) -> None:
+        for cb in list(self._config_listeners):
+            try:
+                cb()
+            except Exception:
+                self.logger.exception("Config-change listener failed")
 
     def publish_toast(
         self,
@@ -75,6 +91,7 @@ class AppContext:
         *,
         action_label: Optional[str] = None,
         action_callback: Optional[Callable[[], None]] = None,
+        on_action_error: Optional[Callable[[Exception], None]] = None,
     ) -> None:
         if self._toast_publisher is not None:
             self._toast_publisher(
@@ -82,11 +99,16 @@ class AppContext:
                 kind,
                 action_label=action_label,  # type: ignore[call-arg]
                 action_callback=action_callback,  # type: ignore[call-arg]
+                on_action_error=on_action_error,  # type: ignore[call-arg]
             )
 
     def switch_to_tab(self, key: str) -> None:
         if self._tab_switcher is not None:
             self._tab_switcher(key)
+
+    def focus_vault_track(self, track_id: int) -> None:
+        if self._vault_focuser is not None:
+            self._vault_focuser(track_id)
 
 
 # ─── The App ────────────────────────────────────────────────────────
@@ -147,6 +169,7 @@ class CrateDiggerApp:
         )
         self._context._toast_publisher = self._publish_toast
         self._context._tab_switcher = self._show_tab
+        self._context._vault_focuser = self._switch_to_vault_and_focus
 
         self._nav_items: list[NavItem] = self._build_nav_items()
         self._nav_buttons: dict[str, SidebarNavButton] = {}
@@ -456,6 +479,12 @@ class CrateDiggerApp:
 
     def _show_tab(self, key: str) -> None:
         if key == self._active_tab_key:
+            tab = self._built_tabs.get(key)
+            if tab is not None and hasattr(tab, "on_tab_visible"):
+                try:
+                    tab.on_tab_visible()  # type: ignore[attr-defined]
+                except Exception:
+                    self._log.exception("Tab refresh failed for %s", key)
             return
 
         if key not in self._built_tabs:
@@ -477,11 +506,28 @@ class CrateDiggerApp:
             self._active_tab_key is not None
             and self._active_tab_key in self._built_tabs
         ):
-            self._built_tabs[self._active_tab_key].grid_remove()
+            prev = self._built_tabs[self._active_tab_key]
+            if hasattr(prev, "on_tab_hidden"):
+                try:
+                    prev.on_tab_hidden()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            prev.grid_remove()
 
-        self._built_tabs[key].grid(row=0, column=0, sticky="nsew")
+        shown = self._built_tabs[key]
+        shown.grid(row=0, column=0, sticky="nsew")
         self._active_tab_key = key
         self._update_nav_highlights()
+        if hasattr(shown, "on_tab_visible"):
+            try:
+                shown.on_tab_visible()  # type: ignore[attr-defined]
+            except Exception:
+                self._log.exception("Tab visible hook failed for %s", key)
+        if self._toast_layer is not None:
+            try:
+                self._toast_layer.lift()
+            except Exception:
+                pass
 
     def _update_nav_highlights(self) -> None:
         for key, btn in self._nav_buttons.items():
@@ -509,15 +555,22 @@ class CrateDiggerApp:
             )
         elif event.type == QueueEventType.JOB_COMPLETED:
             track_id = event.track_id
-            self._publish_toast(
-                f"Added: {event.display_name or 'track'}",
-                "success",
-                action_label="Show in Vault" if track_id else None,
-                action_callback=(
-                    (lambda tid=track_id: self._switch_to_vault_and_focus(tid))
-                    if track_id else None
-                ),
-            )
+            # Manual Rip shows inline success on the progress row — skip
+            # the duplicate shell toast when that tab is active.
+            if self._active_tab_key != "manual_rip":
+                self._publish_toast(
+                    f"Added: {event.display_name or 'track'}",
+                    "success",
+                    action_label="Show in Vault" if track_id else None,
+                    action_callback=(
+                        (lambda tid=track_id: self._switch_to_vault_and_focus(tid))
+                        if track_id else None
+                    ),
+                    on_action_error=lambda _e: self._publish_toast(
+                        "Could not open that track in the Vault.",
+                        "warning",
+                    ),
+                )
         elif event.type == QueueEventType.JOB_FAILED:
             self._publish_toast(
                 f"Failed: {event.error_message or 'unknown error'}",
@@ -547,14 +600,17 @@ class CrateDiggerApp:
         *,
         action_label: Optional[str] = None,
         action_callback: Optional[Callable[[], None]] = None,
+        on_action_error: Optional[Callable[[Exception], None]] = None,
     ) -> None:
         if self._toast_layer is None:
             return
+        self._toast_layer.lift()
         self._toast_layer.show(
             message,
             kind=kind,
             action_label=action_label,
             action_callback=action_callback,
+            on_action_error=on_action_error,
         )
 
 

@@ -43,6 +43,7 @@ demucs==4.0.1
 # ─── Persistence & Config ────────────────────────────────────────────
 # sqlite3 is stdlib; no dependency needed
 pydantic>=2.8                  # Used by utils/config.py for schema validation
+keyring>=25.0                  # OS credential store for Discogs/DeepSeek keys
 
 # ─── Packaging (dev only, not required at runtime) ───────────────────
 pyinstaller>=6.10 ; extra == "build"

@@ -78,6 +78,7 @@ class ToastLayer:
         duration_ms: Optional[int] = None,
         action_label: Optional[str] = None,
         action_callback: Optional[Callable[[], None]] = None,
+        on_action_error: Optional[Callable[[Exception], None]] = None,
     ) -> "Toast":
         """
         Display a toast. Returns the Toast handle so callers can
@@ -97,12 +98,22 @@ class ToastLayer:
             duration_ms=duration_ms or self._geom.default_duration_ms,
             action_label=action_label,
             action_callback=action_callback,
+            on_action_error=on_action_error,
             on_dismissed=self._on_toast_dismissed,
         )
         self._active.append(t)
         self._reflow()
+        self.lift()
         t.slide_in()
         return t
+
+    def lift(self) -> None:
+        """Keep toasts above tab content after tab switches."""
+        for toast in self._active:
+            try:
+                toast.lift()
+            except Exception:
+                pass
 
     def clear(self) -> None:
         """Dismiss every active toast immediately. Used during shutdown."""
@@ -141,6 +152,7 @@ class Toast(ctk.CTkFrame):
         duration_ms: int,
         action_label: Optional[str],
         action_callback: Optional[Callable[[], None]],
+        on_action_error: Optional[Callable[[Exception], None]],
         on_dismissed: Callable[["Toast"], None],
     ) -> None:
         super().__init__(
@@ -155,6 +167,7 @@ class Toast(ctk.CTkFrame):
         self._geom = geometry
         self._duration_ms = duration_ms
         self._on_dismissed = on_dismissed
+        self._on_action_error = on_action_error
         self._dismiss_handle: Optional[str] = None
         self._slide_handle: Optional[str] = None
         self._current_y: int = geometry.margin_top
@@ -431,9 +444,10 @@ class Toast(ctk.CTkFrame):
     def _on_action_clicked(self, cb: Callable[[], None]) -> None:
         try:
             cb()
-        except Exception:
-            # Toast actions must never crash the UI — the caller is
-            # responsible for surfacing action errors via their own
-            # toast/dialog.
-            pass
+        except Exception as e:
+            if self._on_action_error is not None:
+                try:
+                    self._on_action_error(e)
+                except Exception:
+                    pass
         self.dismiss(animated=True)

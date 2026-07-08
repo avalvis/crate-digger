@@ -1062,6 +1062,8 @@ class SettingsTab(ctk.CTkFrame):
             self._config.update_discovery(default_min_have=n)
         except ConfigError as e:
             self._ctx.publish_toast(str(e), kind="error")
+        else:
+            self._ctx.notify_config_changed()
 
     def _save_reel_size(self, value: str) -> None:
         try:
@@ -1072,12 +1074,16 @@ class SettingsTab(ctk.CTkFrame):
             self._config.update_discovery(reel_size=n)
         except ConfigError as e:
             self._ctx.publish_toast(str(e), kind="error")
+        else:
+            self._ctx.notify_config_changed()
 
     def _save_prioritize_samples(self, value: bool) -> None:
         try:
             self._config.update_discovery(prioritize_samples=bool(value))
         except ConfigError as e:
             self._ctx.publish_toast(str(e), kind="error")
+        else:
+            self._ctx.notify_config_changed()
 
     def _on_intensity_slider(self, value: float) -> None:
         self._update_intensity_label(value)
@@ -1091,6 +1097,8 @@ class SettingsTab(ctk.CTkFrame):
             self._config.update_discovery(sample_weight_intensity=round(value, 2))
         except ConfigError as e:
             self._ctx.publish_toast(str(e), kind="error")
+        else:
+            self._ctx.notify_config_changed()
 
     def _update_intensity_label(self, value: float) -> None:
         if self._intensity_label is not None:
@@ -1101,6 +1109,8 @@ class SettingsTab(ctk.CTkFrame):
             self._config.update_discovery(allow_compilations=bool(value))
         except ConfigError as e:
             self._ctx.publish_toast(str(e), kind="error")
+        else:
+            self._ctx.notify_config_changed()
 
     def _on_preview_volume_slider(self, value: float) -> None:
         self._update_preview_volume_label(value)
@@ -1188,11 +1198,12 @@ class SettingsTab(ctk.CTkFrame):
             self._ctx.publish_toast(str(e), kind="error")
             return
 
+        engine_ready = False
         if snap.discogs_token:
-            # Update existing engine or create a new one (first-time token save).
             if self._ctx.discovery is not None:
                 try:
                     self._ctx.discovery.update_discogs_token(snap.discogs_token)
+                    engine_ready = True
                 except Exception:
                     self._log.exception("Failed to update DiscoveryEngine token")
             else:
@@ -1203,11 +1214,22 @@ class SettingsTab(ctk.CTkFrame):
                         discogs_token=snap.discogs_token,
                         logger=self._log.getChild("discovery"),
                     )
+                    engine_ready = True
                     self._log.info("DiscoveryEngine created after first token save.")
                 except Exception:
                     self._log.exception("Failed to create DiscoveryEngine")
             self._token_entry.set("•" * 20)
-            self._ctx.publish_toast("Discogs token saved.", kind="success")
+            if engine_ready:
+                self._ctx.publish_toast(
+                    "Discogs token saved. Digital Crate is ready to dig.",
+                    kind="success",
+                )
+            else:
+                self._ctx.publish_toast(
+                    "Token saved but discovery failed to start. "
+                    "Check your token and try again.",
+                    kind="error",
+                )
         else:
             if self._ctx.discovery is not None:
                 try:
@@ -1219,6 +1241,7 @@ class SettingsTab(ctk.CTkFrame):
 
         self._refresh_token_status(snap)
         self._refresh_discovery_health()
+        self._ctx.notify_config_changed()
 
     def _save_deepseek_key(self, value: str) -> None:
         value = (value or "").strip()
@@ -1253,6 +1276,14 @@ class SettingsTab(ctk.CTkFrame):
             self._deepseek_entry.set("")
             self._ctx.publish_toast("DeepSeek key cleared.", kind="info")
 
+        self._refresh_deepseek_status(snap)
+        self._ctx.notify_config_changed()
+
+    def on_tab_visible(self) -> None:
+        """Refresh health readouts when returning to Settings."""
+        self._refresh_discovery_health()
+        snap = self._config.snapshot()
+        self._refresh_token_status(snap)
         self._refresh_deepseek_status(snap)
 
     # ── Browse buttons ──
