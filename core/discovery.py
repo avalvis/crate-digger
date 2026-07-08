@@ -66,6 +66,8 @@ class DiscoveryFilters:
     format: Optional[str] = None           # Discogs format (Vinyl, CD, etc.)
     query: Optional[str] = None            # Free-text keyword search
     min_have: int = 10                     # min community `have` count
+    max_have: int = 3000                   # max `have` count — excludes
+                                            # mainstream/overly common records
 
     # Sample-friendliness weighting (see core.sampling_taxonomy).
     prioritize_samples: bool = True        # tilt ranking toward sample-friendly
@@ -496,6 +498,8 @@ class DiscoveryEngine:
                 if cand is None:
                     continue
                 if cand.have < filters.min_have:
+                    continue
+                if cand.have > filters.max_have:
                     continue
                 if not self._year_in_range(cand.year, filters):
                     continue

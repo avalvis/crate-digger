@@ -85,6 +85,7 @@ class SettingsTab(ctk.CTkFrame):
         # Field widgets we need to read/write later.
         self._vault_entry: Optional[GlowEntry] = None
         self._staging_entry: Optional[GlowEntry] = None
+        self._mpc_root_entry: Optional[GlowEntry] = None
         self._token_entry: Optional[GlowEntry] = None
         self._workers_dropdown: Optional[ctk.CTkOptionMenu] = None
         self._stems_default_switch: Optional[ctk.CTkSwitch] = None
@@ -99,6 +100,7 @@ class SettingsTab(ctk.CTkFrame):
         self._deepseek_entry: Optional[GlowEntry] = None
         self._deepseek_status_label: Optional[ctk.CTkLabel] = None
         self._min_have_entry: Optional[ctk.CTkEntry] = None
+        self._max_have_entry: Optional[ctk.CTkEntry] = None
         self._reel_size_dropdown: Optional[ctk.CTkOptionMenu] = None
         self._prioritize_switch: Optional[ctk.CTkSwitch] = None
         self._prioritize_var: Optional[ctk.BooleanVar] = None
@@ -321,6 +323,46 @@ class SettingsTab(ctk.CTkFrame):
         )
         self._folder_scheme_dropdown.pack(padx=2, pady=2)
 
+        # MPC Samples folder (destination for the Digital Crate "MPC
+        # Workflow" button — typically an MPC SD card path).
+        self._field_label(
+            body,
+            6,
+            "MPC Samples folder",
+            "Destination for the Digital Crate → MPC Workflow button. "
+            "Stems are organized as <folder>/<Artist - Title>/<stem>.wav "
+            "and never touch the Vault.",
+        )
+
+        mpc_row = ctk.CTkFrame(body, fg_color="transparent")
+        mpc_row.grid(row=7, column=0, sticky="ew", pady=(t.space.lg, 0))
+        mpc_row.grid_columnconfigure(0, weight=1)
+
+        self._mpc_root_entry = GlowEntry(
+            mpc_row,
+            t,
+            placeholder="E:\\Samples\\Crate Digger",
+            show_clear_button=False,
+            on_submit=lambda v: self._save_mpc_root(v),
+        )
+        self._mpc_root_entry.grid(row=0, column=0, sticky="ew", padx=(0, t.space.sm))
+        self._mpc_root_entry._entry.bind(
+            "<KeyRelease>",
+            lambda _e: self._debounce(
+                "mpc_samples_root",
+                lambda: self._save_mpc_root(self._mpc_root_entry.get()),
+            ),
+            add="+",
+        )
+
+        ctk.CTkButton(
+            mpc_row,
+            text="Browse…",
+            command=self._pick_mpc_root,
+            **style_secondary_button(t),
+            width=100,
+        ).grid(row=0, column=1, sticky="e")
+
         return row + 3  # heading + subtitle + card row
 
     # ── Ingestion section ──
@@ -532,11 +574,29 @@ class SettingsTab(ctk.CTkFrame):
             "<Return>", lambda _e: self._save_min_have(), add="+",
         )
 
-        self._field_label(body, 2, "Reel size", "How many cards each Dig fills.")
+        self._field_label(
+            body, 2, "Maximum collectors (avoid mainstream hits)",
+            "Discogs 'have' ceiling — records above this are excluded as "
+            "too common/popular to be a 'gem'. Set high to disable.",
+        )
+        self._max_have_entry = ctk.CTkEntry(
+            body, width=100, height=38,
+            **{k: v for k, v in style_input(t).items() if k != "height"},
+            justify="center",
+        )
+        self._max_have_entry.grid(row=3, column=0, sticky="w", pady=(0, t.space.md))
+        self._max_have_entry.bind(
+            "<FocusOut>", lambda _e: self._save_max_have(), add="+",
+        )
+        self._max_have_entry.bind(
+            "<Return>", lambda _e: self._save_max_have(), add="+",
+        )
+
+        self._field_label(body, 4, "Reel size", "How many cards each Dig fills.")
         _reel_wrapper = ctk.CTkFrame(
             body, fg_color=t.border.strong, border_width=0, corner_radius=t.radius.md,
         )
-        _reel_wrapper.grid(row=3, column=0, sticky="w", pady=(0, t.space.md))
+        _reel_wrapper.grid(row=5, column=0, sticky="w", pady=(0, t.space.md))
         self._reel_size_dropdown = ctk.CTkOptionMenu(
             _reel_wrapper,
             values=[str(n) for n in (4, 6, 8, 10, 12, 16)],
@@ -555,12 +615,12 @@ class SettingsTab(ctk.CTkFrame):
         self._reel_size_dropdown.pack(padx=2, pady=2)
 
         self._field_label(
-            body, 4, "Prioritize sample-friendly genres",
+            body, 6, "Prioritize sample-friendly genres",
             "Tilts the roulette toward funk, soul, jazz, Greek gems, etc. "
             "Nothing is ever fully excluded.",
         )
         prio_row = ctk.CTkFrame(body, fg_color="transparent")
-        prio_row.grid(row=5, column=0, sticky="w", pady=(0, t.space.sm))
+        prio_row.grid(row=7, column=0, sticky="w", pady=(0, t.space.sm))
         self._prioritize_var = ctk.BooleanVar(value=True)
         self._prioritize_switch = ctk.CTkSwitch(
             prio_row, text="", variable=self._prioritize_var,
@@ -573,9 +633,9 @@ class SettingsTab(ctk.CTkFrame):
         )
         self._prioritize_switch.pack(side="left")
 
-        self._field_label(body, 6, "Sample-weight intensity")
+        self._field_label(body, 8, "Sample-weight intensity")
         intensity_row = ctk.CTkFrame(body, fg_color="transparent")
-        intensity_row.grid(row=7, column=0, sticky="ew", pady=(0, t.space.md))
+        intensity_row.grid(row=9, column=0, sticky="ew", pady=(0, t.space.md))
         intensity_row.grid_columnconfigure(0, weight=1)
         self._intensity_slider = ctk.CTkSlider(
             intensity_row, from_=0.0, to=1.0, number_of_steps=20,
@@ -592,11 +652,11 @@ class SettingsTab(ctk.CTkFrame):
         self._intensity_label.grid(row=0, column=1)
 
         self._field_label(
-            body, 8, "Allow compilations",
+            body, 10, "Allow compilations",
             "Include Various Artists comps — many breaks live on them.",
         )
         comp_row = ctk.CTkFrame(body, fg_color="transparent")
-        comp_row.grid(row=9, column=0, sticky="w", pady=(0, t.space.md))
+        comp_row.grid(row=11, column=0, sticky="w", pady=(0, t.space.md))
         self._compilations_var = ctk.BooleanVar(value=False)
         self._compilations_switch = ctk.CTkSwitch(
             comp_row, text="", variable=self._compilations_var,
@@ -609,9 +669,9 @@ class SettingsTab(ctk.CTkFrame):
         )
         self._compilations_switch.pack(side="left")
 
-        self._field_label(body, 10, "Preview volume")
+        self._field_label(body, 12, "Preview volume")
         pv_row = ctk.CTkFrame(body, fg_color="transparent")
-        pv_row.grid(row=11, column=0, sticky="ew", pady=(0, t.space.md))
+        pv_row.grid(row=13, column=0, sticky="ew", pady=(0, t.space.md))
         pv_row.grid_columnconfigure(0, weight=1)
         self._preview_volume_slider = ctk.CTkSlider(
             pv_row, from_=0.0, to=1.0, number_of_steps=20,
@@ -631,7 +691,7 @@ class SettingsTab(ctk.CTkFrame):
             body, text="", text_color=t.text.muted,
             font=t.font.caption, anchor="w", justify="left", wraplength=680,
         )
-        self._discovery_health_label.grid(row=12, column=0, sticky="w")
+        self._discovery_health_label.grid(row=14, column=0, sticky="w")
 
         return row + 3
 
@@ -864,9 +924,41 @@ class SettingsTab(ctk.CTkFrame):
             **style_ghost_button(t),
         ).grid(row=0, column=2, sticky="e")
 
-        # Row 2: reset defaults
+        # Row 2: preview cache
+        cache_row = ctk.CTkFrame(body, fg_color="transparent")
+        cache_row.grid(row=2, column=0, sticky="ew", pady=(t.space.md, 0))
+        cache_row.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            cache_row,
+            text="Preview cache",
+            text_color=t.text.secondary,
+            font=t.font.caption,
+            width=140,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+
+        ctk.CTkLabel(
+            cache_row,
+            text="Downloaded audio cached for in-app previews. "
+                 "Stale entries are also cleared automatically on startup.",
+            text_color=t.text.primary,
+            font=t.font.body,
+            anchor="w",
+            wraplength=460,
+            justify="left",
+        ).grid(row=0, column=1, sticky="w")
+
+        ctk.CTkButton(
+            cache_row,
+            text="Clear cache",
+            command=self._clear_preview_cache,
+            **style_ghost_button(t),
+        ).grid(row=0, column=2, sticky="e")
+
+        # Row 3: reset defaults
         reset_row = ctk.CTkFrame(body, fg_color="transparent")
-        reset_row.grid(row=2, column=0, sticky="ew", pady=(t.space.md, 0))
+        reset_row.grid(row=3, column=0, sticky="ew", pady=(t.space.lg, 0))
 
         ctk.CTkButton(
             reset_row,
@@ -876,6 +968,20 @@ class SettingsTab(ctk.CTkFrame):
         ).pack(anchor="w")
 
         return row + 1
+
+    def _clear_preview_cache(self) -> None:
+        if self._ctx.preview is None:
+            self._ctx.publish_toast("Preview cache is unavailable.", "error")
+            return
+        try:
+            removed = self._ctx.preview.clear_cache()
+        except Exception as e:
+            self._ctx.publish_toast(f"Could not clear cache: {e}", "error")
+            return
+        self._ctx.publish_toast(
+            f"Cleared {removed} cached preview file{'s' if removed != 1 else ''}.",
+            "success" if removed else "info",
+        )
 
     # ── Initial population from config ──
 
@@ -888,6 +994,9 @@ class SettingsTab(ctk.CTkFrame):
 
         if self._staging_entry is not None:
             self._staging_entry.set(cfg.general.staging_root)
+
+        if self._mpc_root_entry is not None:
+            self._mpc_root_entry.set(cfg.general.mpc_samples_root)
 
         if self._workers_dropdown is not None:
             self._workers_dropdown.set(str(cfg.general.concurrent_workers))
@@ -920,6 +1029,9 @@ class SettingsTab(ctk.CTkFrame):
         if self._min_have_entry is not None:
             self._min_have_entry.delete(0, "end")
             self._min_have_entry.insert(0, str(disc.default_min_have))
+        if self._max_have_entry is not None:
+            self._max_have_entry.delete(0, "end")
+            self._max_have_entry.insert(0, str(disc.max_have))
         if self._reel_size_dropdown is not None:
             self._reel_size_dropdown.set(str(disc.reel_size))
         if self._prioritize_var is not None:
@@ -994,6 +1106,26 @@ class SettingsTab(ctk.CTkFrame):
         except ConfigError as e:
             self._ctx.publish_toast(str(e), kind="error")
 
+    def _save_mpc_root(self, value: str) -> None:
+        value = self._normalize_path(value)
+        if not value:
+            return
+        try:
+            # Best-effort mkdir — on a not-yet-inserted SD card this will
+            # fail, which is fine; the folder just needs to exist by the
+            # time the user actually clicks "MPC Workflow".
+            Path(value).expanduser().mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            self._ctx.publish_toast(
+                f"Could not create folder: {e}",
+                kind="error",
+            )
+            return
+        try:
+            self._config.update_general(mpc_samples_root=str(Path(value).expanduser()))
+        except ConfigError as e:
+            self._ctx.publish_toast(str(e), kind="error")
+
     def _save_worker_count(self, value: str) -> None:
         try:
             n = int(value)
@@ -1060,6 +1192,20 @@ class SettingsTab(ctk.CTkFrame):
             return
         try:
             self._config.update_discovery(default_min_have=n)
+        except ConfigError as e:
+            self._ctx.publish_toast(str(e), kind="error")
+        else:
+            self._ctx.notify_config_changed()
+
+    def _save_max_have(self) -> None:
+        if self._max_have_entry is None:
+            return
+        try:
+            n = int(self._max_have_entry.get().strip())
+        except ValueError:
+            return
+        try:
+            self._config.update_discovery(max_have=n)
         except ConfigError as e:
             self._ctx.publish_toast(str(e), kind="error")
         else:
@@ -1312,6 +1458,18 @@ class SettingsTab(ctk.CTkFrame):
             self._staging_entry.set(chosen)
             self._save_staging_root(chosen)
 
+    def _pick_mpc_root(self) -> None:
+        current = self._mpc_root_entry.get() if self._mpc_root_entry else ""
+        initial = str(Path(current).expanduser()) if current else str(Path.home())
+        chosen = filedialog.askdirectory(
+            title="Choose MPC Samples folder",
+            initialdir=initial,
+            mustexist=False,
+        )
+        if chosen:
+            self._mpc_root_entry.set(chosen)
+            self._save_mpc_root(chosen)
+
     # ── Reset ──
 
     def _confirm_reset(self) -> None:
@@ -1344,6 +1502,7 @@ class SettingsTab(ctk.CTkFrame):
             )
             self._config.update_discovery(
                 default_min_have=10,
+                max_have=3000,
                 reel_size=8,
                 prioritize_samples=True,
                 sample_weight_intensity=0.6,

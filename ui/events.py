@@ -105,7 +105,7 @@ class UiEventBridge:
         self._unsub_from_core: Optional[Callable[[], None]] = None
 
         # Coalescing buffer (Tk-thread only — no lock needed)
-        # Key: (type, job_id) → latest event
+        # Key: (type, job_id, stage) → latest event
         self._coalesce_buf: "OrderedDict[tuple, QueueEvent]" = OrderedDict()
 
         # Simple instrumentation — handy for debugging "where did the
@@ -269,11 +269,22 @@ class UiEventBridge:
     def _add_to_buffer(self, event: QueueEvent) -> None:
         """
         Add event to the coalesce buffer. For coalescable types, newer
-        events replace older ones with the same (type, job_id) key,
+        events replace older ones with the same (type, job_id, stage) key,
         keeping the UI from processing obsolete progress numbers.
+
+        Keying on `stage` too (not just type+job_id) matters: a job races
+        through several pipeline stages (artwork/tag/relocate/index) fast
+        enough that they can all land in the same ~33ms pump window. If
+        every stage shared one key, each new stage's event would silently
+        overwrite the previous stage's *unshown* event, so the UI would
+        visibly skip stages entirely — jumping from "Analyzing" straight
+        to "Complete" with no frame in between. Splitting by stage
+        guarantees at least one dispatched frame per stage transition,
+        while same-stage progress ticks (e.g. BPM analysis's 0-99%) still
+        coalesce exactly as before.
         """
         if event.type in _COALESCABLE_TYPES and event.job_id is not None:
-            key: tuple = (event.type, event.job_id)
+            key: tuple = (event.type, event.job_id, event.stage)
             if key in self._coalesce_buf:
                 self._events_coalesced += 1
                 # Remove + re-insert to move it to the end (FIFO order

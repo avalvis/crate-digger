@@ -17,6 +17,7 @@ from __future__ import annotations
 import threading
 import webbrowser
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
 
 import customtkinter as ctk
@@ -29,6 +30,11 @@ from core.discovery import (
     DiscoveryThrottledError,
     NoResultsError,
     NoYouTubeMatchError,
+)
+from core.mpc_export import (
+    MpcSampleExportCancelledError,
+    MpcSampleExportError,
+    export_sample_to_mpc,
 )
 from core.pipeline import PipelineRequest
 from core.sampling_taxonomy import sample_affinity
@@ -214,14 +220,15 @@ class DigitalCrateTab(ctk.CTkFrame):
             **style_label_meta(t), wraplength=760, justify="left",
         ).grid(row=1, column=0, sticky="w", pady=(t.space.xs, t.space.xl))
 
-        self._build_token_warning(content, row=2)
-        self._build_presets(content, row=3)
-        self._build_filters_card(content, row=4)
-        self._build_dig_row(content, row=5)
-        self._build_reel_area(content, row=6)
-        self._build_recent_digs(content, row=7)
+        next_row = 2
+        next_row = self._build_token_warning(content, next_row)
+        next_row = self._build_presets(content, next_row)
+        next_row = self._build_filters_card(content, next_row)
+        next_row = self._build_dig_row(content, next_row)
+        next_row = self._build_reel_area(content, next_row)
+        next_row = self._build_recent_digs(content, next_row)
 
-    def _build_token_warning(self, parent, row: int) -> None:
+    def _build_token_warning(self, parent, row: int) -> int:
         t = self._theme
         card = ctk.CTkFrame(
             parent, fg_color=t.surface.raised, border_color=t.status.warning,
@@ -250,6 +257,7 @@ class DigitalCrateTab(ctk.CTkFrame):
                       **style_secondary_button(t), width=130).grid(
             row=0, column=2, sticky="e", padx=(0, t.space.lg), pady=t.space.md)
         self._token_warning_card = card
+        return row + 1
 
     def _sync_discovery_prefs(self) -> None:
         """Pull discovery prefs from config (e.g. after Settings changes)."""
@@ -263,7 +271,7 @@ class DigitalCrateTab(ctk.CTkFrame):
         if self._reel_size_var is not None:
             self._reel_size_var.set(str(disc.reel_size))
 
-    def _build_presets(self, parent, row: int) -> None:
+    def _build_presets(self, parent, row: int) -> int:
         t = self._theme
         ctk.CTkLabel(parent, text="Era presets",
                      **style_label_subheading(t)).grid(
@@ -287,8 +295,9 @@ class DigitalCrateTab(ctk.CTkFrame):
                      sticky="w")
             self._preset_buttons.append(btn)
             col += 1
+        return row + 2
 
-    def _build_filters_card(self, parent, row: int) -> None:
+    def _build_filters_card(self, parent, row: int) -> int:
         t = self._theme
         card = ctk.CTkFrame(parent, **style_card_elevated(t))
         card.grid(row=row, column=0, sticky="ew", pady=(0, t.space.lg))
@@ -402,6 +411,7 @@ class DigitalCrateTab(ctk.CTkFrame):
             **style_label_meta(t), anchor="w",
         ).grid(row=8, column=0, columnspan=2, sticky="w",
                pady=(t.space.md, 0))
+        return row + 1
 
     def _make_size_dropdown(self, parent) -> ctk.CTkOptionMenu:
         t = self._theme
@@ -468,7 +478,7 @@ class DigitalCrateTab(ctk.CTkFrame):
                     padx=(0 if col == 0 else t.space.md, t.space.md))
         parent.grid_columnconfigure(col, weight=1)
 
-    def _build_dig_row(self, parent, row: int) -> None:
+    def _build_dig_row(self, parent, row: int) -> int:
         t = self._theme
         dig_row = ctk.CTkFrame(parent, fg_color="transparent")
         dig_row.grid(row=row, column=0, sticky="ew", pady=(0, t.space.lg))
@@ -493,8 +503,9 @@ class DigitalCrateTab(ctk.CTkFrame):
         self._health_label.pack(side="right")
 
         self._set_dig_status(None)
+        return row + 1
 
-    def _build_reel_area(self, parent, row: int) -> None:
+    def _build_reel_area(self, parent, row: int) -> int:
         t = self._theme
         ctk.CTkLabel(parent, text="The reel",
                      **style_label_subheading(t)).grid(
@@ -516,8 +527,9 @@ class DigitalCrateTab(ctk.CTkFrame):
                      text="Pick a preset or set filters, then hit Dig.",
                      **style_label_meta(t)).pack(pady=(t.space.xs, 0))
         self._reel_empty = empty
+        return row + 2
 
-    def _build_recent_digs(self, parent, row: int) -> None:
+    def _build_recent_digs(self, parent, row: int) -> int:
         t = self._theme
         ctk.CTkLabel(parent, text="Recent digs",
                      **style_label_subheading(t)).grid(
@@ -526,6 +538,7 @@ class DigitalCrateTab(ctk.CTkFrame):
         frame.grid(row=row + 1, column=0, sticky="ew")
         frame.grid_columnconfigure(0, weight=1)
         self._recent_frame = frame
+        return row + 2
 
     # ── Presets ──
 
@@ -800,6 +813,7 @@ class DigitalCrateTab(ctk.CTkFrame):
             format=norm(self._format_var.get()),
             query=norm(self._query_var.get()),
             min_have=snap.config.discovery.default_min_have,
+            max_have=snap.config.discovery.max_have,
             prioritize_samples=bool(self._prioritize_var.get()),
             sample_intensity=float(intensity),
             allow_compilations=bool(self._compilations_var.get()),
@@ -846,9 +860,11 @@ class _ReelCard(ctk.CTkFrame):
         self._preview_started = False
         self._recorded = False
         self._queued = False
+        self._mpc_exporting = False
         self._player: Optional[WaveformPlayer] = None
         self._preview_btn: Optional[ctk.CTkButton] = None
         self._queue_btn: Optional[ctk.CTkButton] = None
+        self._mpc_btn: Optional[ctk.CTkButton] = None
 
         self.grid_columnconfigure(0, weight=1)
         self._build()
@@ -913,6 +929,11 @@ class _ReelCard(ctk.CTkFrame):
             actions, text="Queue it", command=self._on_queue_clicked,
             **style_primary_button(t), width=120)
         self._queue_btn.pack(side="left", padx=(0, t.space.sm))
+
+        self._mpc_btn = ctk.CTkButton(
+            actions, text="◈  MPC Workflow", command=self._on_mpc_clicked,
+            **style_secondary_button(t), width=150)
+        self._mpc_btn.pack(side="left", padx=(0, t.space.sm))
 
         ctk.CTkButton(actions, text="Discogs",
                       command=self._on_open_discogs, **style_ghost_button(t),
@@ -993,6 +1014,87 @@ class _ReelCard(ctk.CTkFrame):
         self._ctx.publish_toast(f"Queued: {s.display_name}", "success")
         if self._on_queued is not None:
             self._on_queued(s)
+
+    # ── MPC sample workflow ──
+
+    def _on_mpc_clicked(self) -> None:
+        if self._mpc_exporting:
+            return
+        if self._ctx.preview is None or self._ctx.stem_separator is None \
+                or self._ctx.exporter is None:
+            self._ctx.publish_toast(
+                "MPC workflow is unavailable (missing preview/stems/exporter engine).",
+                "error",
+            )
+            return
+
+        snap = self._ctx.config.snapshot().config
+        self._mpc_exporting = True
+        if self._mpc_btn is not None:
+            self._mpc_btn.configure(state="disabled", text="Downloading…")
+        # Immediate confirmation the click registered — the actual job can
+        # take several minutes (CPU stem separation), so the user needs
+        # feedback right away, not just a button that changed color.
+        self._ctx.publish_toast(
+            f"Sending '{self._s.display_name}' to MPC — this can take a few minutes…",
+            "info",
+        )
+
+        threading.Thread(
+            target=self._mpc_worker,
+            args=(snap.general.mpc_samples_root, snap.general.staging_root),
+            daemon=True,
+        ).start()
+
+    def _mpc_worker(self, destination_root: str, staging_root: str) -> None:
+        s = self._s
+        try:
+            result = export_sample_to_mpc(
+                video_id=s.youtube_video_id,
+                artist=s.artist,
+                title=s.title,
+                destination_root=Path(destination_root),
+                staging_root=Path(staging_root),
+                preview=self._ctx.preview,
+                stem_separator=self._ctx.stem_separator,
+                exporter=self._ctx.exporter,
+                progress_callback=lambda label, _pct: self.after(
+                    0, lambda l=label: self._on_mpc_progress(l),
+                ),
+                cancel_event=self._cancel_event,
+                logger=self._log.getChild("mpc_export"),
+            )
+        except MpcSampleExportCancelledError:
+            return
+        except MpcSampleExportError as e:
+            self.after(0, lambda err=e: self._on_mpc_error(err))
+            return
+        except Exception as e:  # noqa: BLE001 — surfaced via toast
+            self._log.exception("Unexpected MPC export failure for %s", s.display_name)
+            self.after(0, lambda err=e: self._on_mpc_error(err))
+            return
+        self.after(0, lambda: self._on_mpc_done(result))
+
+    def _on_mpc_progress(self, label: str) -> None:
+        if self._mpc_btn is not None:
+            self._mpc_btn.configure(text=label)
+
+    def _on_mpc_done(self, result) -> None:
+        if self._mpc_btn is not None:
+            t = self._theme
+            self._mpc_btn.configure(
+                text="Sent to MPC ✓", state="disabled",
+                fg_color=t.status.success,
+            )
+        self._ctx.publish_toast(
+            f"Stems ready: {result.track_dir}", "success",
+        )
+
+    def _on_mpc_error(self, error: Exception) -> None:
+        self._mpc_exporting = False
+        if self._mpc_btn is not None:
+            self._mpc_btn.configure(state="normal", text="↻  Retry MPC Workflow")
+        self._ctx.publish_toast(f"MPC workflow failed: {error}", "error")
 
     def _record(self, *, was_queued: bool) -> None:
         if self._ctx.discovery is None:

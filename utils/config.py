@@ -134,6 +134,15 @@ class GeneralConfig(BaseModel):
         default=False,
         description="Whether a DeepSeek API key is stored in the OS keyring or plaintext fallback.",
     )
+    mpc_samples_root: str = Field(
+        default_factory=lambda: str(Path.home() / "Music" / "CrateDigger_MPC"),
+        description=(
+            "Destination root for the Digital Crate 'MPC Workflow' button — "
+            "typically an MPC SD card path. Tracks sent here are split into "
+            "stems and organized as <root>/<Artist - Title>/<stem>.wav, "
+            "bypassing the Vault entirely."
+        ),
+    )
 
 
 class DownloaderConfig(BaseModel):
@@ -165,6 +174,11 @@ class DiscoveryConfig(BaseModel):
     # `False` means the user hasn't entered one yet.
     has_token: bool = False
     default_min_have: int = Field(default=10, ge=1)
+    # Ceiling on Discogs "have" count — records more common than this are
+    # excluded as too mainstream to be a "gem". Discogs have/want counts
+    # don't track pure chart popularity, but a record with thousands of
+    # documented copies in circulation is definitionally not obscure.
+    max_have: int = Field(default=3000, ge=1)
 
     # How many gems a single Dig surfaces into the reel.
     reel_size: int = Field(default=8, ge=1, le=24)

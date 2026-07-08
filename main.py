@@ -494,6 +494,14 @@ def _bootstrap(splash: _SplashWindow, log: logging.Logger) -> int:
         logger=log.getChild("preview"),
     )
 
+    splash.set_status("Cleaning preview cache…")
+    try:
+        removed = preview_service.clear_stale_cache()
+        if removed:
+            log.info("Cleared %d stale preview cache file(s).", removed)
+    except Exception:
+        log.exception("Preview cache cleanup failed (non-fatal)")
+
     vault_root = Path(snap.config.general.vault_root).expanduser()
     staging_root = Path(snap.config.general.staging_root).expanduser()
 
@@ -562,6 +570,7 @@ def _bootstrap(splash: _SplashWindow, log: logging.Logger) -> int:
         discovery=discovery,
         exporter=exporter,
         preview=preview_service,
+        stem_separator=stem_separator,
         logger=log.getChild("app"),
     )
 

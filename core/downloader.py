@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
+import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -124,6 +125,15 @@ _FORMAT_SPEC = "bestaudio[ext=m4a]/bestaudio/best"
 # well above the typical 128 kbit/s AAC YouTube actually serves.
 _FALLBACK_AAC_QUALITY = "256"
 
+# YouTube's per-format stream URLs are short-lived and occasionally get
+# rejected with a 403 even though the video itself is perfectly
+# downloadable — re-extracting fresh info (a new signed URL) and trying
+# again almost always clears it. Not a network-retry (yt-dlp's own
+# `retries`/`fragment_retries` handle those); this re-runs extraction
+# from scratch.
+_DOWNLOAD_ATTEMPTS = 3
+_DOWNLOAD_RETRY_DELAY_SECONDS = 2.0
+
 
 class Downloader:
     """
@@ -209,21 +219,41 @@ class Downloader:
         ]
 
         info: dict[str, Any] | None = None
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-        except DownloadCancelledError:
-            raise
-        except (DownloadError, ExtractorError) as e:
-            # yt-dlp sometimes wraps hook exceptions — double-check the event
-            # so cancellation isn't misreported as a network failure.
+        last_error: Optional[Exception] = None
+        for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
             if cancel_event is not None and cancel_event.is_set():
-                raise DownloadCancelledError("Cancelled by user.") from e
-            self._log.error("yt-dlp failed for %s: %s", url, e)
-            raise ExtractionFailedError(str(e)) from e
-        except Exception as e:               # defensive: never leak raw tracebacks
-            self._log.exception("Unexpected downloader failure for %s", url)
-            raise ExtractionFailedError(f"Unexpected error: {e}") from e
+                raise DownloadCancelledError("Cancelled by user.")
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                last_error = None
+                break
+            except DownloadCancelledError:
+                raise
+            except (DownloadError, ExtractorError) as e:
+                # yt-dlp sometimes wraps hook exceptions — double-check the
+                # event so cancellation isn't misreported as a network failure.
+                if cancel_event is not None and cancel_event.is_set():
+                    raise DownloadCancelledError("Cancelled by user.") from e
+                last_error = e
+                if attempt < _DOWNLOAD_ATTEMPTS:
+                    self._log.warning(
+                        "yt-dlp attempt %d/%d failed for %s (%s); "
+                        "retrying with a fresh stream URL in %.0fs",
+                        attempt, _DOWNLOAD_ATTEMPTS, url, e,
+                        _DOWNLOAD_RETRY_DELAY_SECONDS,
+                    )
+                    time.sleep(_DOWNLOAD_RETRY_DELAY_SECONDS)
+            except Exception as e:           # defensive: never leak raw tracebacks
+                self._log.exception("Unexpected downloader failure for %s", url)
+                raise ExtractionFailedError(f"Unexpected error: {e}") from e
+
+        if last_error is not None:
+            self._log.error(
+                "yt-dlp failed for %s after %d attempt(s): %s",
+                url, _DOWNLOAD_ATTEMPTS, last_error,
+            )
+            raise ExtractionFailedError(str(last_error)) from last_error
 
         if info is None:
             raise ExtractionFailedError("yt-dlp returned no info.")
@@ -257,6 +287,8 @@ class Downloader:
             "ffmpeg_location": self._ffmpeg_path,
             "quiet": True,
             "no_warnings": False,
+            "no_color": True,                # otherwise raw ANSI codes leak
+                                              # into logged/surfaced error text
             "noprogress": True,              # we report via progress_hooks
             "logger": _YDLLoggerAdapter(self._log),
             "noplaylist": True,

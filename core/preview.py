@@ -26,6 +26,7 @@ import logging
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -40,6 +41,13 @@ _PLAYBACK_CHANNELS = 2
 # Default number of peak buckets across the whole track. ~2000 gives a
 # crisp waveform on a wide card without ballooning memory.
 _DEFAULT_PEAK_BUCKETS = 2000
+
+# YouTube's per-format stream URLs are short-lived and occasionally get
+# rejected with a 403 even though the video itself is perfectly
+# downloadable — re-extracting fresh info (a new signed URL) and trying
+# again almost always clears it.
+_DOWNLOAD_ATTEMPTS = 3
+_DOWNLOAD_RETRY_DELAY_SECONDS = 2.0
 
 
 # ─── Public types ────────────────────────────────────────────────────
@@ -208,6 +216,27 @@ class PreviewService:
                 pass
         return removed
 
+    def clear_stale_cache(self, max_age_days: float = 14.0) -> int:
+        """
+        Remove cache entries not worth keeping: leftover `.part` files
+        from downloads interrupted by a crash or force-quit (unusable
+        regardless of age) and complete files older than `max_age_days`.
+        Meant to be called once at app startup. Returns count removed.
+        """
+        removed = 0
+        cutoff = time.time() - (max_age_days * 86400.0)
+        for p in self._cache_dir.glob("*"):
+            if not p.is_file():
+                continue
+            try:
+                is_partial = p.suffix.lower() == ".part"
+                if is_partial or p.stat().st_mtime < cutoff:
+                    p.unlink()
+                    removed += 1
+            except OSError:
+                pass
+        return removed
+
     # ── Download ──
 
     def _download(
@@ -237,6 +266,8 @@ class PreviewService:
             "ffmpeg_location": self._ffmpeg,
             "quiet": True,
             "no_warnings": True,
+            "no_color": True,        # otherwise raw ANSI codes leak into
+                                      # logged/surfaced error text
             "noprogress": True,
             "noplaylist": True,
             "overwrites": True,
@@ -247,17 +278,36 @@ class PreviewService:
         }
 
         url = self._YT_WATCH.format(vid=vid)
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-        except PreviewCancelledError:
-            raise
-        except (DownloadError, ExtractorError) as e:
-            if cancel_event is not None and cancel_event.is_set():
-                raise PreviewCancelledError("Cancelled by user.") from e
-            raise PreviewFetchError(f"Could not fetch preview audio: {e}") from e
-        except Exception as e:  # defensive
-            raise PreviewFetchError(f"Unexpected fetch error: {e}") from e
+        info = None
+        last_error: Optional[Exception] = None
+        for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
+            self._check_cancel(cancel_event)
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                last_error = None
+                break
+            except PreviewCancelledError:
+                raise
+            except (DownloadError, ExtractorError) as e:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise PreviewCancelledError("Cancelled by user.") from e
+                last_error = e
+                if attempt < _DOWNLOAD_ATTEMPTS:
+                    self._log.warning(
+                        "yt-dlp attempt %d/%d failed for %s (%s); "
+                        "retrying with a fresh stream URL in %.0fs",
+                        attempt, _DOWNLOAD_ATTEMPTS, vid, e,
+                        _DOWNLOAD_RETRY_DELAY_SECONDS,
+                    )
+                    time.sleep(_DOWNLOAD_RETRY_DELAY_SECONDS)
+            except Exception as e:  # defensive
+                raise PreviewFetchError(f"Unexpected fetch error: {e}") from e
+
+        if last_error is not None:
+            raise PreviewFetchError(
+                f"Could not fetch preview audio: {last_error}"
+            ) from last_error
 
         path = self._locate_download(info, vid)
         if path is None:

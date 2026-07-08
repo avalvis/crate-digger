@@ -474,6 +474,13 @@ class StemSeparator:
         last_reported_pct = 0.0
         saw_model_load = False
         output_lines: list[str] = []  # full buffer for error reporting
+        last_emit_time = time.monotonic()
+        # Between demucs's tqdm bar hitting 100% and the process actually
+        # exiting, it's still flushing stem WAVs to disk with zero output —
+        # can take real time on a full song. Without a heartbeat here the
+        # UI just sits frozen on the last percent, indistinguishable from
+        # having actually hung.
+        _HEARTBEAT_SECONDS = 4.0
 
         while True:
             if cancel_event is not None and cancel_event.is_set():
@@ -486,6 +493,16 @@ class StemSeparator:
             except queue.Empty:
                 if proc.poll() is not None:
                     break
+                if time.monotonic() - last_emit_time > _HEARTBEAT_SECONDS:
+                    last_emit_time = time.monotonic()
+                    elapsed = time.monotonic() - started
+                    self._emit(
+                        progress_callback,
+                        SeparationStage.SEPARATING,
+                        last_reported_pct,
+                        elapsed,
+                        f"Separating… ({elapsed:.0f}s elapsed)",
+                    )
                 continue
 
             if line is None:
@@ -506,6 +523,7 @@ class StemSeparator:
                 lowered = line.lower()
                 if "download" in lowered or "loading" in lowered:
                     saw_model_load = True
+                    last_emit_time = time.monotonic()
                     self._emit(
                         progress_callback,
                         SeparationStage.LOADING_MODEL,
@@ -522,6 +540,7 @@ class StemSeparator:
                 mapped = 10.0 + (demucs_pct / 100.0) * 85.0
                 if mapped > last_reported_pct + 0.5:  # throttle UI spam
                     last_reported_pct = mapped
+                    last_emit_time = time.monotonic()
                     self._emit(
                         progress_callback,
                         SeparationStage.SEPARATING,

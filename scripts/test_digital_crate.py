@@ -183,7 +183,14 @@ def main() -> int:
         config.load()
 
         # Seed a fake token so the Digital Crate's token warning is hidden.
-        config.set_discogs_token("fake-token-for-stub-engine")
+        # NOTE: deliberately does NOT go through config.set_discogs_token()
+        # — that writes to the real OS keyring under a fixed, global
+        # service name shared by every ConfigManager instance (test or
+        # production), regardless of which config.json is in use. Poking
+        # the in-memory state directly keeps this test from clobbering
+        # whatever real Discogs token is stored on the machine running it.
+        config._token = "fake-token-for-stub-engine"
+        config._config.discovery.has_token = True
 
         db = VaultDatabase(td_path / "vault.db")
         qm = _StubQueueManager()
