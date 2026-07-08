@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from core.discovery import DiscoveryEngine
     from core.exporter import MPCExporter
     from core.pipeline import IngestionPipeline
+    from core.preview import PreviewService
 
 
 # ─── Nav configuration ──────────────────────────────────────────────
@@ -62,6 +63,7 @@ class AppContext:
     exporter: Optional["MPCExporter"]
     logger: logging.Logger
     pipeline: Optional["IngestionPipeline"] = None  # for live enricher updates
+    preview: Optional["PreviewService"] = None  # in-app waveform preview
 
     _toast_publisher: Optional[Callable[[str, ToastKind], None]] = None
     _tab_switcher: Optional[Callable[[str], None]] = None
@@ -103,6 +105,7 @@ class CrateDiggerApp:
         pipeline: Optional["IngestionPipeline"] = None,
         discovery: Optional["DiscoveryEngine"] = None,
         exporter: Optional["MPCExporter"] = None,
+        preview: Optional["PreviewService"] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self._log = logger or logging.getLogger("cratedigger.app")
@@ -112,6 +115,7 @@ class CrateDiggerApp:
         self._pipeline = pipeline
         self._discovery = discovery
         self._exporter = exporter
+        self._preview = preview
 
         self._root = ctk.CTk()
         self._root.report_callback_exception = self._on_tk_callback_exception
@@ -139,6 +143,7 @@ class CrateDiggerApp:
             exporter=self._exporter,
             logger=self._log.getChild("tabs"),
             pipeline=self._pipeline,
+            preview=self._preview,
         )
         self._context._toast_publisher = self._publish_toast
         self._context._tab_switcher = self._show_tab

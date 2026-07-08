@@ -60,13 +60,34 @@ class AnalysisProgress:
 
 @dataclass(slots=True, frozen=True)
 class AnalysisResult:
-    bpm: float                     # rounded to 2dp
+    bpm: float                     # rounded to 2dp (octave-corrected)
     bpm_confidence: float          # 0..1 (inter-beat interval tightness)
     musical_key: str               # e.g. "Am", "F#", "C"
     camelot_key: str               # e.g. "8A", "11B"
     key_confidence: float          # 0..1 (margin between top-2 correlations)
     duration_seconds: float
     sample_rate: int
+    # ── Rhythm grid (MPC-ready) ──
+    # `bpm_raw` is the tracker's pre-correction tempo; `bpm` may have been
+    # folded into a producer-friendly range (half/double-time correction).
+    bpm_raw: float = 0.0
+    octave_corrected: bool = False
+    beats_per_bar: int = 4
+    # Beat + downbeat grid in seconds. Empty when the track was too sparse
+    # for a stable grid. Downbeats mark bar starts — the anchor for
+    # bar-aligned loop export and chop quantization.
+    beat_times: tuple[float, ...] = ()
+    downbeat_times: tuple[float, ...] = ()
+
+    @property
+    def beat_period(self) -> float:
+        """Seconds per beat at the (corrected) BPM. 0 when BPM unknown."""
+        return 60.0 / self.bpm if self.bpm > 0 else 0.0
+
+    @property
+    def bar_period(self) -> float:
+        """Seconds per bar at the (corrected) BPM."""
+        return self.beat_period * self.beats_per_bar
 
 
 # ─── Public exceptions ───────────────────────────────────────────────
@@ -137,6 +158,9 @@ class AudioAnalyzer:
         hpss_margin: Optional[float] = 4.0,
         chroma_bins_per_octave: int = 36,
         ffmpeg_path: Optional[str] = None,
+        tempo_fold_min: float = 70.0,
+        tempo_fold_max: float = 145.0,
+        beats_per_bar: int = 4,
     ) -> None:
         """
         Args:
@@ -161,6 +185,14 @@ class AudioAnalyzer:
         self._hpss_margin = hpss_margin
         self._chroma_bpo = int(chroma_bins_per_octave)
         self._ffmpeg_path = ffmpeg_path
+        # Half/double-time correction target window. Detected tempos are
+        # folded (×2 / ÷2) until they land inside [min, max] — the range
+        # sample-based hip-hop / boombap / lofi actually lives in. Prevents
+        # a 75-BPM boombap loop from being reported as 150, or a 140 drill
+        # beat from being halved to 70.
+        self._fold_min = float(tempo_fold_min)
+        self._fold_max = float(tempo_fold_max)
+        self._beats_per_bar = int(beats_per_bar)
 
         # Pre-compute the 24×12 profile matrix. Row layout:
         #   rows  0..11  → major key rooted at pitch class i
@@ -217,10 +249,18 @@ class AudioAnalyzer:
                 f"(minimum {self.MIN_DURATION_SECONDS}s)"
             )
 
-        # ── BPM ──
+        # ── BPM + rhythm grid ──
         self._check_cancel(cancel_event)
         self._emit(progress_callback, AnalysisStage.BPM, 25.0, "Detecting BPM")
-        bpm, bpm_conf = self._detect_bpm(y, sr, librosa)
+        bpm_raw, bpm_conf, beat_times, onset_env = self._detect_bpm(y, sr, librosa)
+
+        # Half/double-time correction into the producer-friendly window.
+        bpm, octave_corrected = self._fold_tempo(bpm_raw)
+
+        # Downbeat / bar grid from the beat sequence + onset strength phase.
+        downbeat_times = self._detect_downbeats(
+            beat_times, onset_env, sr, librosa,
+        )
 
         # ── Harmonic isolation (optional) ──
         self._check_cancel(cancel_event)
@@ -237,9 +277,22 @@ class AudioAnalyzer:
 
         self._emit(progress_callback, AnalysisStage.COMPLETE, 100.0, "Analysis complete")
 
+        # Re-grid beats to the octave-corrected tempo so loop/chop math
+        # lines up with the reported BPM.
+        beat_grid = self._build_beat_grid(
+            beat_times, bpm, bpm_raw, duration,
+        )
+        if octave_corrected and beat_grid.size > 0:
+            downbeat_times = self._rescale_downbeats(
+                downbeat_times, bpm_raw, bpm,
+            )
+
         self._log.debug(
-            "Analyzed %s: BPM=%.2f (conf=%.2f)  key=%s/%s (conf=%.2f)  dur=%.1fs",
-            path.name, bpm, bpm_conf, key_name, camelot, key_conf, duration,
+            "Analyzed %s: BPM=%.2f raw=%.2f corrected=%s (conf=%.2f)  "
+            "key=%s/%s (conf=%.2f)  beats=%d downbeats=%d  dur=%.1fs",
+            path.name, bpm, bpm_raw, octave_corrected, bpm_conf,
+            key_name, camelot, key_conf,
+            len(beat_grid), len(downbeat_times), duration,
         )
 
         return AnalysisResult(
@@ -250,11 +303,18 @@ class AudioAnalyzer:
             key_confidence=key_conf,
             duration_seconds=duration,
             sample_rate=sr,
+            bpm_raw=round(bpm_raw, 2),
+            octave_corrected=octave_corrected,
+            beats_per_bar=self._beats_per_bar,
+            beat_times=tuple(float(t) for t in beat_grid),
+            downbeat_times=tuple(float(t) for t in downbeat_times),
         )
 
     # ── BPM ──
 
-    def _detect_bpm(self, y: np.ndarray, sr: int, librosa) -> tuple[float, float]:
+    def _detect_bpm(
+        self, y: np.ndarray, sr: int, librosa,
+    ) -> tuple[float, float, np.ndarray, np.ndarray]:
         # Median-aggregated onset strength is noticeably more robust on
         # drum-heavy material than the default max aggregation.
         onset_env = librosa.onset.onset_strength(y=y, sr=sr, aggregate=np.median)
@@ -267,27 +327,132 @@ class AudioAnalyzer:
         # (scalar vs 1-element array). Normalize defensively.
         tempo = float(np.atleast_1d(tempo_raw).flat[0])
 
+        beat_times = np.asarray(beat_times, dtype=np.float64)
+
         if not np.isfinite(tempo) or tempo <= 0:
-            return 0.0, 0.0
+            return 0.0, 0.0, beat_times, onset_env
 
         # Confidence proxy: how tight are the inter-beat intervals?
         # A metronomic drum loop will have ~100% of IBIs within 5% of the
         # median; a rubato jazz performance will have <50%.
-        if len(beat_times) < 4:
-            return tempo, 0.0
+        if beat_times.size < 4:
+            return tempo, 0.0, beat_times, onset_env
 
         ibis = np.diff(beat_times)
         if ibis.size == 0:
-            return tempo, 0.0
+            return tempo, 0.0, beat_times, onset_env
 
         median_ibi = float(np.median(ibis))
         if median_ibi <= 0:
-            return tempo, 0.0
+            return tempo, 0.0, beat_times, onset_env
 
         tight_fraction = float(
             np.mean(np.abs(ibis - median_ibi) / median_ibi < 0.05)
         )
-        return tempo, tight_fraction
+        return tempo, tight_fraction, beat_times, onset_env
+
+    def _fold_tempo(self, tempo: float) -> tuple[float, bool]:
+        """
+        Fold a detected tempo into [fold_min, fold_max] by halving/doubling.
+        Returns (corrected_tempo, was_corrected).
+        """
+        if not np.isfinite(tempo) or tempo <= 0:
+            return 0.0, False
+
+        corrected = float(tempo)
+        changed = False
+        # Guard against pathological loops (e.g. 300 → 150 → 75).
+        for _ in range(6):
+            if corrected < self._fold_min:
+                corrected *= 2.0
+                changed = True
+            elif corrected > self._fold_max:
+                corrected /= 2.0
+                changed = True
+            else:
+                break
+        return corrected, changed
+
+    def _detect_downbeats(
+        self,
+        beat_times: np.ndarray,
+        onset_env: np.ndarray,
+        sr: int,
+        librosa,
+    ) -> np.ndarray:
+        """
+        Pick bar starts from the beat grid. Uses onset-strength phase at
+        each beat to find which beat in the bar carries the downbeat accent.
+        """
+        if beat_times.size < self._beats_per_bar:
+            return np.array([], dtype=np.float64)
+
+        hop = 512
+        strengths = np.array([
+            float(onset_env[min(int(t * sr / hop), len(onset_env) - 1)])
+            for t in beat_times
+        ], dtype=np.float64)
+
+        best_offset = 0
+        best_score = -np.inf
+        for offset in range(self._beats_per_bar):
+            bar_scores = strengths[offset::self._beats_per_bar]
+            if bar_scores.size == 0:
+                continue
+            score = float(np.median(bar_scores))
+            if score > best_score:
+                best_score = score
+                best_offset = offset
+
+        return beat_times[best_offset::self._beats_per_bar]
+
+    def _build_beat_grid(
+        self,
+        beat_times: np.ndarray,
+        bpm: float,
+        bpm_raw: float,
+        duration: float,
+    ) -> np.ndarray:
+        """Regular beat grid aligned to the (possibly corrected) tempo."""
+        if bpm <= 0 or duration <= 0:
+            return np.array([], dtype=np.float64)
+
+        period = 60.0 / bpm
+        if beat_times.size == 0:
+            return np.arange(0.0, duration, period, dtype=np.float64)
+
+        start = float(beat_times[0])
+        if bpm_raw > 0 and abs(bpm - bpm_raw) / bpm_raw > 0.01:
+            # Phase-align to the first detected beat, then re-space to the
+            # corrected tempo.
+            ratio = bpm / bpm_raw
+            if ratio < 1.0:
+                # Halved tempo → every other beat is a grid point.
+                beat_times = beat_times[::2]
+            elif ratio > 1.0:
+                # Doubled tempo → interpolate midpoints between beats.
+                mids = (beat_times[:-1] + beat_times[1:]) / 2.0
+                beat_times = np.sort(np.concatenate([beat_times, mids]))
+            start = float(beat_times[0])
+
+        grid = np.arange(start, duration, period, dtype=np.float64)
+        if grid.size == 0:
+            grid = np.array([start], dtype=np.float64)
+        return grid
+
+    @staticmethod
+    def _rescale_downbeats(
+        downbeats: np.ndarray,
+        bpm_raw: float,
+        bpm: float,
+    ) -> np.ndarray:
+        """Stretch/compress downbeat times when tempo was octave-folded."""
+        if downbeats.size == 0 or bpm_raw <= 0 or bpm <= 0:
+            return downbeats
+        scale = bpm_raw / bpm
+        if abs(scale - 1.0) < 0.01:
+            return downbeats
+        return downbeats * scale
 
     # ── Key ──
 

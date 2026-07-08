@@ -3,17 +3,21 @@ ui/tabs/digital_crate.py
 ──────────────────────────────────────────────────────────────────────
 Crate Digger — Digital Crate (Discovery) Tab
 
-The "what am I digging today" surface. Six filter controls drive a
-single-click Dig action that queries Discogs for a matching master
-release, resolves it on YouTube Music, and presents the result as a
-card the user can Queue, Skip, or Open in external services.
+The "what am I digging today" surface. Era presets + filters drive a
+single Dig that surfaces a *reel* of sample-friendly gems from Discogs,
+each resolved on YouTube Music and previewable in-app with a scrubbable
+waveform. Queue the ones you like; skipped gems can resurface later.
+
+Guiding principle: weight, never exclude — the roulette tilts toward
+boom-bap/lo-fi/Greek gems but can still surprise with a wildcard.
 """
 
 from __future__ import annotations
 
 import threading
 import webbrowser
-from typing import TYPE_CHECKING, Optional
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Callable, Optional
 
 import customtkinter as ctk
 
@@ -27,16 +31,16 @@ from core.discovery import (
     NoYouTubeMatchError,
 )
 from core.pipeline import PipelineRequest
-from core.stems import StemModel
+from core.sampling_taxonomy import sample_affinity
 from ui.components.spinner import Spinner
+from ui.components.waveform_player import WaveformPlayer
 from ui.components.year_spinner import YearSpinner
 from ui.theme import (
-    style_card,
     style_card_elevated,
     style_ghost_button,
     style_label_body,
-    style_label_heading,
     style_label_meta,
+    style_label_heading,
     style_label_subheading,
     style_primary_button,
     style_secondary_button,
@@ -49,133 +53,62 @@ if TYPE_CHECKING:
 # ─── Filter vocabularies ────────────────────────────────────────────
 
 _FORMAT_CHOICES: list[str] = [
-    "",
-    "Vinyl",
-    "CD",
-    "Cassette",
-    "7\"",
-    "12\"",
-    "LP",
-    "Album",
-    "Single",
-    "EP",
-    "Compilation",
+    "", "Vinyl", "CD", "Cassette", "7\"", "12\"", "LP", "Album",
+    "Single", "EP", "Compilation",
 ]
 
 _COUNTRY_CHOICES: list[str] = [
-    "",  # blank = any
-    "Argentina",
-    "Australia",
-    "Belgium",
-    "Brazil",
-    "Canada",
-    "Colombia",
-    "Cuba",
-    "Ethiopia",
-    "France",
-    "Germany",
-    "Ghana",
-    "Greece",
-    "India",
-    "Italy",
-    "Jamaica",
-    "Japan",
-    "Mexico",
-    "Netherlands",
-    "Nigeria",
-    "Norway",
-    "South Africa",
-    "Spain",
-    "Sweden",
-    "Switzerland",
-    "Turkey",
-    "UK",
-    "USA",
-    "USSR",
-    "Yugoslavia",
+    "", "Argentina", "Australia", "Belgium", "Brazil", "Canada", "Colombia",
+    "Cuba", "Ethiopia", "France", "Germany", "Ghana", "Greece", "India",
+    "Italy", "Jamaica", "Japan", "Mexico", "Netherlands", "Nigeria", "Norway",
+    "South Africa", "Spain", "Sweden", "Switzerland", "Turkey", "UK", "USA",
+    "USSR", "Yugoslavia",
 ]
 
 _GENRE_CHOICES: list[str] = [
-    "",  # blank = any
-    "Electronic",
-    "Folk, World, & Country",
-    "Funk / Soul",
-    "Hip Hop",
-    "Jazz",
-    "Latin",
-    "Pop",
-    "Reggae",
-    "Rock",
-    "Stage & Screen",
-    "Blues",
-    "Non-Music",
-    "Children's",
-    "Brass & Military",
-    "Classical",
+    "", "Electronic", "Folk, World, & Country", "Funk / Soul", "Hip Hop",
+    "Jazz", "Latin", "Pop", "Reggae", "Rock", "Stage & Screen", "Blues",
+    "Non-Music", "Children's", "Brass & Military", "Classical",
 ]
 
 _STYLE_CHOICES: list[str] = [
-    "",
-    "Acid Jazz",
-    "Afrobeat",
-    "Ambient",
-    "Big Beat",
-    "Blues Rock",
-    "Bolero",
-    "Boogaloo",
-    "Bossa Nova",
-    "Bouzouki",
-    "Breakbeat",
-    "Chanson",
-    "Cumbia",
-    "Dancehall",
-    "Deep House",
-    "Disco",
-    "Downtempo",
-    "Dub",
-    "Éntekhno",
-    "Ethio-jazz",
-    "Experimental",
-    "Flamenco",
-    "Free Jazz",
-    "Funk",
-    "Fusion",
-    "Garage House",
-    "Gospel",
-    "Hard Bop",
-    "Highlife",
-    "House",
-    "Italo-Disco",
-    "Jazz-Funk",
-    "Jungle",
-    "Krautrock",
-    "Laïkó",
-    "Latin Jazz",
-    "Library Music",
-    "Lounge",
-    "Lo-Fi",
-    "MPB",
-    "Neo Soul",
-    "New Wave",
-    "No Wave",
-    "Pachanga",
-    "Post-Punk",
-    "Prog Rock",
-    "Psychedelic Rock",
-    "Raï",
-    "Rebetiko",
-    "Rock & Roll",
-    "Salsa",
-    "Samba",
-    "Shoegaze",
-    "Ska",
-    "Soul",
-    "Soul-Jazz",
-    "Spiritual Jazz",
-    "Synth-pop",
-    "Techno",
-    "Trip Hop",
-    "Tropicália",
+    "", "Acid Jazz", "Afrobeat", "Ambient", "Big Beat", "Blues Rock",
+    "Bolero", "Boogaloo", "Bossa Nova", "Bouzouki", "Breakbeat", "Chanson",
+    "Cumbia", "Dancehall", "Deep House", "Disco", "Downtempo", "Dub",
+    "Éntekhno", "Ethio-jazz", "Experimental", "Flamenco", "Free Jazz",
+    "Funk", "Fusion", "Garage House", "Gospel", "Hard Bop", "Highlife",
+    "House", "Italo-Disco", "Jazz-Funk", "Jungle", "Krautrock", "Laïkó",
+    "Latin Jazz", "Library Music", "Lounge", "Lo-Fi", "MPB", "Neo Soul",
+    "New Wave", "No Wave", "Pachanga", "Post-Punk", "Prog Rock",
+    "Psychedelic Rock", "Raï", "Rebetiko", "Rock & Roll", "Salsa", "Samba",
+    "Shoegaze", "Ska", "Soul", "Soul-Jazz", "Spiritual Jazz", "Synth-pop",
+    "Techno", "Trip Hop", "Tropicália",
+]
+
+
+# ─── Era presets ─────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class _Preset:
+    label: str
+    year_min: Optional[int] = None
+    year_max: Optional[int] = None
+    country: str = ""
+    genre: str = ""
+    style: str = ""
+
+
+_PRESETS: list[_Preset] = [
+    _Preset("70s Soul / Funk", 1970, 1979, genre="Funk / Soul"),
+    _Preset("60s–70s Jazz", 1960, 1979, genre="Jazz"),
+    _Preset("Greek 60s–80s", 1960, 1989, country="Greece"),
+    _Preset("Library / OST", 1960, 1985, genre="Stage & Screen",
+            style="Library Music"),
+    _Preset("Brazilian", 1965, 1985, country="Brazil"),
+    _Preset("Spiritual Jazz", 1965, 1979, genre="Jazz",
+            style="Spiritual Jazz"),
+    _Preset("Everything (weighted)"),
 ]
 
 
@@ -190,40 +123,39 @@ class DigitalCrateTab(ctk.CTkFrame):
         self._log = ctx.logger.getChild("digital_crate")
 
         # State
-        self._digging: bool = False
-        self._current_suggestion: Optional[DiscoverySuggestion] = None
-        self._dig_lock = threading.Lock()  # serialize dig button clicks
+        self._digging = False
+        self._dig_lock = threading.Lock()
+        self._cards: list[_ReelCard] = []
 
-        # Widget refs (populated by _build_body)
-        self._year_var: Optional[ctk.StringVar] = None
+        # Widget refs
+        self._from_var: Optional[ctk.StringVar] = None
+        self._to_var: Optional[ctk.StringVar] = None
         self._query_var: Optional[ctk.StringVar] = None
         self._country_var: Optional[ctk.StringVar] = None
         self._format_var: Optional[ctk.StringVar] = None
         self._genre_var: Optional[ctk.StringVar] = None
         self._style_var: Optional[ctk.StringVar] = None
+        self._prioritize_var: Optional[ctk.BooleanVar] = None
+        self._compilations_var: Optional[ctk.BooleanVar] = None
+        self._intensity_slider: Optional[ctk.CTkSlider] = None
+        self._reel_size_var: Optional[ctk.StringVar] = None
         self._dig_button: Optional[ctk.CTkButton] = None
         self._dig_spinner: Optional[Spinner] = None
         self._dig_status_label: Optional[ctk.CTkLabel] = None
-        self._result_card: Optional[ctk.CTkFrame] = None
-        self._result_empty_card: Optional[ctk.CTkFrame] = None
-        self._result_artist: Optional[ctk.CTkLabel] = None
-        self._result_title: Optional[ctk.CTkLabel] = None
-        self._result_meta: Optional[ctk.CTkLabel] = None
-        self._result_match: Optional[ctk.CTkLabel] = None
-        self._queue_button: Optional[ctk.CTkButton] = None
-        self._skip_button: Optional[ctk.CTkButton] = None
-        self._open_discogs_button: Optional[ctk.CTkButton] = None
-        self._open_youtube_button: Optional[ctk.CTkButton] = None
+        self._health_label: Optional[ctk.CTkLabel] = None
+        self._reel_frame: Optional[ctk.CTkFrame] = None
+        self._reel_empty: Optional[ctk.CTkFrame] = None
+        self._recent_frame: Optional[ctk.CTkFrame] = None
         self._token_warning_card: Optional[ctk.CTkFrame] = None
 
         self._build_body()
         self._refresh_token_gate()
+        self._refresh_recent_digs()
 
     # ── Body construction ──
 
     def _build_body(self) -> None:
         t = self._theme
-
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
@@ -239,80 +171,83 @@ class DigitalCrateTab(ctk.CTkFrame):
         scroll.grid_columnconfigure(0, weight=1)
 
         content = ctk.CTkFrame(scroll, fg_color="transparent")
-        content.grid(
-            row=0,
-            column=0,
-            sticky="ew",
-            padx=t.space.xl,
-            pady=(t.space.xxl, t.space.xl),
-        )
+        content.grid(row=0, column=0, sticky="ew", padx=t.space.xl,
+                     pady=(t.space.xxl, t.space.xl))
         content.grid_columnconfigure(0, weight=1)
         self._content = content
         content.bind("<Configure>", self._on_content_configure)
 
-        # Heading
-        ctk.CTkLabel(
-            content,
-            text="Digital Crate",
-            **style_label_heading(t),
-        ).grid(row=0, column=0, sticky="w")
-
+        ctk.CTkLabel(content, text="Digital Crate",
+                     **style_label_heading(t)).grid(row=0, column=0, sticky="w")
         ctk.CTkLabel(
             content,
             text=(
-                "Surface a gem from Discogs that matches your filters "
-                "and queue it for ingestion with one click."
+                "Spin the crate roulette. Pick an era preset or dial in "
+                "filters, then Dig a reel of sample-friendly gems — preview "
+                "each in-app and queue your favorites."
             ),
-            **style_label_meta(t),
-            wraplength=720,
-            justify="left",
+            **style_label_meta(t), wraplength=760, justify="left",
         ).grid(row=1, column=0, sticky="w", pady=(t.space.xs, t.space.xl))
 
-        # Token-missing warning
         self._build_token_warning(content, row=2)
-
-        # Filters card
-        self._build_filters_card(content, row=3)
-
-        # Dig button + spinner row
-        self._build_dig_row(content, row=4)
-
-        # Result area
-        self._build_result_area(content, row=5)
+        self._build_presets(content, row=3)
+        self._build_filters_card(content, row=4)
+        self._build_dig_row(content, row=5)
+        self._build_reel_area(content, row=6)
+        self._build_recent_digs(content, row=7)
 
     def _build_token_warning(self, parent, row: int) -> None:
         t = self._theme
         card = ctk.CTkFrame(
-            parent,
-            fg_color=t.surface.raised,
-            border_color=t.status.warning,
-            border_width=t.stroke.hairline,
-            corner_radius=t.radius.lg,
+            parent, fg_color=t.surface.raised, border_color=t.status.warning,
+            border_width=t.stroke.hairline, corner_radius=t.radius.lg,
         )
         card.grid(row=row, column=0, sticky="ew", pady=(0, t.space.lg))
         card.grid_columnconfigure(1, weight=1)
         card.grid_remove()
 
-        ctk.CTkLabel(
-            card, text="⚠", text_color=t.status.warning, font=t.font.heading, width=36
-        ).grid(row=0, column=0, sticky="w", padx=(t.space.lg, 0), pady=t.space.md)
-
+        ctk.CTkLabel(card, text="⚠", text_color=t.status.warning,
+                     font=t.font.heading, width=36).grid(
+            row=0, column=0, sticky="w", padx=(t.space.lg, 0), pady=t.space.md)
         msg = ctk.CTkFrame(card, fg_color="transparent")
-        msg.grid(row=0, column=1, sticky="ew", padx=(t.space.sm, t.space.md), pady=t.space.md)
-        ctk.CTkLabel(
-            msg, text="Discogs API token required", text_color=t.text.primary, font=t.font.body_emphasis, anchor="w"
-        ).grid(row=0, column=0, sticky="w")
+        msg.grid(row=0, column=1, sticky="ew", padx=(t.space.sm, t.space.md),
+                 pady=t.space.md)
+        ctk.CTkLabel(msg, text="Discogs API token required",
+                     text_color=t.text.primary, font=t.font.body_emphasis,
+                     anchor="w").grid(row=0, column=0, sticky="w")
         ctk.CTkLabel(
             msg, text="Add a personal access token in Settings to enable discovery.",
-            text_color=t.text.secondary, font=t.font.caption, anchor="w", wraplength=520, justify="left"
+            text_color=t.text.secondary, font=t.font.caption, anchor="w",
+            wraplength=520, justify="left",
         ).grid(row=1, column=0, sticky="w", pady=(2, 0))
-
-        ctk.CTkButton(
-            card, text="Open Settings", command=lambda: self._ctx.switch_to_tab("settings"),
-            **style_secondary_button(t), width=130
-        ).grid(row=0, column=2, sticky="e", padx=(0, t.space.lg), pady=t.space.md)
-
+        ctk.CTkButton(card, text="Open Settings",
+                      command=lambda: self._ctx.switch_to_tab("settings"),
+                      **style_secondary_button(t), width=130).grid(
+            row=0, column=2, sticky="e", padx=(0, t.space.lg), pady=t.space.md)
         self._token_warning_card = card
+
+    def _build_presets(self, parent, row: int) -> None:
+        t = self._theme
+        ctk.CTkLabel(parent, text="Era presets",
+                     **style_label_subheading(t)).grid(
+            row=row, column=0, sticky="w", pady=(0, t.space.sm))
+
+        wrap = ctk.CTkFrame(parent, fg_color="transparent")
+        wrap.grid(row=row + 1, column=0, sticky="ew", pady=(0, t.space.lg))
+        # Use a flowing row of chip buttons.
+        col = 0
+        for preset in _PRESETS:
+            btn = ctk.CTkButton(
+                wrap, text=preset.label,
+                command=lambda p=preset: self._apply_preset(p),
+                fg_color=t.surface.raised, hover_color=t.surface.elevated,
+                text_color=t.text.primary, border_color=t.border.strong,
+                border_width=t.stroke.regular, corner_radius=t.radius.pill,
+                font=t.font.caption, height=32,
+            )
+            btn.grid(row=0, column=col, padx=(0, t.space.sm), pady=t.space.xxs,
+                     sticky="w")
+            col += 1
 
     def _build_filters_card(self, parent, row: int) -> None:
         t = self._theme
@@ -326,234 +261,428 @@ class DigitalCrateTab(ctk.CTkFrame):
         inner.grid_columnconfigure(1, weight=1)
 
         ctk.CTkLabel(inner, text="Filters", **style_label_subheading(t)).grid(
-            row=0, column=0, columnspan=2, sticky="w", pady=(0, t.space.md)
-        )
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, t.space.md))
 
-        self._year_var = ctk.StringVar(value="")
+        self._from_var = ctk.StringVar(value="")
+        self._to_var = ctk.StringVar(value="")
         self._format_var = ctk.StringVar(value="")
         self._country_var = ctk.StringVar(value="")
         self._genre_var = ctk.StringVar(value="")
         self._style_var = ctk.StringVar(value="")
         self._query_var = ctk.StringVar(value="")
 
+        # Era range: From / To
+        era_wrap = ctk.CTkFrame(inner, fg_color="transparent")
+        self._build_filter_field(inner, 1, 0, label="Era (from → to)",
+                                 widget=era_wrap)
+        era_wrap.grid_columnconfigure(0, weight=1)
+        era_wrap.grid_columnconfigure(2, weight=1)
+        YearSpinner(era_wrap, t, self._from_var, min_year=1900, max_year=2035,
+                    placeholder="From").grid(row=0, column=0, sticky="ew")
+        ctk.CTkLabel(era_wrap, text="→", text_color=t.text.muted,
+                     font=t.font.body).grid(row=0, column=1, padx=t.space.sm)
+        YearSpinner(era_wrap, t, self._to_var, min_year=1900, max_year=2035,
+                    placeholder="To").grid(row=0, column=2, sticky="ew")
+
         self._build_filter_field(
-            inner,
-            row=1,
-            col=0,
-            label="Year",
-            widget=YearSpinner(inner, self._theme, self._year_var, placeholder="e.g. 1978"),
+            inner, 1, 1, label="Format",
+            widget=self._make_combobox(inner, self._format_var, _FORMAT_CHOICES))
+        self._build_filter_field(
+            inner, 3, 0, label="Country",
+            widget=self._make_combobox(inner, self._country_var, _COUNTRY_CHOICES))
+        self._build_filter_field(
+            inner, 3, 1, label="Genre",
+            widget=self._make_combobox(inner, self._genre_var, _GENRE_CHOICES))
+        self._build_filter_field(
+            inner, 5, 0, label="Style",
+            widget=self._make_combobox(inner, self._style_var, _STYLE_CHOICES))
+        self._build_filter_field(
+            inner, 5, 1, label="Search keywords",
+            widget=self._make_entry(inner, self._query_var, "Artist, title, etc."))
+
+        # Weighting + options row
+        opts = ctk.CTkFrame(inner, fg_color="transparent")
+        opts.grid(row=7, column=0, columnspan=2, sticky="ew",
+                  pady=(t.space.md, 0))
+        opts.grid_columnconfigure(0, weight=1)
+
+        snap = self._ctx.config.snapshot()
+        disc = snap.config.discovery
+
+        self._prioritize_var = ctk.BooleanVar(value=disc.prioritize_samples)
+        prio_row = ctk.CTkFrame(opts, fg_color="transparent")
+        prio_row.grid(row=0, column=0, sticky="w")
+        ctk.CTkSwitch(
+            prio_row, text="Prioritize sample-friendly gems",
+            variable=self._prioritize_var, onvalue=True, offvalue=False,
+            command=self._on_prioritize_toggle,
+            progress_color=t.accent.purple, button_color=t.text.primary,
+            button_hover_color=t.text.primary, fg_color=t.surface.elevated,
+            text_color=t.text.primary, font=t.font.body,
+        ).pack(side="left")
+
+        # Intensity slider
+        intensity_row = ctk.CTkFrame(opts, fg_color="transparent")
+        intensity_row.grid(row=1, column=0, sticky="w", pady=(t.space.sm, 0))
+        ctk.CTkLabel(intensity_row, text="Tilt strength",
+                     **style_label_meta(t)).pack(side="left",
+                                                 padx=(0, t.space.sm))
+        self._intensity_slider = ctk.CTkSlider(
+            intensity_row, from_=0.0, to=1.0, number_of_steps=20, width=180,
+            button_color=t.accent.purple, button_hover_color=t.accent.purple_bright,
+            progress_color=t.accent.purple, fg_color=t.surface.elevated,
         )
-        self._build_filter_field(inner, 1, 1, label="Format", widget=self._make_combobox(inner, self._format_var, _FORMAT_CHOICES))
-        self._build_filter_field(inner, 3, 0, label="Country", widget=self._make_combobox(inner, self._country_var, _COUNTRY_CHOICES))
-        self._build_filter_field(inner, 3, 1, label="Genre", widget=self._make_combobox(inner, self._genre_var, _GENRE_CHOICES))
-        self._build_filter_field(inner, 5, 0, label="Style", widget=self._make_combobox(inner, self._style_var, _STYLE_CHOICES))
-        self._build_filter_field(inner, 5, 1, label="Search Keywords", widget=self._make_entry(inner, self._query_var, "Artist, title, etc."))
+        self._intensity_slider.set(disc.sample_weight_intensity)
+        self._intensity_slider.pack(side="left")
+
+        # Compilations + reel size
+        self._compilations_var = ctk.BooleanVar(value=disc.allow_compilations)
+        comp_row = ctk.CTkFrame(opts, fg_color="transparent")
+        comp_row.grid(row=2, column=0, sticky="w", pady=(t.space.sm, 0))
+        ctk.CTkSwitch(
+            comp_row, text="Include compilations (Various Artists)",
+            variable=self._compilations_var, onvalue=True, offvalue=False,
+            progress_color=t.accent.purple, button_color=t.text.primary,
+            button_hover_color=t.text.primary, fg_color=t.surface.elevated,
+            text_color=t.text.primary, font=t.font.body,
+        ).pack(side="left")
+
+        size_row = ctk.CTkFrame(opts, fg_color="transparent")
+        size_row.grid(row=3, column=0, sticky="w", pady=(t.space.sm, 0))
+        ctk.CTkLabel(size_row, text="Reel size",
+                     **style_label_meta(t)).pack(side="left",
+                                                padx=(0, t.space.sm))
+        self._reel_size_var = ctk.StringVar(value=str(disc.reel_size))
+        self._make_size_dropdown(size_row).pack(side="left")
 
         ctk.CTkLabel(
-            inner, text="Leave any field blank for broader matches. Enter exact year for precision.",
-            **style_label_meta(t), anchor="w"
-        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(t.space.md, 0))
+            inner,
+            text="Leave fields blank for a broad, weighted roulette. "
+                 "Nothing is ever fully excluded.",
+            **style_label_meta(t), anchor="w",
+        ).grid(row=8, column=0, columnspan=2, sticky="w",
+               pady=(t.space.md, 0))
 
-    def _make_entry(self, parent, variable: ctk.StringVar, placeholder: str) -> ctk.CTkFrame:
+    def _make_size_dropdown(self, parent) -> ctk.CTkOptionMenu:
         t = self._theme
-        wrapper = ctk.CTkFrame(parent, fg_color=t.border.strong, border_width=0, corner_radius=t.radius.md)
+        return ctk.CTkOptionMenu(
+            parent, variable=self._reel_size_var,
+            values=[str(n) for n in (4, 6, 8, 10, 12, 16)],
+            fg_color=t.surface.raised, button_color=t.surface.raised,
+            button_hover_color=t.surface.elevated,
+            dropdown_fg_color=t.surface.elevated, text_color=t.text.primary,
+            dropdown_text_color=t.text.primary,
+            dropdown_hover_color=t.surface.overlay, font=t.font.body,
+            corner_radius=t.radius.md, width=80, height=32,
+        )
+
+    def _make_entry(self, parent, variable: ctk.StringVar,
+                    placeholder: str) -> ctk.CTkFrame:
+        t = self._theme
+        wrapper = ctk.CTkFrame(parent, fg_color=t.border.strong, border_width=0,
+                               corner_radius=t.radius.md)
         ctk.CTkEntry(
             wrapper, textvariable=variable, placeholder_text=placeholder,
             fg_color=t.surface.raised, border_width=0, text_color=t.text.primary,
-            placeholder_text_color=t.text.muted, font=t.font.body, corner_radius=max(0, t.radius.md - 2), height=38
+            placeholder_text_color=t.text.muted, font=t.font.body,
+            corner_radius=max(0, t.radius.md - 2), height=38,
         ).pack(fill="x", padx=2, pady=2)
         return wrapper
 
-    def _make_combobox(self, parent, variable: ctk.StringVar, values: list[str]) -> ctk.CTkFrame:
+    def _make_combobox(self, parent, variable: ctk.StringVar,
+                       values: list[str]) -> ctk.CTkFrame:
         t = self._theme
-        wrapper = ctk.CTkFrame(parent, fg_color=t.border.strong, border_width=0, corner_radius=t.radius.md)
+        wrapper = ctk.CTkFrame(parent, fg_color=t.border.strong, border_width=0,
+                               corner_radius=t.radius.md)
         cb = ctk.CTkComboBox(
             wrapper, variable=variable, values=values,
-            fg_color=t.surface.raised, border_width=0, button_color=t.surface.raised,
-            button_hover_color=t.surface.elevated, dropdown_fg_color=t.surface.elevated,
-            text_color=t.text.primary, text_color_disabled=t.text.muted,
-            dropdown_text_color=t.text.primary, dropdown_hover_color=t.surface.overlay,
-            font=t.font.body, corner_radius=max(0, t.radius.md - 2), height=38
+            fg_color=t.surface.raised, border_width=0,
+            button_color=t.surface.raised, button_hover_color=t.surface.elevated,
+            dropdown_fg_color=t.surface.elevated, text_color=t.text.primary,
+            text_color_disabled=t.text.muted, dropdown_text_color=t.text.primary,
+            dropdown_hover_color=t.surface.overlay, font=t.font.body,
+            corner_radius=max(0, t.radius.md - 2), height=38,
         )
         cb.pack(fill="x", padx=2, pady=2)
-        
-        # Mouse wheel support for the closed combobox value selection
+
         def on_wheel(event):
             current = variable.get()
             try:
                 idx = values.index(current)
             except ValueError:
                 idx = 0
-            
-            if event.delta > 0:
-                new_idx = max(0, idx - 1)
-            else:
-                new_idx = min(len(values) - 1, idx + 1)
-            
+            new_idx = (max(0, idx - 1) if event.delta > 0
+                       else min(len(values) - 1, idx + 1))
             variable.set(values[new_idx])
 
         cb.bind("<MouseWheel>", on_wheel)
         return wrapper
 
-    def _build_filter_field(self, parent, row: int, col: int, *, label: str, widget: ctk.CTkBaseClass) -> None:
+    def _build_filter_field(self, parent, row: int, col: int, *, label: str,
+                            widget: ctk.CTkBaseClass) -> None:
         t = self._theme
         ctk.CTkLabel(parent, text=label, **style_label_body(t), anchor="w").grid(
-            row=row, column=col, sticky="w", padx=(0 if col == 0 else t.space.md, t.space.md), pady=(t.space.sm, 2)
-        )
-        widget.grid(row=row+1, column=col, sticky="ew", padx=(0 if col == 0 else t.space.md, t.space.md))
+            row=row, column=col, sticky="w",
+            padx=(0 if col == 0 else t.space.md, t.space.md), pady=(t.space.sm, 2))
+        widget.grid(row=row + 1, column=col, sticky="ew",
+                    padx=(0 if col == 0 else t.space.md, t.space.md))
         parent.grid_columnconfigure(col, weight=1)
 
     def _build_dig_row(self, parent, row: int) -> None:
         t = self._theme
         dig_row = ctk.CTkFrame(parent, fg_color="transparent")
-        dig_row.grid(row=row, column=0, pady=(0, t.space.xl))
+        dig_row.grid(row=row, column=0, sticky="ew", pady=(0, t.space.lg))
+
         self._dig_button = ctk.CTkButton(
-            dig_row, text="◆   Dig", command=self._on_dig_clicked,
-            **style_primary_button(t), width=220
-        )
+            dig_row, text="◆   Dig the crate", command=self._on_dig_clicked,
+            **style_primary_button(t), width=240)
         self._dig_button.configure(font=t.font.subheading, height=52)
         self._dig_button.pack(side="left")
+
         status_frame = ctk.CTkFrame(dig_row, fg_color="transparent")
         status_frame.pack(side="left", padx=(t.space.lg, 0))
-        self._dig_spinner = Spinner(status_frame, t, size="md", color=t.accent.purple)
+        self._dig_spinner = Spinner(status_frame, t, size="md",
+                                    color=t.accent.purple)
         self._dig_spinner.pack(side="left", padx=(0, t.space.sm))
-        self._dig_status_label = ctk.CTkLabel(status_frame, text="", text_color=t.text.secondary, font=t.font.body, anchor="w")
+        self._dig_status_label = ctk.CTkLabel(
+            status_frame, text="", text_color=t.text.secondary,
+            font=t.font.body, anchor="w")
         self._dig_status_label.pack(side="left")
+
+        self._health_label = ctk.CTkLabel(
+            dig_row, text="", text_color=t.text.muted, font=t.font.micro,
+            anchor="e")
+        self._health_label.pack(side="right")
+
         self._set_dig_status(None)
 
-    def _build_result_area(self, parent, row: int) -> None:
+    def _build_reel_area(self, parent, row: int) -> None:
         t = self._theme
-        ctk.CTkLabel(parent, text="Last find", **style_label_subheading(t)).grid(row=row, column=0, sticky="w", pady=(0, t.space.md))
+        ctk.CTkLabel(parent, text="The reel",
+                     **style_label_subheading(t)).grid(
+            row=row, column=0, sticky="w", pady=(0, t.space.md))
+
+        holder = ctk.CTkFrame(parent, fg_color="transparent")
+        holder.grid(row=row + 1, column=0, sticky="ew")
+        holder.grid_columnconfigure(0, weight=1)
+        self._reel_frame = holder
+
         empty = ctk.CTkFrame(parent, **style_card_elevated(t))
         empty.grid(row=row + 1, column=0, sticky="ew")
         empty.grid_columnconfigure(0, weight=1)
         empty_inner = ctk.CTkFrame(empty, fg_color="transparent")
         empty_inner.grid(row=0, column=0, pady=t.space.xxxl)
-        ctk.CTkLabel(empty_inner, text="Nothing dug up yet.", text_color=t.text.secondary, font=t.font.subheading).pack()
-        ctk.CTkLabel(empty_inner, text="Set your filters above and hit Dig to surface a gem.", **style_label_meta(t)).pack(pady=(t.space.xs, 0))
-        self._result_empty_card = empty
+        ctk.CTkLabel(empty_inner, text="Nothing dug up yet.",
+                     text_color=t.text.secondary, font=t.font.subheading).pack()
+        ctk.CTkLabel(empty_inner,
+                     text="Pick a preset or set filters, then hit Dig.",
+                     **style_label_meta(t)).pack(pady=(t.space.xs, 0))
+        self._reel_empty = empty
 
-        card = ctk.CTkFrame(parent, **style_card_elevated(t))
-        card.grid(row=row + 1, column=0, sticky="ew")
-        card.grid_columnconfigure(0, weight=1)
-        card.grid_remove()
-        inner = ctk.CTkFrame(card, fg_color="transparent")
-        inner.grid(row=0, column=0, sticky="ew", padx=t.space.xl, pady=t.space.xl)
-        inner.grid_columnconfigure(0, weight=1)
-        self._result_artist = ctk.CTkLabel(inner, text="", text_color=t.accent.purple, font=t.font.body_emphasis, anchor="w")
-        self._result_artist.grid(row=0, column=0, sticky="w")
-        self._result_title = ctk.CTkLabel(inner, text="", text_color=t.text.primary, font=t.font.heading, anchor="w", wraplength=700, justify="left")
-        self._result_title.grid(row=1, column=0, sticky="w", pady=(t.space.xxs, t.space.sm))
-        self._result_meta = ctk.CTkLabel(inner, text="", text_color=t.text.secondary, font=t.font.body, anchor="w")
-        self._result_meta.grid(row=2, column=0, sticky="w")
-        self._result_match = ctk.CTkLabel(inner, text="", text_color=t.text.muted, font=t.font.caption, anchor="w")
-        self._result_match.grid(row=3, column=0, sticky="w", pady=(t.space.xs, t.space.lg))
-        actions = ctk.CTkFrame(inner, fg_color="transparent")
-        actions.grid(row=4, column=0, sticky="w")
-        self._queue_button = ctk.CTkButton(actions, text="Queue it", command=self._on_queue_clicked, **style_primary_button(t), width=130)
-        self._queue_button.pack(side="left")
-        self._skip_button = ctk.CTkButton(actions, text="Skip", command=self._on_skip_clicked, **style_secondary_button(t), width=100)
-        self._skip_button.pack(side="left", padx=(t.space.sm, 0))
-        self._open_discogs_button = ctk.CTkButton(actions, text="Open on Discogs", command=self._on_open_discogs_clicked, **style_ghost_button(t))
-        self._open_discogs_button.pack(side="left", padx=(t.space.sm, 0))
-        self._open_youtube_button = ctk.CTkButton(actions, text="Open on YouTube", command=self._on_open_youtube_clicked, **style_ghost_button(t))
-        self._open_youtube_button.pack(side="left", padx=(t.space.sm, 0))
-        self._result_card = card
+    def _build_recent_digs(self, parent, row: int) -> None:
+        t = self._theme
+        ctk.CTkLabel(parent, text="Recent digs",
+                     **style_label_subheading(t)).grid(
+            row=row, column=0, sticky="w", pady=(t.space.xl, t.space.md))
+        frame = ctk.CTkFrame(parent, **style_card_elevated(t))
+        frame.grid(row=row + 1, column=0, sticky="ew")
+        frame.grid_columnconfigure(0, weight=1)
+        self._recent_frame = frame
+
+    # ── Presets ──
+
+    def _apply_preset(self, preset: _Preset) -> None:
+        self._from_var.set(str(preset.year_min) if preset.year_min else "")
+        self._to_var.set(str(preset.year_max) if preset.year_max else "")
+        self._country_var.set(preset.country)
+        self._genre_var.set(preset.genre)
+        self._style_var.set(preset.style)
+        self._format_var.set("")
+        self._query_var.set("")
+        # One-click feel: presets immediately dig.
+        self._on_dig_clicked()
+
+    def _on_prioritize_toggle(self) -> None:
+        # Persist so the choice sticks across sessions.
+        try:
+            self._ctx.config.update_discovery(
+                prioritize_samples=bool(self._prioritize_var.get()))
+        except Exception:
+            self._log.debug("Could not persist prioritize toggle", exc_info=True)
+
+    # ── Dig ──
 
     def _refresh_token_gate(self) -> None:
         snap = self._ctx.config.snapshot()
         if self._token_warning_card:
-            if snap.discogs_token: self._token_warning_card.grid_remove()
-            else: self._token_warning_card.grid()
+            if snap.discogs_token:
+                self._token_warning_card.grid_remove()
+            else:
+                self._token_warning_card.grid()
 
     def _on_dig_clicked(self) -> None:
         with self._dig_lock:
-            if self._digging: return
+            if self._digging:
+                return
             self._digging = True
         self._set_dig_in_flight(True)
+
         snap = self._ctx.config.snapshot()
-        if not snap.discogs_token:
+        if not snap.discogs_token or not self._ctx.discovery:
             self._set_dig_in_flight(False)
             self._digging = False
-            self._ctx.publish_toast("Add a Discogs token in Settings.", "warning")
+            self._ctx.publish_toast("Add a Discogs token in Settings.",
+                                    "warning")
+            self._refresh_token_gate()
             return
-        if not self._ctx.discovery:
-            self._set_dig_in_flight(False)
-            self._digging = False
-            return
+
         filters = self._collect_filters()
-        threading.Thread(target=self._run_dig_worker, args=(filters,), daemon=True).start()
+        count = self._collect_reel_size()
+        threading.Thread(target=self._run_dig_worker, args=(filters, count),
+                         daemon=True).start()
 
-    def _run_dig_worker(self, filters: DiscoveryFilters) -> None:
-        suggestion, error = None, None
-        try: suggestion = self._ctx.discovery.dig(filters)
-        except Exception as e: error = e
-        self.after(0, lambda: self._on_dig_finished(suggestion, error))
+    def _run_dig_worker(self, filters: DiscoveryFilters, count: int) -> None:
+        results: list[DiscoverySuggestion] = []
+        error: Optional[Exception] = None
+        try:
+            results = self._ctx.discovery.dig_many(filters, count=count)
+        except Exception as e:  # noqa: BLE001 — surfaced via toast
+            error = e
+        self.after(0, lambda: self._on_dig_finished(results, error))
 
-    def _on_dig_finished(self, suggestion: Optional[DiscoverySuggestion], error: Optional[Exception]) -> None:
+    def _on_dig_finished(self, results: list[DiscoverySuggestion],
+                         error: Optional[Exception]) -> None:
         self._digging = False
         self._set_dig_in_flight(False)
-        if error:
+        self._update_health()
+        if error is not None:
             self._handle_dig_error(error)
             return
-        if not suggestion:
-            self._ctx.publish_toast("No results found.", "warning")
+        if not results:
+            self._ctx.publish_toast("No results found. Try wider filters.",
+                                    "warning")
             return
-        self._current_suggestion = suggestion
-        self._render_suggestion(suggestion)
+        self._render_reel(results)
+        self._ctx.publish_toast(
+            f"Dug up {len(results)} gem{'s' if len(results) != 1 else ''}.",
+            "success")
 
     def _handle_dig_error(self, error: Exception) -> None:
         if isinstance(error, NoResultsError):
-            self._ctx.publish_toast("No matches found. Try wider filters.", "info")
+            self._ctx.publish_toast(
+                "No masters matched. Try widening the era or clearing a filter.",
+                "info")
+        elif isinstance(error, NoYouTubeMatchError):
+            self._ctx.publish_toast(
+                "Found records on Discogs but none resolved on YouTube Music. "
+                "Try a broader dig.", "warning")
+        elif isinstance(error, DiscoveryThrottledError):
+            self._ctx.publish_toast(
+                "Discogs/YouTube rate-limited us. Wait a moment and dig again.",
+                "warning")
+        elif isinstance(error, DiscoveryConfigError):
+            self._ctx.publish_toast(str(error), "error")
+            self._refresh_token_gate()
         else:
             self._ctx.publish_toast(f"Dig failed: {error}", "error")
 
-    def _render_suggestion(self, s: DiscoverySuggestion) -> None:
-        self._result_empty_card.grid_remove()
-        self._result_card.grid()
-        self._result_artist.configure(text=s.artist)
-        self._result_title.configure(text=s.title)
-        parts = [str(x) for x in [s.year, s.country, s.style or s.genre] if x]
-        self._result_meta.configure(text="  ·  ".join(parts))
-        conf = int(s.match_score * 100)
-        self._result_match.configure(text=f"Matched on YouTube Music  ·  {conf}% confidence")
+    def _render_reel(self, results: list[DiscoverySuggestion]) -> None:
+        self._clear_cards()
+        self._reel_empty.grid_remove()
+        t = self._theme
+        for i, s in enumerate(results):
+            card = _ReelCard(
+                self._reel_frame, self._ctx, s,
+                on_queued=self._on_card_queued,
+            )
+            card.grid(row=i, column=0, sticky="ew", pady=(0, t.space.md))
+            self._cards.append(card)
 
-    def _on_queue_clicked(self) -> None:
-        s = self._current_suggestion
-        if not s: return
-        snap = self._ctx.config.snapshot()
-        request = PipelineRequest(
-            source_url=s.youtube_url,
-            enable_stems=snap.config.general.enable_stems_by_default,
-            hint_genre=s.genre, hint_country=s.country, hint_year=s.year,
-            hint_discogs_master_id=s.discogs_master_id,
-            hint_discogs_release_id=s.discogs_release_id,
-            source_platform_override="discogs_dig",
-        )
-        self._ctx.queue_manager.enqueue(request)
-        self._ctx.publish_toast(f"Queued: {s.display_name}", "success")
-        self._clear_result()
+    def _on_card_queued(self, suggestion: DiscoverySuggestion) -> None:
+        self._refresh_recent_digs()
 
-    def _on_skip_clicked(self) -> None: self._clear_result()
+    def _clear_cards(self) -> None:
+        for card in self._cards:
+            try:
+                card.teardown()
+                card.destroy()
+            except Exception:
+                pass
+        self._cards = []
 
-    def _on_open_discogs_clicked(self) -> None:
-        if self._current_suggestion: webbrowser.open(f"https://www.discogs.com/master/{self._current_suggestion.discogs_master_id}")
+    # ── Recent digs ──
 
-    def _on_open_youtube_clicked(self) -> None:
-        if self._current_suggestion: webbrowser.open(self._current_suggestion.youtube_url)
+    def _refresh_recent_digs(self) -> None:
+        frame = self._recent_frame
+        if frame is None:
+            return
+        t = self._theme
+        for child in frame.winfo_children():
+            child.destroy()
 
-    def _clear_result(self) -> None:
-        self._current_suggestion = None
-        self._result_card.grid_remove()
-        self._result_empty_card.grid()
+        try:
+            rows = self._ctx.database.list_recent_discoveries(limit=12)
+        except Exception:
+            rows = []
+
+        if not rows:
+            ctk.CTkLabel(frame, text="No digs recorded yet.",
+                         **style_label_meta(t)).grid(
+                row=0, column=0, sticky="w", padx=t.space.lg, pady=t.space.lg)
+            return
+
+        for i, rec in enumerate(rows):
+            row_frame = ctk.CTkFrame(frame, fg_color="transparent")
+            row_frame.grid(row=i, column=0, sticky="ew", padx=t.space.lg,
+                           pady=(t.space.sm if i == 0 else 2,
+                                 t.space.sm if i == len(rows) - 1 else 2))
+            row_frame.grid_columnconfigure(0, weight=1)
+
+            name = f"{rec.artist} — {rec.title}"
+            ctk.CTkLabel(row_frame, text=name, text_color=t.text.primary,
+                         font=t.font.body, anchor="w").grid(
+                row=0, column=0, sticky="w")
+
+            meta_parts = [str(x) for x in (rec.year, rec.country,
+                                           rec.style or rec.genre) if x]
+            ctk.CTkLabel(row_frame, text="   ·   ".join(meta_parts),
+                         text_color=t.text.muted, font=t.font.micro,
+                         anchor="e").grid(row=0, column=1, sticky="e",
+                                          padx=(t.space.md, t.space.sm))
+
+            badge = "queued" if rec.was_queued else "seen"
+            color = t.status.success if rec.was_queued else t.text.muted
+            ctk.CTkLabel(row_frame, text=badge, text_color=color,
+                         font=t.font.micro).grid(row=0, column=2, sticky="e")
+
+    # ── Health ──
+
+    def _update_health(self) -> None:
+        if self._health_label is None or self._ctx.discovery is None:
+            return
+        try:
+            stats = self._ctx.discovery.get_stats()
+        except Exception:
+            return
+        parts = [
+            f"Discogs {stats.discogs_requests}",
+            f"YTM {stats.ytm_requests}",
+        ]
+        if stats.throttle_events:
+            parts.append(f"⚠ {stats.throttle_events} throttles")
+        self._health_label.configure(text="   ·   ".join(parts))
+
+    # ── Dig button state ──
 
     def _set_dig_in_flight(self, in_flight: bool) -> None:
         t = self._theme
         if in_flight:
-            self._dig_button.configure(text="Digging…", state="disabled", fg_color=t.accent.blue_dim)
+            self._dig_button.configure(text="Digging…", state="disabled",
+                                       fg_color=t.accent.blue_dim)
             self._set_dig_status("Searching Discogs and YouTube Music…")
         else:
-            self._dig_button.configure(text="◆   Dig", state="normal", fg_color=t.accent.blue)
+            self._dig_button.configure(text="◆   Dig the crate", state="normal",
+                                       fg_color=t.accent.blue)
             self._set_dig_status(None)
 
     def _set_dig_status(self, message: Optional[str]) -> None:
@@ -564,21 +693,255 @@ class DigitalCrateTab(ctk.CTkFrame):
             self._dig_spinner.stop()
             self._dig_status_label.configure(text="")
 
+    # ── Filter collection ──
+
     def _collect_filters(self) -> DiscoveryFilters:
-        y_str = self._year_var.get().strip()
-        year = int(y_str) if y_str.isdigit() else None
-        def norm(v): return v.strip() or None
+        def parse_year(var: ctk.StringVar) -> Optional[int]:
+            s = var.get().strip()
+            return int(s) if s.isdigit() else None
+
+        def norm(v: str) -> Optional[str]:
+            return v.strip() or None
+
+        year_min = parse_year(self._from_var)
+        year_max = parse_year(self._to_var)
+        # Swap if reversed so a sloppy entry still works.
+        if year_min is not None and year_max is not None and year_min > year_max:
+            year_min, year_max = year_max, year_min
+
         snap = self._ctx.config.snapshot()
+        intensity = (self._intensity_slider.get()
+                     if self._intensity_slider is not None
+                     else snap.config.discovery.sample_weight_intensity)
+
         return DiscoveryFilters(
-            year=year, country=norm(self._country_var.get()),
-            genre=norm(self._genre_var.get()), style=norm(self._style_var.get()),
-            format=norm(self._format_var.get()), query=norm(self._query_var.get()),
+            year=None,
+            year_min=year_min,
+            year_max=year_max,
+            country=norm(self._country_var.get()),
+            genre=norm(self._genre_var.get()),
+            style=norm(self._style_var.get()),
+            format=norm(self._format_var.get()),
+            query=norm(self._query_var.get()),
             min_have=snap.config.discovery.default_min_have,
+            prioritize_samples=bool(self._prioritize_var.get()),
+            sample_intensity=float(intensity),
+            allow_compilations=bool(self._compilations_var.get()),
         )
+
+    def _collect_reel_size(self) -> int:
+        try:
+            return int(self._reel_size_var.get())
+        except (ValueError, AttributeError):
+            return self._ctx.config.snapshot().config.discovery.reel_size
 
     def _on_content_configure(self, _event) -> None:
         t = self._theme
         parent_width = self._content.master.winfo_width()
-        target = min(960, max(480, parent_width - 2 * t.space.xl))
+        target = min(1000, max(480, parent_width - 2 * t.space.xl))
         if abs(self._content.winfo_width() - target) > 8:
             self._content.configure(width=target)
+
+
+# ─── Reel card ───────────────────────────────────────────────────────
+
+
+class _ReelCard(ctk.CTkFrame):
+    """One discovery suggestion: metadata + waveform preview + actions."""
+
+    def __init__(
+        self,
+        parent: ctk.CTkBaseClass,
+        ctx: "AppContext",
+        suggestion: DiscoverySuggestion,
+        *,
+        on_queued: Optional[Callable[[DiscoverySuggestion], None]] = None,
+    ) -> None:
+        t = ctx.theme
+        super().__init__(parent, **style_card_elevated(t))
+
+        self._ctx = ctx
+        self._theme = t
+        self._log = ctx.logger.getChild("reel_card")
+        self._s = suggestion
+        self._on_queued = on_queued
+
+        self._cancel_event = threading.Event()
+        self._preview_started = False
+        self._recorded = False
+        self._queued = False
+        self._player: Optional[WaveformPlayer] = None
+        self._preview_btn: Optional[ctk.CTkButton] = None
+        self._queue_btn: Optional[ctk.CTkButton] = None
+
+        self.grid_columnconfigure(0, weight=1)
+        self._build()
+
+    def _build(self) -> None:
+        t = self._theme
+        s = self._s
+        inner = ctk.CTkFrame(self, fg_color="transparent")
+        inner.grid(row=0, column=0, sticky="ew", padx=t.space.xl,
+                   pady=t.space.lg)
+        inner.grid_columnconfigure(0, weight=1)
+
+        # Title / meta
+        ctk.CTkLabel(inner, text=s.artist, text_color=t.accent.purple,
+                     font=t.font.body_emphasis, anchor="w").grid(
+            row=0, column=0, sticky="w")
+        ctk.CTkLabel(inner, text=s.title, text_color=t.text.primary,
+                     font=t.font.subheading, anchor="w", wraplength=640,
+                     justify="left").grid(row=1, column=0, sticky="w",
+                                          pady=(t.space.xxs, t.space.xs))
+
+        meta_parts = [str(x) for x in (s.year, s.country, s.style or s.genre)
+                      if x]
+        conf = int(s.match_score * 100)
+        meta_parts.append(f"YT {conf}%")
+        ctk.CTkLabel(inner, text="   ·   ".join(meta_parts),
+                     text_color=t.text.secondary, font=t.font.caption,
+                     anchor="w").grid(row=2, column=0, sticky="w")
+
+        # Sample-friendly chip when the taxonomy rates this highly.
+        affinity = sample_affinity(
+            genres=[s.genre] if s.genre else [],
+            styles=[s.style] if s.style else [],
+            country=s.country, year=s.year,
+        )
+        if affinity >= 1.25:
+            ctk.CTkLabel(
+                inner, text="◆ sample-friendly", text_color=t.accent.blue,
+                font=t.font.micro, anchor="w").grid(row=3, column=0,
+                                                    sticky="w",
+                                                    pady=(t.space.xxs, 0))
+
+        # Preview player (hidden until loaded)
+        self._player = WaveformPlayer(
+            inner, t, height=84,
+            initial_volume=self._ctx.config.snapshot().config.ui.preview_volume,
+        )
+        self._player.grid(row=4, column=0, sticky="ew",
+                          pady=(t.space.md, t.space.md))
+        self._player.grid_remove()
+
+        # Actions
+        actions = ctk.CTkFrame(inner, fg_color="transparent")
+        actions.grid(row=5, column=0, sticky="w")
+
+        self._preview_btn = ctk.CTkButton(
+            actions, text="▶  Preview", command=self._on_preview_clicked,
+            **style_secondary_button(t), width=120)
+        self._preview_btn.pack(side="left", padx=(0, t.space.sm))
+
+        self._queue_btn = ctk.CTkButton(
+            actions, text="Queue it", command=self._on_queue_clicked,
+            **style_primary_button(t), width=120)
+        self._queue_btn.pack(side="left", padx=(0, t.space.sm))
+
+        ctk.CTkButton(actions, text="Discogs",
+                      command=self._on_open_discogs, **style_ghost_button(t),
+                      width=80).pack(side="left")
+        ctk.CTkButton(actions, text="YouTube",
+                      command=self._on_open_youtube, **style_ghost_button(t),
+                      width=80).pack(side="left", padx=(t.space.sm, 0))
+
+    # ── Preview ──
+
+    def _on_preview_clicked(self) -> None:
+        if self._preview_started or self._player is None:
+            return
+        if self._ctx.preview is None:
+            self._ctx.publish_toast("Preview engine unavailable.", "error")
+            return
+        self._preview_started = True
+        if self._preview_btn is not None:
+            self._preview_btn.configure(state="disabled", text="Loading…")
+        self._player.grid()
+        self._player.set_loading("Fetching preview…")
+        # Recording on preview means a skipped-but-unheard gem can resurface.
+        self._record(was_queued=False)
+        threading.Thread(target=self._preview_worker, daemon=True).start()
+
+    def _preview_worker(self) -> None:
+        try:
+            data = self._ctx.preview.fetch(
+                self._s.youtube_video_id,
+                cancel_event=self._cancel_event,
+            )
+        except Exception as e:  # noqa: BLE001 — surfaced in the player
+            self.after(0, lambda err=e: self._on_preview_error(err))
+            return
+        self.after(0, lambda: self._on_preview_ready(data))
+
+    def _on_preview_ready(self, data) -> None:
+        if self._player is None:
+            return
+        self._player.set_preview(data)
+        if self._preview_btn is not None:
+            self._preview_btn.grid_remove()
+            self._preview_btn.pack_forget()
+
+    def _on_preview_error(self, error: Exception) -> None:
+        if self._player is not None:
+            self._player.set_error(f"Preview failed: {error}")
+        if self._preview_btn is not None:
+            self._preview_btn.configure(state="normal", text="↻  Retry")
+        self._preview_started = False
+
+    # ── Actions ──
+
+    def _on_queue_clicked(self) -> None:
+        if self._queued:
+            return
+        s = self._s
+        snap = self._ctx.config.snapshot()
+        request = PipelineRequest(
+            source_url=s.youtube_url,
+            enable_stems=snap.config.general.enable_stems_by_default,
+            hint_genre=s.genre, hint_country=s.country, hint_year=s.year,
+            hint_discogs_master_id=s.discogs_master_id,
+            hint_discogs_release_id=s.discogs_release_id,
+            source_platform_override="discogs_dig",
+        )
+        try:
+            self._ctx.queue_manager.enqueue(request)
+        except Exception as e:  # noqa: BLE001
+            self._ctx.publish_toast(f"Could not queue: {e}", "error")
+            return
+        self._queued = True
+        self._record(was_queued=True)
+        t = self._theme
+        if self._queue_btn is not None:
+            self._queue_btn.configure(text="Queued ✓", state="disabled",
+                                      fg_color=t.status.success)
+        self._ctx.publish_toast(f"Queued: {s.display_name}", "success")
+        if self._on_queued is not None:
+            self._on_queued(s)
+
+    def _record(self, *, was_queued: bool) -> None:
+        if self._ctx.discovery is None:
+            return
+        if self._recorded and not was_queued:
+            return
+        self._recorded = True
+        try:
+            self._ctx.discovery.record_suggestion(self._s, was_queued=was_queued)
+        except Exception:
+            self._log.debug("record_suggestion failed", exc_info=True)
+
+    def _on_open_discogs(self) -> None:
+        webbrowser.open(
+            f"https://www.discogs.com/master/{self._s.discogs_master_id}")
+
+    def _on_open_youtube(self) -> None:
+        webbrowser.open(self._s.youtube_url)
+
+    # ── Teardown ──
+
+    def teardown(self) -> None:
+        self._cancel_event.set()
+        if self._player is not None:
+            try:
+                self._player.stop()
+            except Exception:
+                pass

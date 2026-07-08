@@ -166,6 +166,21 @@ class DiscoveryConfig(BaseModel):
     has_token: bool = False
     default_min_have: int = Field(default=10, ge=1)
 
+    # How many gems a single Dig surfaces into the reel.
+    reel_size: int = Field(default=8, ge=1, le=24)
+
+    # Tilt discovery toward sample-friendly genres/styles/eras. This only
+    # re-weights the ranking — nothing is ever hard-excluded, so the
+    # roulette can still surface anything.
+    prioritize_samples: bool = True
+    # 0.0 = pure Discogs desirability (want/have); 1.0 = strongly favor
+    # sample-friendly genres/eras. 0.6 is a balanced default.
+    sample_weight_intensity: float = Field(default=0.6, ge=0.0, le=1.0)
+
+    # Include "Various Artists" compilations. Many breaks live on comps,
+    # but they resolve poorly on YouTube Music, so it's off by default.
+    allow_compilations: bool = False
+
 
 class UIConfig(BaseModel):
     """UI-state preferences."""
@@ -173,7 +188,17 @@ class UIConfig(BaseModel):
     window_width: int = Field(default=1280, ge=1120)
     window_height: int = Field(default=820, ge=720)
     last_active_tab: str = "manual_rip"
+    # Playback volume for the in-app preview players (0.0..1.0).
+    preview_volume: float = Field(default=0.85, ge=0.0, le=1.0)
     # Space for future vault-tab column sort/filter persistence.
+
+
+class ExportConfig(BaseModel):
+    """MPC / WAV export defaults."""
+
+    sample_rate: int = Field(default=44100, ge=8000, le=192000)
+    bit_depth: int = Field(default=16, ge=16, le=24)
+    # Only 16 and 24 are supported by the exporter; validated at use time.
 
 
 class AppConfig(BaseModel):
@@ -184,6 +209,7 @@ class AppConfig(BaseModel):
     downloader: DownloaderConfig = Field(default_factory=DownloaderConfig)
     stems: StemsConfig = Field(default_factory=StemsConfig)
     discovery: DiscoveryConfig = Field(default_factory=DiscoveryConfig)
+    export: ExportConfig = Field(default_factory=ExportConfig)
     ui: UIConfig = Field(default_factory=UIConfig)
 
 
@@ -316,6 +342,9 @@ class ConfigManager:
 
     def update_discovery(self, **fields: Any) -> ConfigSnapshot:
         return self._update_section("discovery", DiscoveryConfig, fields)
+
+    def update_export(self, **fields: Any) -> ConfigSnapshot:
+        return self._update_section("export", ExportConfig, fields)
 
     def update_ui(self, **fields: Any) -> ConfigSnapshot:
         return self._update_section("ui", UIConfig, fields)

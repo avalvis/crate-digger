@@ -54,7 +54,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import customtkinter as ctk
 
-from core.database import TrackFilter, TrackRecord
+from core.database import CrateRecord, DuplicateGroup, TrackFilter, TrackRecord
 from core.exporter import (
     ExportCancelledError,
     ExportedFile,
@@ -74,6 +74,7 @@ from ui.components.data_table import (
 )
 from ui.components.glow_entry import GlowEntry
 from ui.components.progress_row import ProgressRow  # noqa: F401 — used indirectly
+from ui.components.waveform_player import WaveformPlayer
 from ui.theme import (
     Theme,
     style_card,
@@ -95,6 +96,10 @@ if TYPE_CHECKING:
 
 _GENRE_ANY = "Any genre"
 _KEY_ANY = "Any key"
+_TAG_ANY = "Any tag"
+_CRATE_ANY = "All crates"
+_RATING_ANY = "Any rating"
+_RATING_CHOICES = [_RATING_ANY, "★ 1+", "★ 2+", "★ 3+", "★ 4+", "★ 5"]
 
 # Full Camelot wheel — what DJ software uses, what users think in.
 _CAMELOT_KEYS: list[str] = [
@@ -143,6 +148,9 @@ class _VaultFilterState:
     max_bpm: Optional[float] = None
     camelot_key: Optional[str] = None
     has_stems: Optional[bool] = None
+    min_rating: Optional[int] = None
+    tag: Optional[str] = None
+    crate_id: Optional[int] = None
     sort_key: str = "date_added"
     sort_desc: bool = True
 
@@ -154,6 +162,9 @@ class _VaultFilterState:
             max_bpm=self.max_bpm,
             camelot_key=self.camelot_key,
             has_stems=self.has_stems,
+            min_rating=self.min_rating,
+            tag=self.tag,
+            crate_id=self.crate_id,
             order_by=self.sort_key,
             order_desc=self.sort_desc,
             limit=limit,
@@ -200,6 +211,9 @@ class VaultTab(ctk.CTkFrame):
         self._search_entry: Optional[GlowEntry] = None
         self._genre_dropdown: Optional[ctk.CTkOptionMenu] = None
         self._key_dropdown: Optional[ctk.CTkOptionMenu] = None
+        self._rating_dropdown: Optional[ctk.CTkOptionMenu] = None
+        self._tag_dropdown: Optional[ctk.CTkOptionMenu] = None
+        self._crate_dropdown: Optional[ctk.CTkOptionMenu] = None
         self._min_bpm_entry: Optional[ctk.CTkEntry] = None
         self._max_bpm_entry: Optional[ctk.CTkEntry] = None
         self._stems_only_var: Optional[ctk.BooleanVar] = None
@@ -211,6 +225,11 @@ class VaultTab(ctk.CTkFrame):
         self._reveal_button: Optional[ctk.CTkButton] = None
         self._reanalyze_button: Optional[ctk.CTkButton] = None
         self._delete_button: Optional[ctk.CTkButton] = None
+        self._inspect_button: Optional[ctk.CTkButton] = None
+        self._crate_button: Optional[ctk.CTkButton] = None
+
+        # Maps crate dropdown labels → crate ids (label "All crates" → None).
+        self._crate_label_to_id: dict[str, Optional[int]] = {}
 
         # Pending focus hint (from "Show in Vault" toast actions).
         # Set by `focus_track()`; consumed on next successful refresh.
@@ -218,6 +237,8 @@ class VaultTab(ctk.CTkFrame):
 
         self._build_body()
         self._refresh_genres()
+        self._refresh_tag_choices()
+        self._refresh_crate_choices()
         self._refresh_data()
 
         # Subscribe to queue events for live updates on completion.
@@ -271,13 +292,20 @@ class VaultTab(ctk.CTkFrame):
             **style_label_heading(t),
         ).grid(row=0, column=0, sticky="w")
 
+        ctk.CTkButton(
+            header,
+            text="Find duplicates",
+            command=self._on_find_duplicates_clicked,
+            **style_ghost_button(t),
+        ).grid(row=0, column=1, sticky="e", padx=(0, t.space.md))
+
         self._header_count_label = ctk.CTkLabel(
             header,
             text="",
             **style_label_meta(t),
             anchor="e",
         )
-        self._header_count_label.grid(row=0, column=1, sticky="e")
+        self._header_count_label.grid(row=0, column=2, sticky="e")
 
     def _build_filter_row(self) -> None:
         t = self._theme
@@ -393,6 +421,22 @@ class VaultTab(ctk.CTkFrame):
         )
         self._reset_button.grid(row=1, column=3, sticky="e")
 
+        # Row 2: rating + tag + crate dropdowns
+        self._rating_dropdown = self._make_dropdown(
+            inner, _RATING_CHOICES, self._on_rating_changed, width=130)
+        self._rating_dropdown.grid(row=2, column=0, sticky="w",
+                                   padx=(0, t.space.md), pady=(t.space.sm, 0))
+
+        self._tag_dropdown = self._make_dropdown(
+            inner, [_TAG_ANY], self._on_tag_changed, width=180)
+        self._tag_dropdown.grid(row=2, column=1, sticky="w",
+                                padx=(0, t.space.md), pady=(t.space.sm, 0))
+
+        self._crate_dropdown = self._make_dropdown(
+            inner, [_CRATE_ANY], self._on_crate_changed, width=200)
+        self._crate_dropdown.grid(row=2, column=2, sticky="w",
+                                  pady=(t.space.sm, 0))
+
     def _build_table(self) -> None:
         t = self._theme
 
@@ -461,6 +505,24 @@ class VaultTab(ctk.CTkFrame):
         # Action buttons on the right
         actions = ctk.CTkFrame(toolbar, fg_color="transparent")
         actions.grid(row=0, column=2, sticky="e", padx=t.space.lg, pady=t.space.md)
+
+        self._inspect_button = ctk.CTkButton(
+            actions,
+            text="Inspect",
+            command=self._on_inspect_clicked,
+            **style_ghost_button(t),
+            state="disabled",
+        )
+        self._inspect_button.pack(side="left", padx=(0, t.space.xs))
+
+        self._crate_button = ctk.CTkButton(
+            actions,
+            text="Add to crate",
+            command=self._on_add_to_crate_clicked,
+            **style_ghost_button(t),
+            state="disabled",
+        )
+        self._crate_button.pack(side="left", padx=(0, t.space.xs))
 
         self._reveal_button = ctk.CTkButton(
             actions,
@@ -612,6 +674,47 @@ class VaultTab(ctk.CTkFrame):
         except Exception:
             self._log.exception("Genre list refresh failed")
 
+    def _refresh_tag_choices(self) -> None:
+        """Populate the tag dropdown from the union of all track tags."""
+        try:
+            tags = self._ctx.database.list_distinct_tags()
+            values = [_TAG_ANY] + tags
+            if self._tag_dropdown is not None:
+                current = self._tag_dropdown.get()
+                self._tag_dropdown.configure(values=values)
+                if current in values:
+                    self._tag_dropdown.set(current)
+                else:
+                    self._tag_dropdown.set(_TAG_ANY)
+        except Exception:
+            self._log.exception("Tag list refresh failed")
+
+    def _refresh_crate_choices(self) -> None:
+        """Populate the crate dropdown from the DB, keeping label→id map."""
+        try:
+            crates = self._ctx.database.list_crates()
+            self._crate_label_to_id = {_CRATE_ANY: None}
+            values = [_CRATE_ANY]
+            for c in crates:
+                label = f"{c.name} ({c.track_count})"
+                self._crate_label_to_id[label] = c.id
+                values.append(label)
+            if self._crate_dropdown is not None:
+                # Preserve current crate selection by id if it still exists.
+                prev_id = self._filters.crate_id
+                self._crate_dropdown.configure(values=values)
+                restored = None
+                if prev_id is not None:
+                    for label, cid in self._crate_label_to_id.items():
+                        if cid == prev_id:
+                            restored = label
+                            break
+                self._crate_dropdown.set(restored or _CRATE_ANY)
+                if restored is None:
+                    self._filters.crate_id = None
+        except Exception:
+            self._log.exception("Crate list refresh failed")
+
     def _schedule_refresh(self) -> None:
         """Debounced refresh — coalesces event bursts."""
         if self._refresh_timer is not None:
@@ -627,6 +730,8 @@ class VaultTab(ctk.CTkFrame):
     def _refresh_and_clear_timer(self) -> None:
         self._refresh_timer = None
         self._refresh_genres()
+        self._refresh_tag_choices()
+        self._refresh_crate_choices()
         self._refresh_data()
 
     def _update_header_count(
@@ -727,6 +832,23 @@ class VaultTab(ctk.CTkFrame):
         self._filters.has_stems = True if self._stems_only_var.get() else None
         self._refresh_data()
 
+    def _on_rating_changed(self, value: str) -> None:
+        if value == _RATING_ANY:
+            self._filters.min_rating = None
+        else:
+            # Labels look like "★ 3+" or "★ 5"; the digit is the threshold.
+            digits = "".join(ch for ch in value if ch.isdigit())
+            self._filters.min_rating = int(digits) if digits else None
+        self._refresh_data()
+
+    def _on_tag_changed(self, value: str) -> None:
+        self._filters.tag = None if value == _TAG_ANY else value
+        self._refresh_data()
+
+    def _on_crate_changed(self, value: str) -> None:
+        self._filters.crate_id = self._crate_label_to_id.get(value)
+        self._refresh_data()
+
     def _apply_bpm_range(self) -> None:
         """Validate both entries, coerce to filter state, refresh."""
         min_bpm = self._parse_bpm(self._min_bpm_entry)
@@ -774,6 +896,12 @@ class VaultTab(ctk.CTkFrame):
             self._max_bpm_entry.delete(0, "end")
         if self._stems_only_var is not None:
             self._stems_only_var.set(False)
+        if self._rating_dropdown is not None:
+            self._rating_dropdown.set(_RATING_ANY)
+        if self._tag_dropdown is not None:
+            self._tag_dropdown.set(_TAG_ANY)
+        if self._crate_dropdown is not None:
+            self._crate_dropdown.set(_CRATE_ANY)
         if self._table is not None:
             self._table.set_sort("date_added", SortDirection.DESC)
         self._refresh_data()
@@ -786,7 +914,10 @@ class VaultTab(ctk.CTkFrame):
             or f.camelot_key
             or f.min_bpm is not None
             or f.max_bpm is not None
-            or f.has_stems is not None,
+            or f.has_stems is not None
+            or f.min_rating is not None
+            or f.tag
+            or f.crate_id is not None,
         )
 
     # ── Sort ──
@@ -812,11 +943,11 @@ class VaultTab(ctk.CTkFrame):
     # ── Row activation / selection ──
 
     def _on_row_activated(self, row: dict) -> None:
-        """Double-click: reveal in OS file manager."""
+        """Double-click: open the track inspector (preview + metadata)."""
         track: TrackRecord = row.get("_track")
         if track is None:
             return
-        self._reveal_in_os([track])
+        self._open_inspector(track)
 
     def _on_selection_changed(self, rows: list[dict]) -> None:
         self._selected_tracks = [
@@ -837,6 +968,7 @@ class VaultTab(ctk.CTkFrame):
 
         enabled = "normal" if count > 0 else "disabled"
         for btn in (
+            self._crate_button,
             self._reveal_button,
             self._reanalyze_button,
             self._delete_button,
@@ -844,6 +976,12 @@ class VaultTab(ctk.CTkFrame):
         ):
             if btn is not None:
                 btn.configure(state=enabled)
+
+        # Inspect operates on a single track only.
+        if self._inspect_button is not None:
+            self._inspect_button.configure(
+                state="normal" if count == 1 else "disabled"
+            )
 
     # ── Pending focus ──
 
@@ -903,6 +1041,66 @@ class VaultTab(ctk.CTkFrame):
             QueueEventType.JOB_FAILED,
         ):
             self._schedule_refresh()
+
+    # ── Action: Inspect (preview + metadata editing) ──
+
+    def _on_inspect_clicked(self) -> None:
+        if len(self._selected_tracks) != 1:
+            return
+        self._open_inspector(self._selected_tracks[0])
+
+    def _open_inspector(self, track: TrackRecord) -> None:
+        _TrackInspectorDialog(
+            parent=self,
+            theme=self._theme,
+            ctx=self._ctx,
+            track=track,
+            on_saved=self._on_inspector_saved,
+        )
+
+    def _on_inspector_saved(self) -> None:
+        """Called after the inspector persists rating/tags/notes."""
+        self._refresh_tag_choices()
+        self._refresh_data()
+
+    # ── Action: Add to crate ──
+
+    def _on_add_to_crate_clicked(self) -> None:
+        if not self._selected_tracks:
+            return
+        _AddToCrateDialog(
+            parent=self,
+            theme=self._theme,
+            ctx=self._ctx,
+            tracks=list(self._selected_tracks),
+            on_done=self._on_crate_changed_externally,
+        )
+
+    def _on_crate_changed_externally(self) -> None:
+        self._refresh_crate_choices()
+        self._refresh_data()
+
+    # ── Action: Find duplicates ──
+
+    def _on_find_duplicates_clicked(self) -> None:
+        try:
+            groups = self._ctx.database.find_duplicates()
+        except Exception as e:
+            self._log.exception("Duplicate scan failed")
+            self._ctx.publish_toast(f"Duplicate scan failed: {e}", "error")
+            return
+
+        if not groups:
+            self._ctx.publish_toast("No duplicates found.", "success")
+            return
+
+        _DuplicatesDialog(
+            parent=self,
+            theme=self._theme,
+            ctx=self._ctx,
+            groups=groups,
+            on_deleted=self._on_inspector_saved,
+        )
 
     # ── Action: Reveal ──
 
@@ -1645,3 +1843,670 @@ class _ExportProgressDialog(ctk.CTkToplevel):
         self._on_cancel_clicked()
         # Don't destroy immediately — let the worker unwind so the user
         # sees the "Cancelled" state before the dialog closes.
+
+
+# ─── Track inspector (preview + metadata editing) ───────────────────
+
+
+class _TrackInspectorDialog(ctk.CTkToplevel):
+    """
+    Single-track inspector: an in-app waveform preview of the local file
+    plus editable star rating, tags and notes. Persists straight to the
+    Vault DB on Save and calls `on_saved` so the parent can refresh.
+    """
+
+    _WIDTH = 620
+    _HEIGHT = 560
+
+    def __init__(
+        self,
+        parent: ctk.CTkBaseClass,
+        theme: Theme,
+        ctx: "AppContext",
+        track: TrackRecord,
+        on_saved: Callable[[], None],
+    ) -> None:
+        super().__init__(parent)
+
+        self._theme = theme
+        self._ctx = ctx
+        self._track = track
+        self._on_saved = on_saved
+        self._log = ctx.logger.getChild("vault.inspect")
+
+        self._rating: int = int(track.rating or 0)
+        self._star_buttons: list[ctk.CTkButton] = []
+        self._player: Optional[WaveformPlayer] = None
+        self._cancel_event = threading.Event()
+        self._preview_started = False
+
+        t = theme
+        self.title(f"{track.artist} — {track.title}")
+        self.configure(fg_color=t.surface.base)
+        self.geometry(f"{self._WIDTH}x{self._HEIGHT}")
+        self.resizable(False, False)
+        self.transient(parent.winfo_toplevel())
+        self._center_over(parent)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+
+        self._build_body()
+        self.bind("<Escape>", lambda _e: self._close())
+
+    def _build_body(self) -> None:
+        t = self._theme
+        track = self._track
+
+        frame = ctk.CTkFrame(self, fg_color="transparent")
+        frame.pack(fill="both", expand=True, padx=t.space.xl, pady=t.space.lg)
+        frame.grid_columnconfigure(0, weight=1)
+
+        # Title + subtitle
+        ctk.CTkLabel(
+            frame,
+            text=track.title or "Untitled",
+            text_color=t.text.primary,
+            font=t.font.subheading,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew")
+        ctk.CTkLabel(
+            frame,
+            text=track.artist or "Unknown artist",
+            text_color=t.text.secondary,
+            font=t.font.body,
+            anchor="w",
+        ).grid(row=1, column=0, sticky="ew", pady=(0, t.space.xs))
+
+        # Metadata chips line
+        meta_bits: list[str] = []
+        if track.genre:
+            meta_bits.append(track.genre)
+        if track.bpm:
+            meta_bits.append(f"{track.bpm:.1f} BPM")
+        if track.camelot_key:
+            meta_bits.append(track.camelot_key)
+        if track.year:
+            meta_bits.append(str(track.year))
+        ctk.CTkLabel(
+            frame,
+            text="   ·   ".join(meta_bits) if meta_bits else "—",
+            text_color=t.text.muted,
+            font=t.font.caption,
+            anchor="w",
+        ).grid(row=2, column=0, sticky="ew", pady=(0, t.space.md))
+
+        # Waveform preview
+        self._player = WaveformPlayer(
+            frame,
+            t,
+            height=90,
+            initial_volume=self._ctx.config.snapshot().config.ui.preview_volume,
+        )
+        self._player.grid(row=3, column=0, sticky="ew", pady=(0, t.space.md))
+        self._start_preview()
+
+        # Rating
+        ctk.CTkLabel(
+            frame, text="Rating", **style_label_meta(t), anchor="w"
+        ).grid(row=4, column=0, sticky="w")
+        star_row = ctk.CTkFrame(frame, fg_color="transparent")
+        star_row.grid(row=5, column=0, sticky="w", pady=(t.space.xxs, t.space.md))
+        for i in range(1, 6):
+            btn = ctk.CTkButton(
+                star_row,
+                text="★",
+                width=34,
+                height=34,
+                fg_color="transparent",
+                hover_color=t.surface.elevated,
+                text_color=t.text.muted,
+                font=t.font.subheading,
+                command=lambda n=i: self._set_rating(n),
+            )
+            btn.pack(side="left", padx=(0, 2))
+            self._star_buttons.append(btn)
+        ctk.CTkButton(
+            star_row,
+            text="Clear",
+            width=54,
+            height=34,
+            command=lambda: self._set_rating(0),
+            **style_ghost_button(t),
+        ).pack(side="left", padx=(t.space.sm, 0))
+        self._render_stars()
+
+        # Tags
+        ctk.CTkLabel(
+            frame, text="Tags (comma-separated)", **style_label_meta(t),
+            anchor="w",
+        ).grid(row=6, column=0, sticky="w")
+        self._tags_entry = ctk.CTkEntry(
+            frame,
+            height=38,
+            **{k: v for k, v in style_input(t).items() if k != "height"},
+        )
+        self._tags_entry.grid(row=7, column=0, sticky="ew", pady=(t.space.xxs, t.space.md))
+        if track.tags:
+            self._tags_entry.insert(0, ", ".join(track.tags))
+
+        # Notes
+        ctk.CTkLabel(
+            frame, text="Notes", **style_label_meta(t), anchor="w"
+        ).grid(row=8, column=0, sticky="w")
+        self._notes_box = ctk.CTkTextbox(
+            frame,
+            height=90,
+            fg_color=t.surface.raised,
+            text_color=t.text.primary,
+            border_color=t.border.subtle,
+            border_width=t.stroke.hairline,
+            corner_radius=t.radius.md,
+            font=t.font.body,
+        )
+        self._notes_box.grid(row=9, column=0, sticky="ew", pady=(t.space.xxs, t.space.lg))
+        if track.notes:
+            self._notes_box.insert("1.0", track.notes)
+
+        # Buttons
+        buttons = ctk.CTkFrame(frame, fg_color="transparent")
+        buttons.grid(row=10, column=0, sticky="ew")
+        ctk.CTkButton(
+            buttons, text="Export chop kit",
+            command=self._export_chop_kit,
+            **style_ghost_button(t),
+        ).pack(side="left")
+        ctk.CTkButton(
+            buttons, text="Cancel", command=self._close,
+            **style_secondary_button(t),
+        ).pack(side="right", padx=(t.space.sm, 0))
+        ctk.CTkButton(
+            buttons, text="Save", command=self._save,
+            **style_primary_button(t),
+        ).pack(side="right")
+
+    # ── Preview ──
+
+    def _start_preview(self) -> None:
+        if self._preview_started or self._player is None:
+            return
+        if self._ctx.preview is None:
+            self._player.set_error("Preview service unavailable.")
+            return
+        path = Path(self._track.file_path)
+        if not path.exists():
+            self._player.set_error("File not found on disk.")
+            return
+        self._preview_started = True
+        self._player.set_loading("Decoding…")
+        threading.Thread(
+            target=self._preview_worker, args=(path,),
+            name="vault-preview", daemon=True,
+        ).start()
+
+    def _preview_worker(self, path: Path) -> None:
+        try:
+            data = self._ctx.preview.load_file(
+                path, cancel_event=self._cancel_event
+            )
+        except Exception as e:  # noqa: BLE001 — surfaced in UI
+            self.after(0, lambda err=e: self._on_preview_error(err))
+            return
+        self.after(0, lambda: self._on_preview_ready(data))
+
+    def _on_preview_ready(self, data) -> None:
+        if self._player is not None:
+            self._player.set_preview(data)
+
+    def _on_preview_error(self, error: Exception) -> None:
+        if self._player is not None:
+            self._player.set_error(f"Preview failed: {error}")
+
+    # ── Rating ──
+
+    def _set_rating(self, value: int) -> None:
+        self._rating = max(0, min(5, int(value)))
+        self._render_stars()
+
+    def _render_stars(self) -> None:
+        t = self._theme
+        for idx, btn in enumerate(self._star_buttons, start=1):
+            filled = idx <= self._rating
+            btn.configure(
+                text="★" if filled else "☆",
+                text_color=t.accent.blue if filled else t.text.muted,
+            )
+
+    # ── Export chop kit ──
+
+    def _export_chop_kit(self) -> None:
+        if self._ctx.exporter is None:
+            self._ctx.publish_toast("Exporter not available.", "error")
+            return
+        destination = filedialog.askdirectory(
+            title="Choose destination for chop kit",
+            mustexist=True,
+            parent=self.winfo_toplevel(),
+        )
+        if not destination:
+            return
+        path = Path(self._track.file_path)
+        self._ctx.publish_toast("Analyzing chops…", "info")
+        threading.Thread(
+            target=self._chop_kit_worker,
+            args=(path, Path(destination)),
+            name="vault-chop-kit",
+            daemon=True,
+        ).start()
+
+    def _chop_kit_worker(self, path: Path, destination: Path) -> None:
+        try:
+            from core.analyzer import AudioAnalyzer
+            from core.chopper import AudioChopper
+
+            ffmpeg = (
+                self._ctx.exporter.ffmpeg_path
+                if self._ctx.exporter is not None
+                else None
+            )
+            chopper = AudioChopper(
+                analyzer=AudioAnalyzer(ffmpeg_path=ffmpeg),
+            )
+            plan = chopper.plan(path, cancel_event=self._cancel_event)
+            result = self._ctx.exporter.export_chop_kit(
+                path, plan, destination,
+                cancel_event=self._cancel_event,
+            )
+        except Exception as e:  # noqa: BLE001
+            self.after(0, lambda err=e: self._on_chop_kit_error(err))
+            return
+        self.after(0, lambda: self._on_chop_kit_done(result))
+
+    def _on_chop_kit_done(self, result) -> None:
+        n = len(result.exported)
+        self._ctx.publish_toast(
+            f"Exported chop kit: {n} file{'s' if n != 1 else ''} → "
+            f"{result.destination_root.name}",
+            "success",
+        )
+
+    def _on_chop_kit_error(self, error: Exception) -> None:
+        self._ctx.publish_toast(f"Chop kit export failed: {error}", "error")
+
+    # ── Save ──
+
+    def _save(self) -> None:
+        tags = [
+            s.strip()
+            for s in self._tags_entry.get().split(",")
+            if s.strip()
+        ]
+        notes = self._notes_box.get("1.0", "end").strip()
+        tid = self._track.id
+        if tid is None:
+            self._close()
+            return
+        try:
+            self._ctx.database.set_track_rating(
+                tid, self._rating if self._rating > 0 else None
+            )
+            self._ctx.database.set_track_annotations(
+                tid, notes=notes, tags=tags
+            )
+            self._ctx.publish_toast("Track updated.", "success")
+        except Exception as e:  # noqa: BLE001
+            self._log.exception("Saving inspector edits failed")
+            self._ctx.publish_toast(f"Could not save: {e}", "error")
+            return
+        try:
+            self._on_saved()
+        finally:
+            self._close()
+
+    # ── Lifecycle ──
+
+    def _center_over(self, parent: ctk.CTkBaseClass) -> None:
+        parent.update_idletasks()
+        px = parent.winfo_rootx()
+        py = parent.winfo_rooty()
+        pw = parent.winfo_width()
+        ph = parent.winfo_height()
+        self.geometry(
+            f"+{px + (pw - self._WIDTH) // 2}+{py + (ph - self._HEIGHT) // 2}"
+        )
+
+    def _close(self) -> None:
+        self._cancel_event.set()
+        if self._player is not None:
+            try:
+                self._player.stop()
+            except Exception:
+                pass
+        self.destroy()
+
+
+# ─── Add-to-crate dialog ────────────────────────────────────────────
+
+
+class _AddToCrateDialog(ctk.CTkToplevel):
+    """Pick an existing crate or create a new one, then add tracks to it."""
+
+    _WIDTH = 460
+    _HEIGHT = 300
+
+    def __init__(
+        self,
+        parent: ctk.CTkBaseClass,
+        theme: Theme,
+        ctx: "AppContext",
+        tracks: list[TrackRecord],
+        on_done: Callable[[], None],
+    ) -> None:
+        super().__init__(parent)
+
+        self._theme = theme
+        self._ctx = ctx
+        self._tracks = tracks
+        self._on_done = on_done
+        self._log = ctx.logger.getChild("vault.crate")
+
+        try:
+            self._crates = ctx.database.list_crates()
+        except Exception:
+            self._crates = []
+        self._label_to_id: dict[str, int] = {
+            f"{c.name} ({c.track_count})": int(c.id)
+            for c in self._crates
+            if c.id is not None
+        }
+
+        t = theme
+        self.title("Add to crate")
+        self.configure(fg_color=t.surface.base)
+        self.geometry(f"{self._WIDTH}x{self._HEIGHT}")
+        self.resizable(False, False)
+        self.grab_set()
+        self.transient(parent.winfo_toplevel())
+        self._center_over(parent)
+
+        self._build_body()
+        self.bind("<Escape>", lambda _e: self.destroy())
+
+    def _build_body(self) -> None:
+        t = self._theme
+        frame = ctk.CTkFrame(self, fg_color="transparent")
+        frame.pack(fill="both", expand=True, padx=t.space.xl, pady=t.space.xl)
+        frame.grid_columnconfigure(0, weight=1)
+
+        count = len(self._tracks)
+        ctk.CTkLabel(
+            frame,
+            text=f"Add {count} track{'s' if count != 1 else ''} to a crate",
+            text_color=t.text.primary,
+            font=t.font.subheading,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew", pady=(0, t.space.md))
+
+        # Existing crate picker
+        existing_labels = list(self._label_to_id.keys())
+        ctk.CTkLabel(
+            frame, text="Existing crate", **style_label_meta(t), anchor="w"
+        ).grid(row=1, column=0, sticky="w")
+        self._existing_menu = ctk.CTkOptionMenu(
+            frame,
+            values=existing_labels or ["— none yet —"],
+            fg_color=t.surface.raised,
+            button_color=t.surface.raised,
+            button_hover_color=t.surface.elevated,
+            dropdown_fg_color=t.surface.elevated,
+            text_color=t.text.primary,
+            dropdown_text_color=t.text.primary,
+            font=t.font.body,
+            corner_radius=t.radius.md,
+        )
+        self._existing_menu.grid(row=2, column=0, sticky="ew", pady=(t.space.xxs, t.space.xs))
+        if not existing_labels:
+            self._existing_menu.configure(state="disabled")
+        ctk.CTkButton(
+            frame,
+            text="Add to selected crate",
+            command=self._add_to_existing,
+            **style_secondary_button(t),
+            state="normal" if existing_labels else "disabled",
+        ).grid(row=3, column=0, sticky="ew", pady=(0, t.space.lg))
+
+        # New crate
+        ctk.CTkLabel(
+            frame, text="Or create a new crate", **style_label_meta(t),
+            anchor="w",
+        ).grid(row=4, column=0, sticky="w")
+        new_row = ctk.CTkFrame(frame, fg_color="transparent")
+        new_row.grid(row=5, column=0, sticky="ew", pady=(t.space.xxs, 0))
+        new_row.grid_columnconfigure(0, weight=1)
+        self._new_entry = ctk.CTkEntry(
+            new_row,
+            height=38,
+            placeholder_text="Crate name…",
+            **{k: v for k, v in style_input(t).items() if k != "height"},
+        )
+        self._new_entry.grid(row=0, column=0, sticky="ew", padx=(0, t.space.sm))
+        ctk.CTkButton(
+            new_row,
+            text="Create + add",
+            command=self._create_and_add,
+            **style_primary_button(t),
+            width=120,
+        ).grid(row=0, column=1)
+
+    def _add_to_existing(self) -> None:
+        label = self._existing_menu.get()
+        crate_id = self._label_to_id.get(label)
+        if crate_id is None:
+            return
+        self._do_add(crate_id)
+
+    def _create_and_add(self) -> None:
+        name = self._new_entry.get().strip()
+        if not name:
+            self._ctx.publish_toast("Enter a crate name.", "warning")
+            return
+        try:
+            crate_id = self._ctx.database.create_crate(name)
+        except Exception as e:  # noqa: BLE001
+            self._log.exception("Crate creation failed")
+            self._ctx.publish_toast(f"Could not create crate: {e}", "error")
+            return
+        self._do_add(crate_id)
+
+    def _do_add(self, crate_id: int) -> None:
+        track_ids = [t.id for t in self._tracks if t.id is not None]
+        try:
+            added = self._ctx.database.add_tracks_to_crate(crate_id, track_ids)
+        except Exception as e:  # noqa: BLE001
+            self._log.exception("Add-to-crate failed")
+            self._ctx.publish_toast(f"Could not add to crate: {e}", "error")
+            return
+        self._ctx.publish_toast(
+            f"Added {added} track{'s' if added != 1 else ''} to crate.",
+            "success",
+        )
+        try:
+            self._on_done()
+        finally:
+            self.destroy()
+
+    def _center_over(self, parent: ctk.CTkBaseClass) -> None:
+        parent.update_idletasks()
+        px = parent.winfo_rootx()
+        py = parent.winfo_rooty()
+        pw = parent.winfo_width()
+        ph = parent.winfo_height()
+        self.geometry(
+            f"+{px + (pw - self._WIDTH) // 2}+{py + (ph - self._HEIGHT) // 2}"
+        )
+
+
+# ─── Duplicates dialog ──────────────────────────────────────────────
+
+
+class _DuplicatesDialog(ctk.CTkToplevel):
+    """
+    Lists clusters of likely-duplicate tracks (identical checksum or the
+    same normalized artist+title) and lets the user remove DB rows for the
+    copies they don't want to keep.
+    """
+
+    _WIDTH = 720
+    _HEIGHT = 600
+
+    def __init__(
+        self,
+        parent: ctk.CTkBaseClass,
+        theme: Theme,
+        ctx: "AppContext",
+        groups: list[DuplicateGroup],
+        on_deleted: Callable[[], None],
+    ) -> None:
+        super().__init__(parent)
+
+        self._theme = theme
+        self._ctx = ctx
+        self._groups = groups
+        self._on_deleted = on_deleted
+        self._log = ctx.logger.getChild("vault.dupes")
+
+        # track_id → BooleanVar for the "remove" checkboxes.
+        self._marks: dict[int, ctk.BooleanVar] = {}
+
+        t = theme
+        self.title("Duplicate tracks")
+        self.configure(fg_color=t.surface.base)
+        self.geometry(f"{self._WIDTH}x{self._HEIGHT}")
+        self.transient(parent.winfo_toplevel())
+        self._center_over(parent)
+
+        self._build_body()
+        self.bind("<Escape>", lambda _e: self.destroy())
+
+    def _build_body(self) -> None:
+        t = self._theme
+        frame = ctk.CTkFrame(self, fg_color="transparent")
+        frame.pack(fill="both", expand=True, padx=t.space.xl, pady=t.space.lg)
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(1, weight=1)
+
+        total = sum(len(g.tracks) for g in self._groups)
+        ctk.CTkLabel(
+            frame,
+            text=f"{len(self._groups)} duplicate group"
+            f"{'s' if len(self._groups) != 1 else ''} · {total} tracks",
+            text_color=t.text.primary,
+            font=t.font.subheading,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew", pady=(0, t.space.sm))
+
+        scroll = ctk.CTkScrollableFrame(
+            frame, fg_color=t.surface.raised, corner_radius=t.radius.lg
+        )
+        scroll.grid(row=1, column=0, sticky="nsew")
+        scroll.grid_columnconfigure(0, weight=1)
+
+        row = 0
+        for gi, group in enumerate(self._groups):
+            reason = (
+                "Byte-identical files"
+                if group.reason == "checksum"
+                else "Same artist + title"
+            )
+            ctk.CTkLabel(
+                scroll,
+                text=f"Group {gi + 1} · {reason}",
+                text_color=t.text.secondary,
+                font=t.font.caption,
+                anchor="w",
+            ).grid(row=row, column=0, sticky="ew", padx=t.space.md,
+                   pady=(t.space.sm, t.space.xxs))
+            row += 1
+
+            # Keep the first track by default; pre-mark the rest for removal.
+            for ti, track in enumerate(group.tracks):
+                if track.id is None:
+                    continue
+                var = ctk.BooleanVar(value=ti > 0)
+                self._marks[track.id] = var
+                label = f"{track.artist} — {track.title}"
+                sub = self._format_track_meta(track)
+                cb = ctk.CTkCheckBox(
+                    scroll,
+                    text=f"  {label}\n  {sub}",
+                    variable=var,
+                    text_color=t.text.primary,
+                    font=t.font.body,
+                    fg_color=t.status.error,
+                    hover_color=t.status.error,
+                    border_color=t.border.strong,
+                    checkmark_color=t.text.on_accent,
+                )
+                cb.grid(row=row, column=0, sticky="ew", padx=t.space.lg,
+                        pady=(0, t.space.xxs))
+                row += 1
+
+        # Buttons
+        buttons = ctk.CTkFrame(frame, fg_color="transparent")
+        buttons.grid(row=2, column=0, sticky="ew", pady=(t.space.md, 0))
+        ctk.CTkLabel(
+            buttons,
+            text="Checked tracks will be removed from the Vault (DB only).",
+            text_color=t.text.muted,
+            font=t.font.caption,
+            anchor="w",
+        ).pack(side="left")
+        ctk.CTkButton(
+            buttons, text="Close", command=self.destroy,
+            **style_secondary_button(t),
+        ).pack(side="right", padx=(t.space.sm, 0))
+        ctk.CTkButton(
+            buttons, text="Remove checked", command=self._remove_checked,
+            **style_danger_button(t),
+        ).pack(side="right")
+
+    @staticmethod
+    def _format_track_meta(track: TrackRecord) -> str:
+        bits: list[str] = []
+        if track.genre:
+            bits.append(track.genre)
+        if track.bpm:
+            bits.append(f"{track.bpm:.0f} BPM")
+        if track.year:
+            bits.append(str(track.year))
+        bits.append(Path(track.file_path).name)
+        return "   ·   ".join(bits)
+
+    def _remove_checked(self) -> None:
+        to_remove = [tid for tid, var in self._marks.items() if var.get()]
+        if not to_remove:
+            self._ctx.publish_toast("Nothing checked.", "info")
+            return
+        removed = 0
+        for tid in to_remove:
+            try:
+                self._ctx.database.delete_track(tid)
+                removed += 1
+            except Exception as e:  # noqa: BLE001
+                self._log.warning("Could not delete track %d: %s", tid, e)
+        self._ctx.publish_toast(
+            f"Removed {removed} duplicate{'s' if removed != 1 else ''}.",
+            "success",
+        )
+        try:
+            self._on_deleted()
+        finally:
+            self.destroy()
+
+    def _center_over(self, parent: ctk.CTkBaseClass) -> None:
+        parent.update_idletasks()
+        px = parent.winfo_rootx()
+        py = parent.winfo_rooty()
+        pw = parent.winfo_width()
+        ph = parent.winfo_height()
+        self.geometry(
+            f"+{px + (pw - self._WIDTH) // 2}+{py + (ph - self._HEIGHT) // 2}"
+        )

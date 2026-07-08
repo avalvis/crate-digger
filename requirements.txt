@@ -10,7 +10,8 @@ mutagen>=1.47.0
 imageio-ffmpeg>=0.5.1          # Auto-provisions ffmpeg binary; no PATH required
 
 # ─── Discovery APIs ──────────────────────────────────────────────────
-python3-discogs-client>=2.7
+# Discovery talks to Discogs over raw HTTP via `requests`; the official
+# discogs client is intentionally not used.
 ytmusicapi>=1.8.2
 requests>=2.32.0
 
@@ -20,6 +21,12 @@ numpy>=1.26,<3.0
 scipy>=1.13
 soundfile>=0.12.1
 audioread>=3.0.1
+
+# ─── Audio Preview Playback ──────────────────────────────────────────
+# In-app waveform preview player. sounddevice bundles PortAudio wheels
+# on Windows/macOS; plays decoded PCM straight from a numpy buffer with
+# frame-accurate seeking for the discovery + vault preview scrubbers.
+sounddevice>=0.4.6
 
 # ─── Stem Separation ─────────────────────────────────────────────────
 # Pinned exact stack for reproducible Python 3.14 runtime behavior.

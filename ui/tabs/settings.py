@@ -34,6 +34,7 @@ from ui.theme import (
     style_card_elevated,
     style_danger_button,
     style_ghost_button,
+    style_input,
     style_label_body,
     style_label_heading,
     style_label_meta,
@@ -97,6 +98,19 @@ class SettingsTab(ctk.CTkFrame):
         self._folder_scheme_dropdown: Optional[ctk.CTkOptionMenu] = None
         self._deepseek_entry: Optional[GlowEntry] = None
         self._deepseek_status_label: Optional[ctk.CTkLabel] = None
+        self._min_have_entry: Optional[ctk.CTkEntry] = None
+        self._reel_size_dropdown: Optional[ctk.CTkOptionMenu] = None
+        self._prioritize_switch: Optional[ctk.CTkSwitch] = None
+        self._prioritize_var: Optional[ctk.BooleanVar] = None
+        self._intensity_slider: Optional[ctk.CTkSlider] = None
+        self._intensity_label: Optional[ctk.CTkLabel] = None
+        self._compilations_switch: Optional[ctk.CTkSwitch] = None
+        self._compilations_var: Optional[ctk.BooleanVar] = None
+        self._preview_volume_slider: Optional[ctk.CTkSlider] = None
+        self._preview_volume_label: Optional[ctk.CTkLabel] = None
+        self._export_sr_dropdown: Optional[ctk.CTkOptionMenu] = None
+        self._export_bits_dropdown: Optional[ctk.CTkOptionMenu] = None
+        self._discovery_health_label: Optional[ctk.CTkLabel] = None
 
         self._build_body()
         self._populate_from_config()
@@ -150,6 +164,8 @@ class SettingsTab(ctk.CTkFrame):
         next_row = self._build_library_section(content, next_row)
         next_row = self._build_ingestion_section(content, next_row)
         next_row = self._build_stems_section(content, next_row)
+        next_row = self._build_discovery_behavior_section(content, next_row)
+        next_row = self._build_export_section(content, next_row)
         next_row = self._build_discovery_section(content, next_row)
         next_row = self._build_about_section(content, next_row)
 
@@ -488,6 +504,190 @@ class SettingsTab(ctk.CTkFrame):
 
         return row + 3
 
+    # ── Discovery behavior section ──
+
+    def _build_discovery_behavior_section(self, parent, row: int) -> int:
+        t = self._theme
+        body = self._section_card(
+            parent,
+            row,
+            "Sample discovery",
+            "Defaults for the Digital Crate reel, genre weighting, and preview.",
+        )
+
+        self._field_label(
+            body, 0, "Minimum collectors (want)",
+            "Discogs 'have' threshold — lower surfaces rarer records.",
+        )
+        self._min_have_entry = ctk.CTkEntry(
+            body, width=100, height=38,
+            **{k: v for k, v in style_input(t).items() if k != "height"},
+            justify="center",
+        )
+        self._min_have_entry.grid(row=1, column=0, sticky="w", pady=(0, t.space.md))
+        self._min_have_entry.bind(
+            "<FocusOut>", lambda _e: self._save_min_have(), add="+",
+        )
+        self._min_have_entry.bind(
+            "<Return>", lambda _e: self._save_min_have(), add="+",
+        )
+
+        self._field_label(body, 2, "Reel size", "How many cards each Dig fills.")
+        _reel_wrapper = ctk.CTkFrame(
+            body, fg_color=t.border.strong, border_width=0, corner_radius=t.radius.md,
+        )
+        _reel_wrapper.grid(row=3, column=0, sticky="w", pady=(0, t.space.md))
+        self._reel_size_dropdown = ctk.CTkOptionMenu(
+            _reel_wrapper,
+            values=[str(n) for n in (4, 6, 8, 10, 12, 16)],
+            command=self._save_reel_size,
+            fg_color=t.surface.raised,
+            button_color=t.surface.raised,
+            button_hover_color=t.surface.elevated,
+            dropdown_fg_color=t.surface.elevated,
+            text_color=t.text.primary,
+            dropdown_text_color=t.text.primary,
+            font=t.font.body,
+            corner_radius=max(0, t.radius.md - 2),
+            width=120,
+            height=38,
+        )
+        self._reel_size_dropdown.pack(padx=2, pady=2)
+
+        self._field_label(
+            body, 4, "Prioritize sample-friendly genres",
+            "Tilts the roulette toward funk, soul, jazz, Greek gems, etc. "
+            "Nothing is ever fully excluded.",
+        )
+        prio_row = ctk.CTkFrame(body, fg_color="transparent")
+        prio_row.grid(row=5, column=0, sticky="w", pady=(0, t.space.sm))
+        self._prioritize_var = ctk.BooleanVar(value=True)
+        self._prioritize_switch = ctk.CTkSwitch(
+            prio_row, text="", variable=self._prioritize_var,
+            onvalue=True, offvalue=False,
+            command=lambda: self._save_prioritize_samples(self._prioritize_var.get()),
+            progress_color=t.accent.blue,
+            button_color=t.text.primary,
+            button_hover_color=t.text.primary,
+            fg_color=t.surface.elevated, width=40, height=22,
+        )
+        self._prioritize_switch.pack(side="left")
+
+        self._field_label(body, 6, "Sample-weight intensity")
+        intensity_row = ctk.CTkFrame(body, fg_color="transparent")
+        intensity_row.grid(row=7, column=0, sticky="ew", pady=(0, t.space.md))
+        intensity_row.grid_columnconfigure(0, weight=1)
+        self._intensity_slider = ctk.CTkSlider(
+            intensity_row, from_=0.0, to=1.0, number_of_steps=20,
+            command=self._on_intensity_slider,
+            progress_color=t.accent.blue,
+            button_color=t.accent.blue,
+            fg_color=t.surface.elevated,
+        )
+        self._intensity_slider.grid(row=0, column=0, sticky="ew", padx=(0, t.space.md))
+        self._intensity_label = ctk.CTkLabel(
+            intensity_row, text="0.60", text_color=t.text.secondary,
+            font=t.font.mono_body, width=48,
+        )
+        self._intensity_label.grid(row=0, column=1)
+
+        self._field_label(
+            body, 8, "Allow compilations",
+            "Include Various Artists comps — many breaks live on them.",
+        )
+        comp_row = ctk.CTkFrame(body, fg_color="transparent")
+        comp_row.grid(row=9, column=0, sticky="w", pady=(0, t.space.md))
+        self._compilations_var = ctk.BooleanVar(value=False)
+        self._compilations_switch = ctk.CTkSwitch(
+            comp_row, text="", variable=self._compilations_var,
+            onvalue=True, offvalue=False,
+            command=lambda: self._save_allow_compilations(self._compilations_var.get()),
+            progress_color=t.accent.blue,
+            button_color=t.text.primary,
+            button_hover_color=t.text.primary,
+            fg_color=t.surface.elevated, width=40, height=22,
+        )
+        self._compilations_switch.pack(side="left")
+
+        self._field_label(body, 10, "Preview volume")
+        pv_row = ctk.CTkFrame(body, fg_color="transparent")
+        pv_row.grid(row=11, column=0, sticky="ew", pady=(0, t.space.md))
+        pv_row.grid_columnconfigure(0, weight=1)
+        self._preview_volume_slider = ctk.CTkSlider(
+            pv_row, from_=0.0, to=1.0, number_of_steps=20,
+            command=self._on_preview_volume_slider,
+            progress_color=t.accent.purple,
+            button_color=t.accent.purple,
+            fg_color=t.surface.elevated,
+        )
+        self._preview_volume_slider.grid(row=0, column=0, sticky="ew", padx=(0, t.space.md))
+        self._preview_volume_label = ctk.CTkLabel(
+            pv_row, text="85%", text_color=t.text.secondary,
+            font=t.font.mono_body, width=48,
+        )
+        self._preview_volume_label.grid(row=0, column=1)
+
+        self._discovery_health_label = ctk.CTkLabel(
+            body, text="", text_color=t.text.muted,
+            font=t.font.caption, anchor="w", justify="left", wraplength=680,
+        )
+        self._discovery_health_label.grid(row=12, column=0, sticky="w")
+
+        return row + 3
+
+    def _build_export_section(self, parent, row: int) -> int:
+        t = self._theme
+        body = self._section_card(
+            parent, row, "MPC export",
+            "Default WAV format for Export to MPC and chop-kit exports.",
+        )
+
+        self._field_label(body, 0, "Sample rate")
+        _sr_wrapper = ctk.CTkFrame(
+            body, fg_color=t.border.strong, border_width=0, corner_radius=t.radius.md,
+        )
+        _sr_wrapper.grid(row=1, column=0, sticky="w", pady=(0, t.space.md))
+        self._export_sr_dropdown = ctk.CTkOptionMenu(
+            _sr_wrapper,
+            values=["44100 Hz", "48000 Hz"],
+            command=self._save_export_sample_rate,
+            fg_color=t.surface.raised,
+            button_color=t.surface.raised,
+            button_hover_color=t.surface.elevated,
+            dropdown_fg_color=t.surface.elevated,
+            text_color=t.text.primary,
+            dropdown_text_color=t.text.primary,
+            font=t.font.body,
+            corner_radius=max(0, t.radius.md - 2),
+            width=160,
+            height=38,
+        )
+        self._export_sr_dropdown.pack(padx=2, pady=2)
+
+        self._field_label(body, 2, "Bit depth")
+        _bits_wrapper = ctk.CTkFrame(
+            body, fg_color=t.border.strong, border_width=0, corner_radius=t.radius.md,
+        )
+        _bits_wrapper.grid(row=3, column=0, sticky="w")
+        self._export_bits_dropdown = ctk.CTkOptionMenu(
+            _bits_wrapper,
+            values=["16-bit", "24-bit"],
+            command=self._save_export_bit_depth,
+            fg_color=t.surface.raised,
+            button_color=t.surface.raised,
+            button_hover_color=t.surface.elevated,
+            dropdown_fg_color=t.surface.elevated,
+            text_color=t.text.primary,
+            dropdown_text_color=t.text.primary,
+            font=t.font.body,
+            corner_radius=max(0, t.radius.md - 2),
+            width=160,
+            height=38,
+        )
+        self._export_bits_dropdown.pack(padx=2, pady=2)
+
+        return row + 3
+
     # ── Discovery & AI section ──
 
     def _build_discovery_section(self, parent, row: int) -> int:
@@ -716,6 +916,35 @@ class SettingsTab(ctk.CTkFrame):
         if self._deepseek_entry is not None and snap.deepseek_key:
             self._deepseek_entry.set("•" * 20)
 
+        disc = cfg.discovery
+        if self._min_have_entry is not None:
+            self._min_have_entry.delete(0, "end")
+            self._min_have_entry.insert(0, str(disc.default_min_have))
+        if self._reel_size_dropdown is not None:
+            self._reel_size_dropdown.set(str(disc.reel_size))
+        if self._prioritize_var is not None:
+            self._prioritize_var.set(disc.prioritize_samples)
+        if self._intensity_slider is not None:
+            self._intensity_slider.set(disc.sample_weight_intensity)
+            self._update_intensity_label(disc.sample_weight_intensity)
+        if self._compilations_var is not None:
+            self._compilations_var.set(disc.allow_compilations)
+        if self._preview_volume_slider is not None:
+            self._preview_volume_slider.set(cfg.ui.preview_volume)
+            self._update_preview_volume_label(cfg.ui.preview_volume)
+
+        exp = cfg.export
+        if self._export_sr_dropdown is not None:
+            self._export_sr_dropdown.set(
+                "48000 Hz" if exp.sample_rate == 48000 else "44100 Hz"
+            )
+        if self._export_bits_dropdown is not None:
+            self._export_bits_dropdown.set(
+                "24-bit" if exp.bit_depth == 24 else "16-bit"
+            )
+
+        self._refresh_discovery_health()
+
         # Keyring warning visibility
         if self._keyring_warning_label is not None:
             if snap.keyring_available:
@@ -822,6 +1051,132 @@ class SettingsTab(ctk.CTkFrame):
         except ConfigError as e:
             self._ctx.publish_toast(str(e), kind="error")
 
+    def _save_min_have(self) -> None:
+        if self._min_have_entry is None:
+            return
+        try:
+            n = int(self._min_have_entry.get().strip())
+        except ValueError:
+            return
+        try:
+            self._config.update_discovery(default_min_have=n)
+        except ConfigError as e:
+            self._ctx.publish_toast(str(e), kind="error")
+
+    def _save_reel_size(self, value: str) -> None:
+        try:
+            n = int(value)
+        except ValueError:
+            return
+        try:
+            self._config.update_discovery(reel_size=n)
+        except ConfigError as e:
+            self._ctx.publish_toast(str(e), kind="error")
+
+    def _save_prioritize_samples(self, value: bool) -> None:
+        try:
+            self._config.update_discovery(prioritize_samples=bool(value))
+        except ConfigError as e:
+            self._ctx.publish_toast(str(e), kind="error")
+
+    def _on_intensity_slider(self, value: float) -> None:
+        self._update_intensity_label(value)
+        self._debounce(
+            "sample_intensity",
+            lambda: self._save_sample_intensity(float(value)),
+        )
+
+    def _save_sample_intensity(self, value: float) -> None:
+        try:
+            self._config.update_discovery(sample_weight_intensity=round(value, 2))
+        except ConfigError as e:
+            self._ctx.publish_toast(str(e), kind="error")
+
+    def _update_intensity_label(self, value: float) -> None:
+        if self._intensity_label is not None:
+            self._intensity_label.configure(text=f"{value:.2f}")
+
+    def _save_allow_compilations(self, value: bool) -> None:
+        try:
+            self._config.update_discovery(allow_compilations=bool(value))
+        except ConfigError as e:
+            self._ctx.publish_toast(str(e), kind="error")
+
+    def _on_preview_volume_slider(self, value: float) -> None:
+        self._update_preview_volume_label(value)
+        self._debounce(
+            "preview_volume",
+            lambda: self._save_preview_volume(float(value)),
+        )
+
+    def _save_preview_volume(self, value: float) -> None:
+        try:
+            self._config.update_ui(preview_volume=round(value, 2))
+        except ConfigError as e:
+            self._ctx.publish_toast(str(e), kind="error")
+
+    def _update_preview_volume_label(self, value: float) -> None:
+        if self._preview_volume_label is not None:
+            self._preview_volume_label.configure(text=f"{int(value * 100)}%")
+
+    def _save_export_sample_rate(self, label: str) -> None:
+        sr = 48000 if "48000" in label else 44100
+        try:
+            self._config.update_export(sample_rate=sr)
+            if self._ctx.exporter is not None:
+                self._ctx.exporter.update_format(sample_rate=sr)
+            self._ctx.publish_toast(
+                f"Export sample rate set to {sr} Hz.",
+                kind="info",
+            )
+        except ConfigError as e:
+            self._ctx.publish_toast(str(e), kind="error")
+
+    def _save_export_bit_depth(self, label: str) -> None:
+        bits = 24 if "24" in label else 16
+        try:
+            self._config.update_export(bit_depth=bits)
+            if self._ctx.exporter is not None:
+                self._ctx.exporter.update_format(bit_depth=bits)
+            self._ctx.publish_toast(
+                f"Export bit depth set to {bits}-bit.",
+                kind="info",
+            )
+        except ConfigError as e:
+            self._ctx.publish_toast(str(e), kind="error")
+
+    def _refresh_discovery_health(self) -> None:
+        t = self._theme
+        if self._discovery_health_label is None:
+            return
+        eng = self._ctx.discovery
+        if eng is None:
+            self._discovery_health_label.configure(
+                text="Discovery health: no Discogs token — Dig is disabled.",
+                text_color=t.text.muted,
+            )
+            return
+        try:
+            stats = eng.get_stats()
+        except Exception:
+            self._discovery_health_label.configure(
+                text="Discovery health: unavailable.",
+                text_color=t.text.muted,
+            )
+            return
+        err_note = ""
+        if stats.throttle_events:
+            err_note = f" · {stats.throttle_events} throttle event(s)"
+        self._discovery_health_label.configure(
+            text=(
+                f"Discovery health: Discogs {stats.discogs_requests} req "
+                f"({stats.discogs_rate_waits:.1f}s waited) · "
+                f"YTM {stats.ytm_requests} req "
+                f"({stats.ytm_rate_waits:.1f}s waited){err_note}"
+            ),
+            text_color=t.status.success if stats.throttle_events == 0 else t.status.warning,
+        )
+
     def _save_discogs_token(self, value: str) -> None:
         value = (value or "").strip()
         if value and set(value) == {"•"}:
@@ -863,6 +1218,7 @@ class SettingsTab(ctk.CTkFrame):
             self._ctx.publish_toast("Discogs token cleared.", kind="info")
 
         self._refresh_token_status(snap)
+        self._refresh_discovery_health()
 
     def _save_deepseek_key(self, value: str) -> None:
         value = (value or "").strip()
@@ -955,6 +1311,15 @@ class SettingsTab(ctk.CTkFrame):
                 fragment_retries=5,
                 concurrent_fragments=4,
             )
+            self._config.update_discovery(
+                default_min_have=10,
+                reel_size=8,
+                prioritize_samples=True,
+                sample_weight_intensity=0.6,
+                allow_compilations=False,
+            )
+            self._config.update_export(sample_rate=44100, bit_depth=16)
+            self._config.update_ui(preview_volume=0.85)
             # Don't clear the Discogs token on reset — user would lose
             # it and have to re-enter. Reset is for *preferences*, not
             # credentials.

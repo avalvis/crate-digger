@@ -167,14 +167,15 @@ def test_discovery() -> None:
         # Sanity: missing token error path (exercise update)
         eng.update_discogs_token(None)
         try:
-            eng.dig(DiscoveryFilters(decade=1970, genre="Jazz"))
+            eng.dig(DiscoveryFilters(year_min=1970, year_max=1979, genre="Jazz"))
         except DiscoveryError as e:
             print(f"  no-token path raises correctly: {type(e).__name__}")
         eng.update_discogs_token(DISCOGS_TOKEN)
 
         # Real dig
         filters = DiscoveryFilters(
-            decade=1970, country="Brazil", genre="Jazz", min_have=30,
+            year_min=1970, year_max=1979, country="Brazil",
+            genre="Jazz", min_have=30,
         )
         print(f"  digging: {filters}")
         try:

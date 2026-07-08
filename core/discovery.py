@@ -4,14 +4,20 @@ core/discovery.py
 Crate Digger — Gem Discovery (Discogs + YouTube Music matcher)
 
 The "Dig" button workflow:
-    1. User picks Decade, Country, Genre/Style in the UI.
+    1. User picks Era (decade range), Country, Genre/Style in the UI.
     2. Query Discogs for master releases matching the filters.
-    3. Rank by community stats (want/have ratio + absolute haves)
-       and pick a random high-rated master the user hasn't been
-       shown before.
+    3. Rank by community stats (want/have ratio) BLENDED with a
+       sample-friendliness affinity (genre/style/era/country) so the
+       roulette tilts toward boom-bap/lo-fi gems — while still able to
+       surface anything (weight, never exclude).
     4. Query ytmusicapi for the exact audio match, preferring
        official album versions over live/remixes.
-    5. Return an enriched suggestion ready to be queued.
+    5. Return a reel of enriched suggestions ready to preview + queue.
+
+`dig_many()` returns a batch for the reel UI and does NOT record the
+suggestions — the caller records via `record_suggestion()` only once the
+user previews or queues one, so skipped-but-unseen gems can resurface.
+`dig()` remains for single-shot callers and records immediately.
 
 Rate limiting (critical):
   • Discogs free tier: 60 requests/min authenticated, 25/min anonymous.
@@ -43,6 +49,7 @@ from typing import Any, Callable, Optional
 import requests
 
 from core.database import DiscoveryRecord, VaultDatabase
+from core.sampling_taxonomy import blended_score, sample_affinity
 
 
 # ─── Public types ────────────────────────────────────────────────────
@@ -50,13 +57,20 @@ from core.database import DiscoveryRecord, VaultDatabase
 @dataclass(slots=True, frozen=True)
 class DiscoveryFilters:
     """User-selected filters from the Digital Crate tab."""
-    year: Optional[int] = None             # Exact year
+    year: Optional[int] = None             # Exact year (overrides year_min/max)
+    year_min: Optional[int] = None         # Era range lower bound (inclusive)
+    year_max: Optional[int] = None         # Era range upper bound (inclusive)
     country: Optional[str] = None          # Discogs country string
     genre: Optional[str] = None            # Discogs top-level genre
     style: Optional[str] = None            # Discogs style
     format: Optional[str] = None           # Discogs format (Vinyl, CD, etc.)
     query: Optional[str] = None            # Free-text keyword search
-    min_have: int = 50                     # min community `have` count
+    min_have: int = 10                     # min community `have` count
+
+    # Sample-friendliness weighting (see core.sampling_taxonomy).
+    prioritize_samples: bool = True        # tilt ranking toward sample-friendly
+    sample_intensity: float = 0.6          # 0=pure desirability, 1=affinity-led
+    allow_compilations: bool = False       # include "Various Artists" masters
 
 
 @dataclass(slots=True, frozen=True)
@@ -77,6 +91,22 @@ class DiscogsCandidate:
     def desirability(self) -> float:
         """Want-to-have ratio, a common proxy for 'underrated gem' status."""
         return (self.want / self.have) if self.have > 0 else 0.0
+
+    @property
+    def sample_affinity(self) -> float:
+        """Sample-friendliness multiplier from the taxonomy (>0 always)."""
+        return sample_affinity(
+            genres=self.genres,
+            styles=self.styles,
+            country=self.country,
+            year=self.year,
+        )
+
+    def rank_score(self, *, prioritize: bool, intensity: float) -> float:
+        """Final ranking score: desirability blended with sample affinity."""
+        if not prioritize:
+            return self.desirability
+        return blended_score(self.desirability, self.sample_affinity, intensity)
 
 
 @dataclass(slots=True, frozen=True)
@@ -206,9 +236,10 @@ class DiscoveryEngine:
     USER_AGENT = "CrateDigger/0.1 +https://github.com/josh/cratedigger"
 
     # Max pages of Discogs search results to fetch per Dig. Discogs
-    # returns 50 per page; 4 pages = 200 candidates, plenty to pick
-    # from without burning the rate budget on a single click.
-    MAX_SEARCH_PAGES = 4
+    # returns 50 per page; 6 pages = 300 candidates — a deep pool that
+    # keeps a full reel (and repeated Digs) fresh without hammering the
+    # rate budget. Range searches widen this further (see _search_discogs).
+    MAX_SEARCH_PAGES = 6
 
     # How many Discogs candidates to try when the first YT match fails.
     MAX_YT_MATCH_ATTEMPTS = 10
@@ -266,9 +297,9 @@ class DiscoveryEngine:
 
     def dig(self, filters: DiscoveryFilters) -> DiscoverySuggestion:
         """
-        Main entry point. Given filters, return one fully-resolved
-        DiscoverySuggestion. The caller (pipeline or UI) is responsible
-        for recording the discovery into the DB once the user acts on it.
+        Single-shot entry point. Returns one fully-resolved suggestion
+        and records it immediately (legacy behavior used by scripts and
+        any caller that wants one gem per click).
 
         Raises:
             DiscoveryConfigError     — missing token
@@ -276,12 +307,35 @@ class DiscoveryEngine:
             NoYouTubeMatchError      — Discogs matches found but none resolvable
             DiscoveryThrottledError  — rate limited beyond our ability to wait
         """
+        results = self.dig_many(filters, count=1)
+        if not results:
+            raise NoYouTubeMatchError(
+                "No Discogs candidate resolved on YouTube Music."
+            )
+        suggestion = results[0]
+        # Legacy contract: record on surface.
+        self.record_suggestion(suggestion, was_queued=False)
+        return suggestion
+
+    def dig_many(
+        self, filters: DiscoveryFilters, count: int = 8,
+    ) -> list[DiscoverySuggestion]:
+        """
+        Surface up to `count` resolved suggestions for the reel UI.
+
+        Ranking blends Discogs desirability with sample-friendliness
+        affinity (genre/style/era/country) when `filters.prioritize_samples`
+        is set. Suggestions are NOT recorded here — call
+        `record_suggestion()` when the user previews or queues one, so
+        skipped gems can resurface on a later Dig.
+        """
         if not self._token:
             raise DiscoveryConfigError(
                 "Discogs API token is required. Add one in Settings."
             )
 
-        self._log.info("Dig started: %s", filters)
+        count = max(1, int(count))
+        self._log.info("Dig (batch of %d) started: %s", count, filters)
 
         candidates = self._search_discogs(filters)
         if not candidates:
@@ -289,58 +343,111 @@ class DiscoveryEngine:
                 "No Discogs masters matched the filters. Try widening them."
             )
 
-        # Filter out previously-suggested masters.
+        pool = self._rank_and_shuffle(candidates, filters)
+
+        # Walk the ranked pool, resolving YT matches until we fill the
+        # reel or exhaust a generous attempt budget.
+        suggestions: list[DiscoverySuggestion] = []
+        seen_video_ids: set[str] = set()
+        last_error: Optional[Exception] = None
+        max_attempts = min(len(pool), count * 3 + self.MAX_YT_MATCH_ATTEMPTS)
+
+        for cand in pool[:max_attempts]:
+            if len(suggestions) >= count:
+                break
+            try:
+                suggestion = self._match_youtube(cand)
+            except NoYouTubeMatchError as e:
+                last_error = e
+                self._log.debug(
+                    "No YT match for %s — %s: %s", cand.artist, cand.title, e,
+                )
+                continue
+            # De-dupe within a single reel (different masters can resolve
+            # to the same upload).
+            if suggestion.youtube_video_id in seen_video_ids:
+                continue
+            seen_video_ids.add(suggestion.youtube_video_id)
+            suggestions.append(suggestion)
+            self._log.info(
+                "Reel match %d/%d: %s — %s (YT %.2f, affinity %.2f)",
+                len(suggestions), count, cand.artist, cand.title,
+                suggestion.match_score, cand.sample_affinity,
+            )
+
+        if not suggestions:
+            raise NoYouTubeMatchError(
+                f"Tried {max_attempts} Discogs candidates; none resolved on "
+                f"YouTube Music. Last error: {last_error}"
+            )
+        return suggestions
+
+    def record_suggestion(
+        self, suggestion: DiscoverySuggestion, *, was_queued: bool = False,
+    ) -> None:
+        """
+        Persist a suggestion to discovery_history so it isn't re-surfaced.
+        Called by the UI when the user previews or queues a gem.
+        """
+        try:
+            self._db.record_discovery(DiscoveryRecord(
+                discogs_master_id=suggestion.discogs_master_id,
+                discogs_release_id=suggestion.discogs_release_id,
+                artist=suggestion.artist,
+                title=suggestion.title,
+                year=suggestion.year,
+                country=suggestion.country,
+                genre=suggestion.genre,
+                style=suggestion.style,
+                was_queued=was_queued,
+            ))
+        except Exception:
+            self._log.exception(
+                "Could not record discovery for master %s",
+                suggestion.discogs_master_id,
+            )
+
+    def _rank_and_shuffle(
+        self, candidates: list[DiscogsCandidate], filters: DiscoveryFilters,
+    ) -> list[DiscogsCandidate]:
+        """
+        Produce an exploration-friendly ranked pool: drop already-seen
+        masters, sort by blended score, then shuffle the desirable top
+        tier so repeated Digs feel fresh. A few random wildcards from the
+        long tail are spliced in so nothing is ever fully excluded.
+        """
         fresh = [c for c in candidates
                  if not self._db.is_already_suggested(c.master_id)]
         if not fresh:
-            # If everything has been seen, fall back to the full list —
-            # the user clicked Dig, they should get *something*.
             self._log.info(
                 "All %d candidates already suggested; reusing pool.",
                 len(candidates),
             )
-            fresh = candidates
+            fresh = list(candidates)
 
-        # Weighted pick: desirability-weighted, but still randomized so
-        # repeated clicks feel exploratory rather than deterministic.
-        ranked = sorted(fresh, key=lambda c: c.desirability, reverse=True)
-        top_pool = ranked[:max(10, len(ranked) // 4)]
+        prioritize = filters.prioritize_samples
+        intensity = filters.sample_intensity
+        ranked = sorted(
+            fresh,
+            key=lambda c: c.rank_score(prioritize=prioritize, intensity=intensity),
+            reverse=True,
+        )
+
+        # Top tier: the best quarter (min 12). Shuffle for exploration.
+        cut = max(12, len(ranked) // 4)
+        top_pool = ranked[:cut]
+        tail = ranked[cut:]
         self._rng.shuffle(top_pool)
 
-        # Try candidates in order until a YT match resolves.
-        last_error: Optional[Exception] = None
-        for i, cand in enumerate(top_pool[:self.MAX_YT_MATCH_ATTEMPTS]):
-            try:
-                suggestion = self._match_youtube(cand)
-                self._log.info(
-                    "Dig resolved on attempt %d: %s — %s (YT score %.2f)",
-                    i + 1, cand.artist, cand.title, suggestion.match_score,
-                )
-                # Record now so a second Dig doesn't re-surface this one
-                # even if the user never queues it.
-                self._db.record_discovery(DiscoveryRecord(
-                    discogs_master_id=cand.master_id,
-                    discogs_release_id=cand.release_id,
-                    artist=cand.artist,
-                    title=cand.title,
-                    year=cand.year,
-                    country=cand.country,
-                    genre=(cand.genres[0] if cand.genres else None),
-                    style=(cand.styles[0] if cand.styles else None),
-                ))
-                return suggestion
-            except NoYouTubeMatchError as e:
-                last_error = e
-                self._log.debug(
-                    "No YT match for %s — %s: %s",
-                    cand.artist, cand.title, e,
-                )
-                continue
+        # Splice in up to 3 wildcards from the tail so the roulette can
+        # still surprise — "weight, never exclude" made literal.
+        if tail:
+            wildcards = self._rng.sample(tail, k=min(3, len(tail)))
+            for wc in wildcards:
+                insert_at = self._rng.randint(0, len(top_pool))
+                top_pool.insert(insert_at, wc)
 
-        raise NoYouTubeMatchError(
-            f"Tried {self.MAX_YT_MATCH_ATTEMPTS} Discogs candidates; "
-            f"none resolved on YouTube Music. Last error: {last_error}"
-        )
+        return top_pool
 
     # ── Discogs ──
 
@@ -352,6 +459,8 @@ class DiscoveryEngine:
             "type": "master",
             "per_page": 50,
         }
+        # Exact year narrows server-side. For an era *range* Discogs has no
+        # native param, so we omit it and filter candidates client-side.
         if filters.year is not None:
             params["year"] = filters.year
         if filters.country:
@@ -365,8 +474,15 @@ class DiscoveryEngine:
         if filters.query:
             params["q"] = filters.query
 
+        # A range filter throws away many hits client-side, so widen the
+        # page budget to keep the reel well-fed.
+        has_range = filters.year is None and (
+            filters.year_min is not None or filters.year_max is not None
+        )
+        max_pages = self.MAX_SEARCH_PAGES + (3 if has_range else 0)
+
         candidates: list[DiscogsCandidate] = []
-        for page in range(1, self.MAX_SEARCH_PAGES + 1):
+        for page in range(1, max_pages + 1):
             params["page"] = page
             data = self._discogs_get("/database/search", params)
             results = data.get("results") or []
@@ -374,10 +490,14 @@ class DiscoveryEngine:
                 break
 
             for r in results:
-                cand = self._result_to_candidate(r)
+                cand = self._result_to_candidate(
+                    r, allow_compilations=filters.allow_compilations,
+                )
                 if cand is None:
                     continue
                 if cand.have < filters.min_have:
+                    continue
+                if not self._year_in_range(cand.year, filters):
                     continue
                 candidates.append(cand)
 
@@ -392,6 +512,21 @@ class DiscoveryEngine:
         )
         return candidates
 
+    @staticmethod
+    def _year_in_range(
+        year: Optional[int], filters: DiscoveryFilters,
+    ) -> bool:
+        """Client-side era-range gate. Unknown years pass (don't punish)."""
+        if filters.year is not None:
+            return True  # exact-year already applied server-side
+        if year is None:
+            return True
+        if filters.year_min is not None and year < filters.year_min:
+            return False
+        if filters.year_max is not None and year > filters.year_max:
+            return False
+        return True
+
     # Artist values that represent compilations — no single YouTube video
     # can match "Various Artists", so skip these early.
     _VARIOUS_NAMES: frozenset[str] = frozenset({
@@ -400,7 +535,9 @@ class DiscoveryEngine:
     })
 
     @staticmethod
-    def _result_to_candidate(r: dict[str, Any]) -> Optional[DiscogsCandidate]:
+    def _result_to_candidate(
+        r: dict[str, Any], *, allow_compilations: bool = False,
+    ) -> Optional[DiscogsCandidate]:
         """Parse a /database/search hit into a candidate, or None if unusable."""
         master_id = r.get("master_id") or r.get("id")
         title_full = r.get("title") or ""
@@ -413,9 +550,13 @@ class DiscoveryEngine:
         else:
             artist, title = "", title_full
 
-        # Skip compilations — "Various Artists" entries can't be matched
-        # to a single YouTube video, so they only burn YTM rate budget.
-        if artist.strip().lower() in DiscoveryEngine._VARIOUS_NAMES:
+        # Compilations ("Various Artists") can't be matched to a single
+        # YouTube video, so by default we skip them to save YTM budget.
+        # The user can opt in via filters.allow_compilations.
+        if (
+            not allow_compilations
+            and artist.strip().lower() in DiscoveryEngine._VARIOUS_NAMES
+        ):
             return None
 
         year_raw = r.get("year")

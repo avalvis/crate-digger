@@ -478,6 +478,17 @@ def _bootstrap(splash: _SplashWindow, log: logging.Logger) -> int:
     exporter = MPCExporter(
         ffmpeg_path=binaries.ffmpeg_path,
         logger=log.getChild("exporter"),
+        target_sample_rate=snap.config.export.sample_rate,
+        target_bit_depth=snap.config.export.bit_depth,
+    )
+
+    # In-app preview player service (waveform + scrubbing).
+    from core.preview import PreviewService
+
+    preview_service = PreviewService(
+        ffmpeg_path=binaries.ffmpeg_path,
+        cache_dir=data_dir / "preview_cache",
+        logger=log.getChild("preview"),
     )
 
     vault_root = Path(snap.config.general.vault_root).expanduser()
@@ -547,6 +558,7 @@ def _bootstrap(splash: _SplashWindow, log: logging.Logger) -> int:
         pipeline=pipeline,
         discovery=discovery,
         exporter=exporter,
+        preview=preview_service,
         logger=log.getChild("app"),
     )
 

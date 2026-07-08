@@ -28,6 +28,7 @@ logs mpc_exports rows on each successful file.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import queue
@@ -41,9 +42,12 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Iterable, Optional
+from typing import TYPE_CHECKING, Callable, Iterable, Optional
 
 from utils.paths import sanitize_filename_component
+
+if TYPE_CHECKING:
+    from core.chopper import ChopPlan
 
 
 # ─── Public types ────────────────────────────────────────────────────
@@ -141,6 +145,25 @@ class MPCExporter:
 
         if self._bits not in (16, 24):
             raise ValueError(f"Unsupported bit depth: {self._bits}")
+
+    def update_format(
+        self,
+        *,
+        sample_rate: Optional[int] = None,
+        bit_depth: Optional[int] = None,
+    ) -> None:
+        """Hot-update export format (used when Settings change at runtime)."""
+        if sample_rate is not None:
+            self._sr = int(sample_rate)
+        if bit_depth is not None:
+            bits = int(bit_depth)
+            if bits not in (16, 24):
+                raise ValueError(f"Unsupported bit depth: {bits}")
+            self._bits = bits
+
+    @property
+    def ffmpeg_path(self) -> str:
+        return self._ffmpeg
 
     # ── Public API ──
 
@@ -241,6 +264,150 @@ class MPCExporter:
             exported=tuple(exported),
             failed=tuple(failed),
             destination_root=dest_root,
+            total_elapsed_seconds=total_elapsed,
+        )
+
+    def export_chop_kit(
+        self,
+        source: Path,
+        plan: "ChopPlan",
+        destination_root: Path,
+        *,
+        kit_name: Optional[str] = None,
+        include_chops: bool = True,
+        include_loops: bool = True,
+        progress_callback: Optional[Callable[[ExportProgress], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> ExportResult:
+        """
+        Export numbered one-shots + bar-aligned loops as an MPC-ready kit.
+
+        Layout:
+          <kit_name>/
+            Chops/001.wav, 002.wav, …
+            Loops/1bar.wav, 2bar.wav, …
+            pad_map.json   — pad index → file mapping
+        """
+        source = Path(source)
+        dest_root = Path(destination_root)
+        self._validate_destination(dest_root)
+
+        name = sanitize_filename_component(
+            kit_name or source.stem, max_length=80,
+        )
+        kit_dir = dest_root / name
+        kit_dir.mkdir(parents=True, exist_ok=True)
+        chops_dir = kit_dir / "Chops"
+        loops_dir = kit_dir / "Loops"
+        if include_chops:
+            chops_dir.mkdir(exist_ok=True)
+        if include_loops:
+            loops_dir.mkdir(exist_ok=True)
+
+        segments: list[tuple[Path, float, float, str]] = []
+        pad_entries: list[dict[str, object]] = []
+        pad_index = 1
+
+        if include_chops:
+            for i, (start, end) in enumerate(plan.one_shot_regions, start=1):
+                fname = f"{i:03d}.wav"
+                segments.append((chops_dir / fname, start, end - start, fname))
+                if pad_index <= 16:
+                    pad_entries.append({
+                        "pad": pad_index,
+                        "file": f"Chops/{fname}",
+                        "start_seconds": round(start, 4),
+                        "end_seconds": round(end, 4),
+                        "type": "one_shot",
+                    })
+                    pad_index += 1
+
+        if include_loops:
+            for loop in plan.loop_regions:
+                fname = f"{loop.bars}bar_loop.wav"
+                segments.append((
+                    loops_dir / fname,
+                    loop.start_seconds,
+                    loop.end_seconds - loop.start_seconds,
+                    fname,
+                ))
+                if pad_index <= 16:
+                    pad_entries.append({
+                        "pad": pad_index,
+                        "file": f"Loops/{fname}",
+                        "start_seconds": round(loop.start_seconds, 4),
+                        "end_seconds": round(loop.end_seconds, 4),
+                        "bars": loop.bars,
+                        "type": "loop",
+                    })
+                    pad_index += 1
+
+        if not segments:
+            raise ExportError("Chop plan produced no exportable segments.")
+
+        started = time.monotonic()
+        exported: list[ExportedFile] = []
+        failed: list[tuple[Path, str]] = []
+        total = len(segments)
+
+        for idx, (dest, start, duration, label) in enumerate(segments, start=1):
+            if cancel_event is not None and cancel_event.is_set():
+                raise ExportCancelledError(
+                    f"Cancelled after {len(exported)}/{total} segments."
+                )
+            try:
+                partial = dest.with_suffix(".wav.partial")
+                self._run_ffmpeg_segment(
+                    source=source,
+                    dest=partial,
+                    start_seconds=start,
+                    duration_seconds=duration,
+                    duration_hint=duration,
+                    on_percent=lambda pct, i=idx, lbl=label: self._emit(
+                        progress_callback,
+                        ExportProgress(
+                            stage=ExportStage.EXPORTING,
+                            overall_percent=self._overall_pct(i, total, pct),
+                            current_file_percent=pct,
+                            current_index=i,
+                            total_files=total,
+                            current_filename=lbl,
+                            elapsed_seconds=time.monotonic() - started,
+                            message=f"Exporting {lbl}",
+                        ),
+                    ),
+                    cancel_event=cancel_event,
+                )
+                self._finalize_partial(partial, dest)
+                exported.append(ExportedFile(
+                    source_path=source,
+                    destination_path=dest,
+                    wav_size_bytes=dest.stat().st_size,
+                    elapsed_seconds=0.0,
+                ))
+            except ExportCancelledError:
+                raise
+            except Exception as e:
+                self._log.exception("Segment export failed: %s", dest)
+                failed.append((source, str(e)))
+
+        # Pad map for MPC program assignment.
+        pad_map = {
+            "kit_name": name,
+            "source": str(source),
+            "bpm": plan.bpm,
+            "beats_per_bar": plan.beats_per_bar,
+            "pads": pad_entries,
+        }
+        (kit_dir / "pad_map.json").write_text(
+            json.dumps(pad_map, indent=2), encoding="utf-8",
+        )
+
+        total_elapsed = time.monotonic() - started
+        return ExportResult(
+            exported=tuple(exported),
+            failed=tuple(failed),
+            destination_root=kit_dir,
             total_elapsed_seconds=total_elapsed,
         )
 
@@ -457,6 +624,125 @@ class MPCExporter:
             t_err.join(timeout=2.0)
             rc = proc.wait()
 
+            if rc != 0:
+                stderr_tail = "\n".join(stderr_lines[-10:]) or "(no stderr)"
+                raise ExportError(
+                    f"ffmpeg exited with code {rc}. Last errors:\n{stderr_tail}"
+                )
+        except ExportCancelledError:
+            raise
+        except ExportError:
+            raise
+        except Exception as e:
+            self._terminate_process(proc)
+            raise ExportError(f"Unexpected ffmpeg failure: {e}") from e
+
+    def _run_ffmpeg_segment(
+        self,
+        source: Path,
+        dest: Path,
+        start_seconds: float,
+        duration_seconds: float,
+        duration_hint: float,
+        on_percent: Callable[[float], None],
+        cancel_event: Optional[threading.Event],
+    ) -> None:
+        """Extract a time slice from `source` into `dest` as PCM WAV."""
+        pcm_codec = "pcm_s16le" if self._bits == 16 else "pcm_s24le"
+        cmd = [
+            self._ffmpeg,
+            "-hide_banner",
+            "-loglevel", "error",
+            "-nostdin",
+            "-y",
+            "-ss", f"{start_seconds:.6f}",
+            "-i", str(source),
+            "-t", f"{duration_seconds:.6f}",
+            "-vn",
+            "-ar", str(self._sr),
+            "-ac", str(self._channels),
+            "-acodec", pcm_codec,
+            "-f", "wav",
+            "-progress", "pipe:1",
+            "-nostats",
+            str(dest),
+        ]
+        self._log.debug("ffmpeg segment: %s", " ".join(cmd))
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                **self._subprocess_platform_kwargs(with_process_group=True),
+            )
+        except FileNotFoundError as e:
+            raise FFmpegNotAvailableError(
+                f"Could not launch ffmpeg at {self._ffmpeg!r}: {e}"
+            ) from e
+
+        stdout_q: "queue.Queue[Optional[str]]" = queue.Queue()
+        stderr_lines: list[str] = []
+
+        def drain_stdout() -> None:
+            try:
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    stdout_q.put(line)
+            finally:
+                stdout_q.put(None)
+
+        def drain_stderr() -> None:
+            try:
+                assert proc.stderr is not None
+                for line in proc.stderr:
+                    stderr_lines.append(line.rstrip())
+            except Exception:
+                pass
+
+        t_out = threading.Thread(target=drain_stdout, daemon=True)
+        t_err = threading.Thread(target=drain_stderr, daemon=True)
+        t_out.start()
+        t_err.start()
+
+        duration_us = int(max(duration_hint, 0.001) * 1_000_000)
+        last_reported = 0.0
+
+        try:
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    self._terminate_process(proc)
+                    raise ExportCancelledError("Cancelled by user.")
+
+                try:
+                    line = stdout_q.get(timeout=0.25)
+                except queue.Empty:
+                    if proc.poll() is not None:
+                        break
+                    continue
+
+                if line is None:
+                    break
+
+                line = line.strip()
+                m = _PROG_OUT_TIME_US.match(line)
+                if m and duration_us > 0:
+                    out_us = int(m.group(1))
+                    pct = min(99.0, (out_us / duration_us) * 100.0)
+                    if pct - last_reported >= 1.0:
+                        last_reported = pct
+                        on_percent(pct)
+                    continue
+
+                m = _PROG_STATUS.match(line)
+                if m and m.group(1) == "end":
+                    on_percent(100.0)
+
+            t_out.join(timeout=2.0)
+            t_err.join(timeout=2.0)
+            rc = proc.wait()
             if rc != 0:
                 stderr_tail = "\n".join(stderr_lines[-10:]) or "(no stderr)"
                 raise ExportError(

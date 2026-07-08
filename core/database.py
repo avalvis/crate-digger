@@ -178,6 +178,25 @@ CREATE TABLE IF NOT EXISTS mpc_exports (
 
 CREATE INDEX IF NOT EXISTS idx_exports_track     ON mpc_exports(track_id);
 CREATE INDEX IF NOT EXISTS idx_exports_exported  ON mpc_exports(exported_at DESC);
+
+CREATE TABLE IF NOT EXISTS crates (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    name                TEXT    NOT NULL UNIQUE,
+    description         TEXT,
+    created_at          TEXT    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS crate_tracks (
+    crate_id            INTEGER NOT NULL,
+    track_id            INTEGER NOT NULL,
+    added_at            TEXT    NOT NULL,
+    PRIMARY KEY (crate_id, track_id),
+    FOREIGN KEY (crate_id) REFERENCES crates(id) ON DELETE CASCADE,
+    FOREIGN KEY (track_id) REFERENCES tracks(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_crate_tracks_crate ON crate_tracks(crate_id);
+CREATE INDEX IF NOT EXISTS idx_crate_tracks_track ON crate_tracks(track_id);
 """
 
 
@@ -265,6 +284,24 @@ class ExportRecord:
     exported_at: Optional[str] = None
 
 
+@dataclass(slots=True)
+class CrateRecord:
+    """A user-defined grouping of tracks (project / mood / kit)."""
+    id: Optional[int] = None
+    name: str = ""
+    description: Optional[str] = None
+    created_at: Optional[str] = None
+    track_count: int = 0
+
+
+@dataclass(slots=True, frozen=True)
+class DuplicateGroup:
+    """A cluster of tracks that appear to be duplicates of each other."""
+    key: str                      # what they share (checksum or artist|title)
+    reason: str                   # "checksum" | "artist+title"
+    tracks: tuple["TrackRecord", ...] = ()
+
+
 @dataclass(slots=True, frozen=True)
 class TrackFilter:
     """Search / filter criteria for the Vault tab. All optional."""
@@ -277,6 +314,8 @@ class TrackFilter:
     camelot_key: Optional[str] = None
     has_stems: Optional[bool] = None
     min_rating: Optional[int] = None
+    tag: Optional[str] = None
+    crate_id: Optional[int] = None
     limit: int = 500
     offset: int = 0
     order_by: str = "date_added"  # whitelist-checked in build_query
@@ -639,6 +678,170 @@ class VaultDatabase:
             if cur.rowcount == 0:
                 raise RecordNotFoundError(f"No track with id={track_id}")
 
+    def set_track_rating(self, track_id: int, rating: Optional[int]) -> None:
+        """Set a 0–5 star rating (None clears). Bumps date_modified."""
+        if rating is not None:
+            rating = max(0, min(5, int(rating)))
+        with self._writing() as conn:
+            conn.execute(
+                "UPDATE tracks SET rating=?, date_modified=? WHERE id=?",
+                (rating, _utc_now_iso(), track_id),
+            )
+
+    def set_track_annotations(
+        self,
+        track_id: int,
+        *,
+        notes: Optional[str] = None,
+        tags: Optional[list[str]] = None,
+    ) -> None:
+        """Update notes and/or tags for a track. Bumps date_modified."""
+        sets: list[str] = []
+        params: list[Any] = []
+        if notes is not None:
+            sets.append("notes=?")
+            params.append(notes)
+        if tags is not None:
+            cleaned = [t.strip() for t in tags if t and t.strip()]
+            sets.append("tags=?")
+            params.append(json.dumps(cleaned, ensure_ascii=False))
+        if not sets:
+            return
+        sets.append("date_modified=?")
+        params.append(_utc_now_iso())
+        params.append(track_id)
+        with self._writing() as conn:
+            conn.execute(
+                f"UPDATE tracks SET {', '.join(sets)} WHERE id=?", params
+            )
+
+    def list_distinct_tags(self) -> list[str]:
+        """Union of all tags across the library (for tag-filter dropdowns)."""
+        tags: set[str] = set()
+        with self._reading() as conn:
+            for row in conn.execute(
+                "SELECT tags FROM tracks WHERE tags IS NOT NULL AND tags != ''"
+            ):
+                try:
+                    parsed = json.loads(row["tags"])
+                    if isinstance(parsed, list):
+                        tags.update(str(t) for t in parsed if t)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+        return sorted(tags, key=str.lower)
+
+    # ─── Crates / collections ───────────────────────────────────────
+
+    def create_crate(self, name: str, description: Optional[str] = None) -> int:
+        """Create a crate; returns its id. Returns existing id if name taken."""
+        name = (name or "").strip()
+        if not name:
+            raise DatabaseError("Crate name cannot be empty.")
+        with self._writing() as conn:
+            try:
+                cur = conn.execute(
+                    "INSERT INTO crates(name, description, created_at) "
+                    "VALUES(?,?,?)",
+                    (name, description, _utc_now_iso()),
+                )
+                return int(cur.lastrowid)
+            except sqlite3.IntegrityError:
+                row = conn.execute(
+                    "SELECT id FROM crates WHERE name=?", (name,)
+                ).fetchone()
+                return int(row["id"])
+
+    def list_crates(self) -> list[CrateRecord]:
+        with self._reading() as conn:
+            rows = conn.execute(
+                """
+                SELECT c.id, c.name, c.description, c.created_at,
+                       COUNT(ct.track_id) AS track_count
+                  FROM crates c
+                  LEFT JOIN crate_tracks ct ON ct.crate_id = c.id
+                 GROUP BY c.id
+                 ORDER BY c.name COLLATE NOCASE
+                """
+            ).fetchall()
+        return [
+            CrateRecord(
+                id=r["id"], name=r["name"], description=r["description"],
+                created_at=r["created_at"], track_count=r["track_count"] or 0,
+            )
+            for r in rows
+        ]
+
+    def add_tracks_to_crate(self, crate_id: int, track_ids: Iterable[int]) -> int:
+        """Add tracks to a crate (idempotent). Returns count newly added."""
+        now = _utc_now_iso()
+        added = 0
+        with self._writing() as conn:
+            for tid in track_ids:
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO crate_tracks(crate_id, track_id, "
+                    "added_at) VALUES(?,?,?)",
+                    (int(crate_id), int(tid), now),
+                )
+                added += cur.rowcount
+        return added
+
+    def remove_tracks_from_crate(
+        self, crate_id: int, track_ids: Iterable[int]
+    ) -> int:
+        with self._writing() as conn:
+            total = 0
+            for tid in track_ids:
+                cur = conn.execute(
+                    "DELETE FROM crate_tracks WHERE crate_id=? AND track_id=?",
+                    (int(crate_id), int(tid)),
+                )
+                total += cur.rowcount
+        return total
+
+    def delete_crate(self, crate_id: int) -> None:
+        with self._writing() as conn:
+            conn.execute("DELETE FROM crates WHERE id=?", (int(crate_id),))
+
+    # ─── Duplicate detection ────────────────────────────────────────
+
+    def find_duplicates(self) -> list[DuplicateGroup]:
+        """
+        Cluster likely-duplicate tracks. Two signals:
+          1. Identical checksum_sha256 (byte-identical files).
+          2. Same normalized artist+title (re-rips / alt uploads).
+        Groups with a single member are omitted.
+        """
+        with self._reading() as conn:
+            rows = conn.execute("SELECT * FROM tracks").fetchall()
+        tracks = [_row_to_track(r) for r in rows]
+
+        by_checksum: dict[str, list[TrackRecord]] = {}
+        by_name: dict[str, list[TrackRecord]] = {}
+        for tr in tracks:
+            if tr.checksum_sha256:
+                by_checksum.setdefault(tr.checksum_sha256, []).append(tr)
+            key = f"{(tr.artist or '').strip().lower()}|{(tr.title or '').strip().lower()}"
+            if key.strip("|"):
+                by_name.setdefault(key, []).append(tr)
+
+        groups: list[DuplicateGroup] = []
+        seen_ids: set[int] = set()
+        for checksum, members in by_checksum.items():
+            if len(members) > 1:
+                groups.append(DuplicateGroup(
+                    key=checksum[:12], reason="checksum",
+                    tracks=tuple(members)))
+                seen_ids.update(m.id for m in members if m.id is not None)
+        for key, members in by_name.items():
+            if len(members) > 1:
+                # Skip members already grouped by checksum.
+                remaining = [m for m in members if m.id not in seen_ids]
+                if len(remaining) > 1:
+                    groups.append(DuplicateGroup(
+                        key=key, reason="artist+title",
+                        tracks=tuple(remaining)))
+        return groups
+
     def _build_list_query(
         self,
         filt: TrackFilter,
@@ -677,6 +880,20 @@ class VaultDatabase:
         if filt.min_rating is not None:
             clauses.append("tracks.rating >= ?")
             params.append(int(filt.min_rating))
+        if filt.tag:
+            # tags is a JSON array of strings; match the quoted token so
+            # "jazz" doesn't match "jazzy". Cheap and index-free but fine
+            # for the library sizes this app targets.
+            clauses.append("tracks.tags LIKE ?")
+            params.append(f'%"{filt.tag}"%')
+        if filt.crate_id is not None:
+            joins += (
+                " JOIN crate_tracks ON crate_tracks.track_id = tracks.id "
+                "AND crate_tracks.crate_id = ? "
+            )
+            # crate param must precede any WHERE params bound after joins;
+            # insert it at the front of the params list to match SQL order.
+            params.insert(0, int(filt.crate_id))
 
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
 
@@ -860,6 +1077,16 @@ class VaultDatabase:
             ).fetchone()
         return row is not None
 
+    def list_recent_discoveries(self, limit: int = 100) -> list[DiscoveryRecord]:
+        """Most-recent discovery-history rows for the 'Recent digs' browser."""
+        with self._reading() as conn:
+            rows = conn.execute(
+                "SELECT * FROM discovery_history "
+                "ORDER BY suggested_at DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        return [_row_to_discovery(r) for r in rows]
+
     def mark_discovery_queued(
         self,
         master_id: int,
@@ -1004,6 +1231,24 @@ def _row_to_track(row: sqlite3.Row) -> TrackRecord:
         rating=row["rating"],
         notes=row["notes"],
         tags=tags,
+    )
+
+
+def _row_to_discovery(row: sqlite3.Row) -> DiscoveryRecord:
+    return DiscoveryRecord(
+        id=row["id"],
+        discogs_master_id=row["discogs_master_id"],
+        discogs_release_id=row["discogs_release_id"],
+        artist=row["artist"],
+        title=row["title"],
+        year=row["year"],
+        decade=row["decade"],
+        country=row["country"],
+        genre=row["genre"],
+        style=row["style"],
+        suggested_at=row["suggested_at"],
+        was_queued=bool(row["was_queued"]),
+        track_id=row["track_id"],
     )
 
 
