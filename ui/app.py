@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
 
 import customtkinter as ctk
@@ -21,6 +22,14 @@ import tkinter as tk
 from core.database import VaultDatabase
 from core.queue_manager import QueueEvent, QueueEventType, QueueManager
 from ui.components.sidebar import SidebarNavButton
+from ui.window_placement import (
+    apply_window_icon,
+    apply_work_area_geometry,
+    is_effectively_maximized,
+    patch_ctk_scaling_guard,
+    prepare_ctk_environment,
+    show_root_window,
+)
 from ui.components.toast import ToastKind, ToastLayer
 from ui.events import UiEventBridge
 from ui.theme import (
@@ -151,15 +160,30 @@ class CrateDiggerApp:
         self._stem_separator = stem_separator
         self._mpc_export_manager = mpc_export_manager
 
+        prepare_ctk_environment()
         self._root = ctk.CTk()
         self._root.report_callback_exception = self._on_tk_callback_exception
         try:
             tk._default_root = self._root  # type: ignore[attr-defined]
         except Exception:
             pass
+        # Build the full UI while hidden — prevents broken partial frames on show.
+        self._root.withdraw()
+
         apply_customtkinter_globals(None)  # type: ignore[arg-type]
         self._theme = build_theme()
-        self._configure_root_window()
+        snap = self._config.snapshot()
+        self._start_maximized = bool(snap.config.ui.window_maximized)
+        patch_ctk_scaling_guard(
+            self._root,
+            is_maximized=self._is_window_maximized,
+        )
+        self._root.title(self.APP_TITLE)
+        self._root.configure(fg_color=self._theme.surface.app)
+        self._root.minsize(self._theme.window_min_width, self._theme.window_min_height)
+
+        icon_path = Path(__file__).resolve().parents[1] / "assets" / "crate-digger.ico"
+        apply_window_icon(self._root, str(icon_path) if icon_path.is_file() else None)
 
         self._bridge = UiEventBridge(
             tk_root=self._root,
@@ -197,6 +221,7 @@ class CrateDiggerApp:
         self._toast_layer: Optional[ToastLayer] = None
 
         self._build_layout()
+        self._show_root_window()
 
         self._bridge.subscribe(self._on_queue_event, weak=False)
 
@@ -222,6 +247,15 @@ class CrateDiggerApp:
         if initial_tab not in valid_keys:
             initial_tab = "manual_rip"
         self._root.after(0, lambda: self._show_tab(initial_tab))
+        if self._start_maximized:
+            self._root.after(
+                100,
+                lambda: apply_work_area_geometry(
+                    self._root,
+                    min_width=self._theme.window_min_width,
+                    min_height=self._theme.window_min_height,
+                ),
+            )
         self._log.info("%s v%s ready.", self.APP_TITLE, self.APP_VERSION)
         self._root.mainloop()
 
@@ -291,25 +325,11 @@ class CrateDiggerApp:
             self._log.exception("update_ui during shutdown failed")
 
     def _is_window_maximized(self) -> bool:
-        try:
-            if sys.platform == "win32":
-                return str(self._root.state()) == "zoomed"
-            if sys.platform == "darwin":
-                return str(self._root.state()) == "zoomed"
-            return bool(self._root.attributes("-zoomed"))
-        except Exception:
-            return False
-
-    def _apply_window_maximized(self) -> None:
-        try:
-            if sys.platform == "win32":
-                self._root.state("zoomed")
-            elif sys.platform == "darwin":
-                self._root.state("zoomed")
-            else:
-                self._root.attributes("-zoomed", True)
-        except Exception:
-            self._log.debug("Could not maximize window on this platform", exc_info=True)
+        snap = self._config.snapshot()
+        return is_effectively_maximized(
+            self._root,
+            fallback=bool(snap.config.ui.window_maximized),
+        )
 
     def _cancel_pending_tk_after_callbacks(self) -> None:
         try:
@@ -323,34 +343,17 @@ class CrateDiggerApp:
             except Exception:
                 pass
 
-    # ── Root window ──
-
-    def _configure_root_window(self) -> None:
-        t = self._theme
-        r = self._root
-        r.title(self.APP_TITLE)
-        r.configure(fg_color=t.surface.app)
-        r.minsize(t.window_min_width, t.window_min_height)
+    def _show_root_window(self) -> None:
         snap = self._config.snapshot()
         ui = snap.config.ui
-
-        if ui.window_maximized:
-            init_w = max(t.window_min_width, ui.window_width)
-            init_h = max(t.window_min_height, ui.window_height)
-            screen_w = r.winfo_screenwidth()
-            screen_h = r.winfo_screenheight()
-            x = max(0, (screen_w - init_w) // 2)
-            y = max(0, (screen_h - init_h) // 2)
-            r.geometry(f"{init_w}x{init_h}+{x}+{y}")
-            r.after(0, self._apply_window_maximized)
-        else:
-            init_w = max(t.window_min_width, ui.window_width)
-            init_h = max(t.window_min_height, ui.window_height)
-            screen_w = r.winfo_screenwidth()
-            screen_h = r.winfo_screenheight()
-            x = max(0, (screen_w - init_w) // 2)
-            y = max(0, (screen_h - init_h) // 2)
-            r.geometry(f"{init_w}x{init_h}+{x}+{y}")
+        show_root_window(
+            self._root,
+            maximized=bool(ui.window_maximized),
+            width=max(self._theme.window_min_width, ui.window_width),
+            height=max(self._theme.window_min_height, ui.window_height),
+            min_width=self._theme.window_min_width,
+            min_height=self._theme.window_min_height,
+        )
 
     # ── Nav items ──
 

@@ -196,13 +196,9 @@ class _SplashWindow:
 
     def __init__(self) -> None:
         import customtkinter as ctk
+        from ui.window_placement import prepare_ctk_environment
 
-        try:
-            if hasattr(ctk, "deactivate_automatic_dpi_awareness"):
-                ctk.deactivate_automatic_dpi_awareness()
-        except Exception:
-            pass
-
+        prepare_ctk_environment()
         ctk.set_appearance_mode("dark")
 
         self._root = ctk.CTk()
@@ -348,6 +344,16 @@ class _SplashWindow:
             pass
         try:
             self._root.destroy()
+        except Exception:
+            pass
+        try:
+            import tkinter as tk
+            if tk._default_root is not None:
+                try:
+                    if not tk._default_root.winfo_exists():  # type: ignore[union-attr]
+                        tk._default_root = None  # type: ignore[attr-defined]
+                except Exception:
+                    tk._default_root = None  # type: ignore[attr-defined]
         except Exception:
             pass
 
@@ -587,6 +593,10 @@ def _bootstrap(splash: _SplashWindow, log: logging.Logger) -> int:
 
     # ── App ──
     splash.set_status("Opening Crate Digger…")
+    # Close splash before creating the main window — two simultaneous Tk roots
+    # cause broken geometry and stray CTk after() callbacks on Windows.
+    splash.close()
+
     from ui.app import CrateDiggerApp
 
     app = CrateDiggerApp(
@@ -603,9 +613,6 @@ def _bootstrap(splash: _SplashWindow, log: logging.Logger) -> int:
         logger=log.getChild("app"),
     )
 
-    # Close splash right before mainloop so the transition is visible.
-    splash.close()
-
     try:
         app.run()
         return 0
@@ -621,6 +628,8 @@ def main() -> int:
     """Entry point. Never raises; returns an exit code."""
     try:
         _patch_customtkinter_compat()
+        from ui.window_placement import prepare_ctk_environment
+        prepare_ctk_environment()
         data_dir = _app_data_dir()
         log = _setup_logging(data_dir)
     except Exception:

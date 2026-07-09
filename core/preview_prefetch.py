@@ -82,6 +82,8 @@ class PreviewPrefetchService:
         self._active = 0
         self._batch_total = 0
         self._batch_done = 0
+        self._batch_ids: list[str] = []
+        self._batch_drained = False
         self._running = False
         self._shutdown = threading.Event()
 
@@ -137,7 +139,9 @@ class PreviewPrefetchService:
         """Queue reel previews top-to-bottom; skips already-ready IDs."""
         ids = [self._preview.normalize_video_id(v) for v in video_ids if v]
         with self._lock:
-            self._batch_total = 0
+            self._batch_ids = list(ids)
+            self._batch_drained = False
+            self._batch_total = len(ids)
             self._batch_done = 0
             for vid in ids:
                 if vid in self._decoded_lru:
@@ -172,7 +176,6 @@ class PreviewPrefetchService:
                     entry.cancel_event = threading.Event()
                     entry.state = PrefetchState.PENDING
                 self._queue.append(vid)
-                self._batch_total += 1
                 self._publish(
                     PrefetchEvent(
                         PrefetchEventType.STATE_CHANGED,
@@ -181,6 +184,7 @@ class PreviewPrefetchService:
                         message="Queued",
                     ),
                 )
+            self._check_batch_drained_locked()
         self._pump()
 
     def cancel_batch(self, video_ids: Optional[list[str]] = None) -> None:
@@ -202,6 +206,8 @@ class PreviewPrefetchService:
                         self._queue.remove(vid)
                 except ValueError:
                     pass
+            self._check_batch_drained_locked()
+        self._pump()
 
     def get_state(self, video_id: str) -> PrefetchState:
         vid = self._preview.normalize_video_id(video_id)
@@ -242,7 +248,54 @@ class PreviewPrefetchService:
 
     def batch_progress(self) -> tuple[int, int]:
         with self._lock:
-            return self._batch_done, max(self._batch_total, 1)
+            total = len(self._batch_ids)
+            if total == 0:
+                return 0, 1
+            ready = sum(
+                1 for vid in self._batch_ids
+                if self._entries.get(vid) is not None
+                and self._entries[vid].state == PrefetchState.READY
+            )
+            return ready, total
+
+    def is_batch_drained(self) -> bool:
+        with self._lock:
+            return self._batch_drained
+
+    def is_batch_idle(self) -> bool:
+        """True when every ID in the current batch reached a terminal state."""
+        with self._lock:
+            return self._batch_terminal_locked()
+
+    def _batch_terminal_locked(self) -> bool:
+        if not self._batch_ids:
+            return True
+        terminal = (
+            PrefetchState.READY,
+            PrefetchState.FAILED,
+            PrefetchState.CANCELLED,
+        )
+        for vid in self._batch_ids:
+            entry = self._entries.get(vid)
+            if entry is None or entry.state not in terminal:
+                return False
+        return True
+
+    def _check_batch_drained_locked(self) -> None:
+        if self._batch_drained or not self._batch_ids:
+            return
+        if not self._batch_terminal_locked():
+            return
+        if self._queue or self._active > 0:
+            return
+        self._batch_drained = True
+        last_id = self._batch_ids[-1] if self._batch_ids else ""
+        self._publish(
+            PrefetchEvent(
+                PrefetchEventType.BATCH_DRAINED,
+                last_id,
+            ),
+        )
 
     def configure(
         self,
@@ -266,8 +319,10 @@ class PreviewPrefetchService:
                 vid = self._queue.popleft()
                 entry = self._entries.get(vid)
                 if entry is None or entry.cancel_event.is_set():
+                    self._check_batch_drained_locked()
                     continue
                 if entry.state == PrefetchState.READY:
+                    self._check_batch_drained_locked()
                     continue
                 self._active += 1
                 threading.Thread(
@@ -283,14 +338,7 @@ class PreviewPrefetchService:
         finally:
             with self._lock:
                 self._active = max(0, self._active - 1)
-                self._batch_done += 1
-                if not self._queue and self._active == 0:
-                    self._publish(
-                        PrefetchEvent(
-                            PrefetchEventType.BATCH_DRAINED,
-                            video_id,
-                        ),
-                    )
+                self._check_batch_drained_locked()
             self._pump()
 
     def _run_prefetch(self, video_id: str) -> None:
@@ -360,6 +408,8 @@ class PreviewPrefetchService:
             entry.message = "Ready"
             entry.percent = 100.0
             data = self.get_decoded(video_id)
+            with self._lock:
+                self._check_batch_drained_locked()
             self._publish(
                 PrefetchEvent(
                     PrefetchEventType.STATE_CHANGED,
@@ -372,6 +422,8 @@ class PreviewPrefetchService:
             )
         except PreviewCancelledError:
             entry.state = PrefetchState.CANCELLED
+            with self._lock:
+                self._check_batch_drained_locked()
             self._publish(
                 PrefetchEvent(
                     PrefetchEventType.STATE_CHANGED,
@@ -382,6 +434,8 @@ class PreviewPrefetchService:
         except PreviewError as e:
             entry.state = PrefetchState.FAILED
             entry.error_message = str(e)
+            with self._lock:
+                self._check_batch_drained_locked()
             self._publish(
                 PrefetchEvent(
                     PrefetchEventType.STATE_CHANGED,
@@ -395,6 +449,8 @@ class PreviewPrefetchService:
         except Exception as e:  # noqa: BLE001
             entry.state = PrefetchState.FAILED
             entry.error_message = str(e)
+            with self._lock:
+                self._check_batch_drained_locked()
             self._publish(
                 PrefetchEvent(
                     PrefetchEventType.STATE_CHANGED,
