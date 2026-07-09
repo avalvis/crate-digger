@@ -43,13 +43,17 @@ import re
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Optional
 
 import requests
 
 from core.database import DiscoveryRecord, VaultDatabase
-from core.sampling_taxonomy import blended_score, sample_affinity
+from core.sampling_taxonomy import (
+    blended_score,
+    pick_wide_open_discogs_seed,
+    sample_affinity,
+)
 
 
 # ─── Public types ────────────────────────────────────────────────────
@@ -457,34 +461,47 @@ class DiscoveryEngine:
         self, filters: DiscoveryFilters,
     ) -> list[DiscogsCandidate]:
         """Paginated Discogs search with filter-to-param translation."""
+        effective = filters
+        start_page = 1
+        if self._is_wide_open(filters):
+            field_name, seed_value = pick_wide_open_discogs_seed(self._rng)
+            effective = replace(filters, **{field_name: seed_value})
+            # Skip page 1 — it's dominated by mega-mainstream masters that
+            # fail max_have even inside a genre bucket.
+            start_page = self._rng.randint(2, 4)
+            self._log.info(
+                "Wide-open dig — exploring %s=%r (page %d+)",
+                field_name, seed_value, start_page,
+            )
+
         params: dict[str, Any] = {
             "type": "master",
             "per_page": 50,
         }
         # Exact year narrows server-side. For an era *range* Discogs has no
         # native param, so we omit it and filter candidates client-side.
-        if filters.year is not None:
-            params["year"] = filters.year
-        if filters.country:
-            params["country"] = filters.country
-        if filters.genre:
-            params["genre"] = filters.genre
-        if filters.style:
-            params["style"] = filters.style
-        if filters.format:
-            params["format"] = filters.format
-        if filters.query:
-            params["q"] = filters.query
+        if effective.year is not None:
+            params["year"] = effective.year
+        if effective.country:
+            params["country"] = effective.country
+        if effective.genre:
+            params["genre"] = effective.genre
+        if effective.style:
+            params["style"] = effective.style
+        if effective.format:
+            params["format"] = effective.format
+        if effective.query:
+            params["q"] = effective.query
 
         # A range filter throws away many hits client-side, so widen the
         # page budget to keep the reel well-fed.
-        has_range = filters.year is None and (
-            filters.year_min is not None or filters.year_max is not None
+        has_range = effective.year is None and (
+            effective.year_min is not None or effective.year_max is not None
         )
         max_pages = self.MAX_SEARCH_PAGES + (3 if has_range else 0)
 
         candidates: list[DiscogsCandidate] = []
-        for page in range(1, max_pages + 1):
+        for page in range(start_page, start_page + max_pages):
             params["page"] = page
             data = self._discogs_get("/database/search", params)
             results = data.get("results") or []
@@ -493,15 +510,15 @@ class DiscoveryEngine:
 
             for r in results:
                 cand = self._result_to_candidate(
-                    r, allow_compilations=filters.allow_compilations,
+                    r, allow_compilations=effective.allow_compilations,
                 )
                 if cand is None:
                     continue
-                if cand.have < filters.min_have:
+                if cand.have < effective.min_have:
                     continue
-                if cand.have > filters.max_have:
+                if cand.have > effective.max_have:
                     continue
-                if not self._year_in_range(cand.year, filters):
+                if not self._year_in_range(cand.year, effective):
                     continue
                 candidates.append(cand)
 
@@ -512,9 +529,23 @@ class DiscoveryEngine:
 
         self._log.debug(
             "Discogs yielded %d candidates (filters=%s)",
-            len(candidates), filters,
+            len(candidates), effective,
         )
         return candidates
+
+    @staticmethod
+    def _is_wide_open(filters: DiscoveryFilters) -> bool:
+        """True when the user left every Discogs filter at its default."""
+        return (
+            filters.query is None
+            and not filters.country
+            and not filters.genre
+            and not filters.style
+            and not filters.format
+            and filters.year is None
+            and filters.year_min is None
+            and filters.year_max is None
+        )
 
     @staticmethod
     def _year_in_range(

@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import logging
 import shutil
+import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -32,8 +34,15 @@ from typing import Callable, Optional
 
 from core.exporter import ExportError, MPCExporter
 from core.preview import PreviewError, PreviewService
-from core.stems import StemSeparationError, StemSeparator
+from core.stems import StemModel, StemSeparationError, StemSeparator
 from utils.paths import sanitize_filename_component
+
+
+# MPC Workflow is a quick sample-dig path — use the single-model demucs
+# preset and cap length so a 5-minute album track doesn't block for 20+ min
+# (htdemucs_ft runs four models back-to-back on CPU).
+MPC_WORKFLOW_STEM_MODEL = StemModel.HTDEMUCS
+MPC_WORKFLOW_MAX_SECONDS = 120.0
 
 
 # ─── Public types ────────────────────────────────────────────────────
@@ -69,6 +78,9 @@ def export_sample_to_mpc(
     preview: PreviewService,
     stem_separator: StemSeparator,
     exporter: MPCExporter,
+    ffmpeg_path: Optional[str] = None,
+    stem_model: StemModel = MPC_WORKFLOW_STEM_MODEL,
+    max_duration_seconds: float = MPC_WORKFLOW_MAX_SECONDS,
     progress_callback: Optional[Callable[[str, float], None]] = None,
     cancel_event: Optional[threading.Event] = None,
     logger: Optional[logging.Logger] = None,
@@ -146,17 +158,29 @@ def export_sample_to_mpc(
             shutil.rmtree(stage_dir, ignore_errors=True)
         stage_dir.mkdir(parents=True, exist_ok=True)
 
+        ffmpeg = ffmpeg_path or exporter.ffmpeg_path
+        stem_input = _maybe_trim_audio(
+            audio_path,
+            max_duration_seconds=max_duration_seconds,
+            ffmpeg_path=ffmpeg,
+            work_dir=stage_dir,
+            logger=log,
+        )
+        if stem_input != audio_path:
+            emit("Trimmed to sample length…", 22.0)
+
         try:
             emit("Splitting stems…", 25.0)
             stems_started = time.monotonic()
             stems_result = stem_separator.separate(
-                audio_path,
+                stem_input,
                 stage_dir,
                 progress_callback=lambda p: emit(
                     p.message or "Splitting stems…",
                     20.0 + (p.percent / 100.0) * 55.0,
                 ),
                 cancel_event=cancel_event,
+                model=stem_model,
             )
             log.info(
                 "MPC export: stems separated for %s in %.1fs (%s)",
@@ -225,3 +249,95 @@ def export_sample_to_mpc(
     except Exception as e:
         log.exception("MPC export failed with an unexpected error: %s", display_name)
         raise MpcSampleExportError(str(e)) from e
+
+
+def _probe_duration(ffmpeg_path: str, source: Path) -> Optional[float]:
+    """Return container duration in seconds via ffprobe."""
+    ffmpeg_p = Path(ffmpeg_path)
+    ffprobe = ffmpeg_p.with_name(
+        "ffprobe.exe" if sys.platform == "win32" else "ffprobe",
+    )
+    if not ffprobe.exists():
+        ffprobe_path = shutil.which("ffprobe")
+        if ffprobe_path is None:
+            return None
+        ffprobe = Path(ffprobe_path)
+
+    cmd = [
+        str(ffprobe),
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(source),
+    ]
+    try:
+        res = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=15,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if res.returncode != 0:
+        return None
+    try:
+        return float((res.stdout or "").strip())
+    except ValueError:
+        return None
+
+
+def _maybe_trim_audio(
+    audio_path: Path,
+    *,
+    max_duration_seconds: Optional[float],
+    ffmpeg_path: str,
+    work_dir: Path,
+    logger: logging.Logger,
+) -> Path:
+    """Shorten long sources so MPC workflow stays responsive on CPU."""
+    if max_duration_seconds is None or max_duration_seconds <= 0:
+        return audio_path
+
+    duration = _probe_duration(ffmpeg_path, audio_path)
+    if duration is None or duration <= max_duration_seconds + 0.5:
+        return audio_path
+
+    trimmed = work_dir / f"{audio_path.stem}_mpc_trim.m4a"
+    cmd = [
+        ffmpeg_path,
+        "-y",
+        "-i", str(audio_path),
+        "-t", str(max_duration_seconds),
+        "-vn",
+        "-acodec", "copy",
+        str(trimmed),
+    ]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        raise MpcSampleExportError(f"Could not trim audio: {e}") from e
+
+    if res.returncode != 0 or not trimmed.exists():
+        # Stream copy can fail on some containers — fall back to re-encode.
+        cmd = [
+            ffmpeg_path,
+            "-y",
+            "-i", str(audio_path),
+            "-t", str(max_duration_seconds),
+            "-vn",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            str(trimmed),
+        ]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            raise MpcSampleExportError(f"Could not trim audio: {e}") from e
+        if res.returncode != 0 or not trimmed.exists():
+            tail = (res.stderr or res.stdout or "unknown error")[-400:]
+            raise MpcSampleExportError(f"Could not trim audio: {tail}")
+
+    logger.info(
+        "MPC export: trimmed %.1fs → %.1fs for faster stem separation",
+        duration,
+        max_duration_seconds,
+    )
+    return trimmed

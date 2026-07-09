@@ -27,6 +27,7 @@ pure scoring helper: give it genres/styles/country/year, get a float.
 
 from __future__ import annotations
 
+import random
 from typing import Iterable, Optional
 
 # ─── Weight tiers ────────────────────────────────────────────────────
@@ -301,3 +302,50 @@ def blended_score(
     # collapses to 1.0 (no effect); at 1.0 it applies fully.
     affinity_term = affinity ** intensity
     return d * affinity_term
+
+
+# ─── Wide-open dig seeds ─────────────────────────────────────────────
+# When the user sets no filters, a bare Discogs master search returns the
+# globally most-owned records (have counts in the tens of thousands). Those
+# are all rejected by max_have (~3000). Pick a sample-friendly genre or
+# style at random so "Dig with no filters" still surfaces diggable gems.
+
+_DISCOGS_DIG_GENRES: tuple[tuple[str, float], ...] = (
+    ("Funk / Soul", _TIER_PRIME),
+    ("Jazz", _TIER_PRIME),
+    ("Latin", _TIER_STRONG),
+    ("Stage & Screen", _TIER_STRONG),
+    ("Reggae", _TIER_GOOD),
+    ("Folk, World, & Country", _TIER_GOOD),
+    ("Blues", _TIER_GOOD),
+    ("Rock", _TIER_NEUTRAL),
+    ("Electronic", _TIER_COLD),
+    ("Pop", _TIER_SOFT),
+)
+
+_DISCOGS_DIG_STYLES: tuple[tuple[str, float], ...] = (
+    ("Soul", _TIER_PRIME),
+    ("Funk", _TIER_PRIME),
+    ("Soul-Jazz", _TIER_PRIME),
+    ("Library Music", _TIER_STRONG),
+    ("Boogaloo", _TIER_STRONG),
+    ("Afrobeat", _TIER_STRONG),
+    ("Gospel", _TIER_GOOD),
+    ("Psychedelic Rock", _TIER_GOOD),
+    ("Éntekhno", _TIER_STRONG),
+    ("Laïkó", _TIER_STRONG),
+    ("Rebetiko", _TIER_STRONG),
+)
+
+
+def pick_wide_open_discogs_seed(rng: random.Random) -> tuple[str, str]:
+    """
+    Return a (field, value) pair for a filterless Dig — either
+    ``("genre", "Jazz")`` or ``("style", "Afrobeat")``, weighted toward
+    sample-friendly crates.
+    """
+    if rng.random() < 0.7:
+        labels, weights = zip(*_DISCOGS_DIG_GENRES)
+        return "genre", rng.choices(labels, weights=weights, k=1)[0]
+    labels, weights = zip(*_DISCOGS_DIG_STYLES)
+    return "style", rng.choices(labels, weights=weights, k=1)[0]

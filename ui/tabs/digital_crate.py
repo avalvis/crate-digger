@@ -34,6 +34,8 @@ from core.discovery import (
 from core.mpc_export import (
     MpcSampleExportCancelledError,
     MpcSampleExportError,
+    MpcSampleResult,
+    MPC_WORKFLOW_MAX_SECONDS,
     export_sample_to_mpc,
 )
 from core.pipeline import PipelineRequest
@@ -42,7 +44,9 @@ from ui.components.dig_roulette_spinner import DigRouletteSpinner
 from ui.components.waveform_player import WaveformPlayer
 from ui.components.year_spinner import YearSpinner
 from ui.theme import (
+    Theme,
     style_card_elevated,
+    style_danger_button,
     style_ghost_button,
     style_label_body,
     style_label_meta,
@@ -652,9 +656,14 @@ class DigitalCrateTab(ctk.CTkFrame):
 
     def _handle_dig_error(self, error: Exception) -> None:
         if isinstance(error, NoResultsError):
+            snap = self._ctx.config.snapshot().config.discovery
             self._ctx.publish_toast(
-                "No masters matched. Try widening the era or clearing a filter.",
-                "info")
+                "No diggable records in your want/have window. "
+                f"With no filters we explore a random genre — try lowering "
+                f"Min Have (now {snap.default_min_have}) or raising "
+                f"Max Have (now {snap.max_have}) in Settings.",
+                "info",
+            )
         elif isinstance(error, NoYouTubeMatchError):
             self._ctx.publish_toast(
                 "Found records on Discogs but none resolved on YouTube Music. "
@@ -833,6 +842,215 @@ class DigitalCrateTab(ctk.CTkFrame):
             self._content.configure(width=target)
 
 
+# ─── MPC workflow progress dialog ────────────────────────────────────
+
+
+class _MpcWorkflowDialog(ctk.CTkToplevel):
+    """Modal progress window for Digital Crate → MPC stem export."""
+
+    _WIDTH = 500
+    _HEIGHT = 220
+
+    def __init__(
+        self,
+        parent: ctk.CTkBaseClass,
+        ctx: "AppContext",
+        suggestion: DiscoverySuggestion,
+        *,
+        on_finished: Callable[[bool], None],
+    ) -> None:
+        super().__init__(parent)
+
+        self._ctx = ctx
+        self._theme = ctx.theme
+        self._s = suggestion
+        self._on_finished = on_finished
+        self._log = ctx.logger.getChild("mpc_dialog")
+        self._cancel_event = threading.Event()
+        self._finished = False
+
+        t = self._theme
+        self.title("MPC Workflow")
+        self.configure(fg_color=t.surface.base)
+        self.geometry(f"{self._WIDTH}x{self._HEIGHT}")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+
+        self._center_over(parent)
+        self._build_body(t)
+        self._start_worker()
+
+    def _center_over(self, parent: ctk.CTkBaseClass) -> None:
+        parent.update_idletasks()
+        px = parent.winfo_rootx()
+        py = parent.winfo_rooty()
+        pw = parent.winfo_width()
+        ph = parent.winfo_height()
+        self.geometry(
+            f"+{px + (pw - self._WIDTH) // 2}+{py + (ph - self._HEIGHT) // 2}",
+        )
+
+    def _build_body(self, t: Theme) -> None:
+        frame = ctk.CTkFrame(self, fg_color="transparent")
+        frame.pack(fill="both", expand=True, padx=t.space.xl, pady=t.space.xl)
+        frame.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            frame,
+            text=self._s.display_name,
+            text_color=t.text.primary,
+            font=t.font.subheading,
+            anchor="w",
+            wraplength=self._WIDTH - 64,
+            justify="left",
+        ).grid(row=0, column=0, sticky="ew")
+
+        ctk.CTkLabel(
+            frame,
+            text=(
+                f"First {int(MPC_WORKFLOW_MAX_SECONDS)}s · fast stem model · "
+                "CPU may take a few minutes"
+            ),
+            text_color=t.text.secondary,
+            font=t.font.caption,
+            anchor="w",
+        ).grid(row=1, column=0, sticky="w", pady=(t.space.xs, t.space.md))
+
+        self._status_label = ctk.CTkLabel(
+            frame, text="Starting…", text_color=t.text.secondary,
+            font=t.font.body, anchor="w",
+        )
+        self._status_label.grid(row=2, column=0, sticky="ew")
+
+        self._progress_bar = ctk.CTkProgressBar(
+            frame, height=10, progress_color=t.accent.purple,
+        )
+        self._progress_bar.grid(row=3, column=0, sticky="ew", pady=(t.space.sm, t.space.md))
+        self._progress_bar.set(0.0)
+
+        buttons = ctk.CTkFrame(frame, fg_color="transparent")
+        buttons.grid(row=4, column=0, sticky="e")
+
+        self._cancel_btn = ctk.CTkButton(
+            buttons, text="Cancel", command=self._on_cancel,
+            **style_danger_button(t), width=100,
+        )
+        self._cancel_btn.pack(side="right")
+
+        self._close_btn = ctk.CTkButton(
+            buttons, text="Close", command=self._close,
+            **style_secondary_button(t), width=100, state="disabled",
+        )
+        self._close_btn.pack(side="right", padx=(0, t.space.sm))
+
+    def _start_worker(self) -> None:
+        snap = self._ctx.config.snapshot().config
+        dest = snap.general.mpc_samples_root
+        staging = snap.general.staging_root
+        threading.Thread(
+            target=self._worker,
+            args=(dest, staging),
+            name=f"mpc-workflow-{self._s.youtube_video_id}",
+            daemon=True,
+        ).start()
+
+    def _worker(self, destination_root: str, staging_root: str) -> None:
+        s = self._s
+        try:
+            result = export_sample_to_mpc(
+                video_id=s.youtube_video_id,
+                artist=s.artist,
+                title=s.title,
+                destination_root=Path(destination_root),
+                staging_root=Path(staging_root),
+                preview=self._ctx.preview,  # type: ignore[arg-type]
+                stem_separator=self._ctx.stem_separator,  # type: ignore[arg-type]
+                exporter=self._ctx.exporter,  # type: ignore[arg-type]
+                progress_callback=lambda label, pct: self.after(
+                    0, lambda l=label, p=pct: self._apply_progress(l, p),
+                ),
+                cancel_event=self._cancel_event,
+                logger=self._log,
+            )
+        except MpcSampleExportCancelledError:
+            self.after(0, self._finish_cancelled)
+            return
+        except MpcSampleExportError as e:
+            self.after(0, lambda err=e: self._finish_error(err))
+            return
+        except Exception as e:  # noqa: BLE001 — surfaced in dialog
+            self._log.exception("Unexpected MPC export failure for %s", s.display_name)
+            self.after(0, lambda err=e: self._finish_error(err))
+            return
+        self.after(0, lambda r=result: self._finish_ok(r))
+
+    def _apply_progress(self, label: str, percent: float) -> None:
+        if self._finished:
+            return
+        self._status_label.configure(text=label)
+        self._progress_bar.set(max(0.0, min(1.0, percent / 100.0)))
+
+    def _finish_ok(self, result: MpcSampleResult) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        t = self._theme
+        self._progress_bar.set(1.0)
+        self._progress_bar.configure(progress_color=t.status.success)
+        self._status_label.configure(
+            text=f"Done — stems saved to {result.track_dir}",
+            text_color=t.status.success,
+        )
+        self._cancel_btn.configure(state="disabled")
+        self._close_btn.configure(state="normal")
+        self._ctx.publish_toast(f"Stems ready: {result.track_dir}", "success")
+        self._on_finished(True)
+
+    def _finish_error(self, error: Exception) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        t = self._theme
+        self._progress_bar.configure(progress_color=t.status.error)
+        self._status_label.configure(
+            text=f"Failed: {error}",
+            text_color=t.status.error,
+            wraplength=self._WIDTH - 64,
+            justify="left",
+        )
+        self._cancel_btn.configure(state="disabled")
+        self._close_btn.configure(state="normal")
+        self._ctx.publish_toast(f"MPC workflow failed: {error}", "error")
+        self._on_finished(False)
+
+    def _finish_cancelled(self) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        self._status_label.configure(
+            text="Cancelled.",
+            text_color=self._theme.text.muted,
+        )
+        self._cancel_btn.configure(state="disabled")
+        self._close_btn.configure(state="normal")
+        self._ctx.publish_toast("MPC workflow cancelled.", "warning")
+        self._on_finished(False)
+
+    def _on_cancel(self) -> None:
+        if self._finished:
+            self._close()
+            return
+        self._cancel_event.set()
+        self._status_label.configure(text="Cancelling…")
+
+    def _close(self) -> None:
+        try:
+            self.destroy()
+        except Exception:
+            pass
+
+
 # ─── Reel card ───────────────────────────────────────────────────────
 
 
@@ -861,6 +1079,7 @@ class _ReelCard(ctk.CTkFrame):
         self._recorded = False
         self._queued = False
         self._mpc_exporting = False
+        self._mpc_dialog: Optional[_MpcWorkflowDialog] = None
         self._player: Optional[WaveformPlayer] = None
         self._preview_btn: Optional[ctk.CTkButton] = None
         self._queue_btn: Optional[ctk.CTkButton] = None
@@ -1028,73 +1247,53 @@ class _ReelCard(ctk.CTkFrame):
             )
             return
 
+        if not (self._s.youtube_video_id or "").strip():
+            self._ctx.publish_toast(
+                "No YouTube match for this dig — cannot run MPC workflow.",
+                "error",
+            )
+            return
+
         snap = self._ctx.config.snapshot().config
+        dest = Path(snap.general.mpc_samples_root).expanduser()
+        try:
+            dest.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            self._ctx.publish_toast(
+                f"MPC destination folder is not writable: {dest} ({e})",
+                "error",
+            )
+            return
+
         self._mpc_exporting = True
         if self._mpc_btn is not None:
-            self._mpc_btn.configure(state="disabled", text="Downloading…")
-        # Immediate confirmation the click registered — the actual job can
-        # take several minutes (CPU stem separation), so the user needs
-        # feedback right away, not just a button that changed color.
-        self._ctx.publish_toast(
-            f"Sending '{self._s.display_name}' to MPC — this can take a few minutes…",
-            "info",
+            self._mpc_btn.configure(state="disabled", text="Working…")
+
+        self._mpc_dialog = _MpcWorkflowDialog(
+            self.winfo_toplevel(),
+            self._ctx,
+            self._s,
+            on_finished=self._on_mpc_dialog_finished,
         )
 
-        threading.Thread(
-            target=self._mpc_worker,
-            args=(snap.general.mpc_samples_root, snap.general.staging_root),
-            daemon=True,
-        ).start()
-
-    def _mpc_worker(self, destination_root: str, staging_root: str) -> None:
-        s = self._s
-        try:
-            result = export_sample_to_mpc(
-                video_id=s.youtube_video_id,
-                artist=s.artist,
-                title=s.title,
-                destination_root=Path(destination_root),
-                staging_root=Path(staging_root),
-                preview=self._ctx.preview,
-                stem_separator=self._ctx.stem_separator,
-                exporter=self._ctx.exporter,
-                progress_callback=lambda label, _pct: self.after(
-                    0, lambda l=label: self._on_mpc_progress(l),
-                ),
-                cancel_event=self._cancel_event,
-                logger=self._log.getChild("mpc_export"),
-            )
-        except MpcSampleExportCancelledError:
+    def _on_mpc_dialog_finished(self, success: bool) -> None:
+        self._mpc_exporting = False
+        self._mpc_dialog = None
+        if self._mpc_btn is None:
             return
-        except MpcSampleExportError as e:
-            self.after(0, lambda err=e: self._on_mpc_error(err))
-            return
-        except Exception as e:  # noqa: BLE001 — surfaced via toast
-            self._log.exception("Unexpected MPC export failure for %s", s.display_name)
-            self.after(0, lambda err=e: self._on_mpc_error(err))
-            return
-        self.after(0, lambda: self._on_mpc_done(result))
-
-    def _on_mpc_progress(self, label: str) -> None:
-        if self._mpc_btn is not None:
-            self._mpc_btn.configure(text=label)
-
-    def _on_mpc_done(self, result) -> None:
-        if self._mpc_btn is not None:
-            t = self._theme
+        t = self._theme
+        if success:
             self._mpc_btn.configure(
-                text="Sent to MPC ✓", state="disabled",
+                text="Sent to MPC ✓",
+                state="disabled",
                 fg_color=t.status.success,
             )
-        self._ctx.publish_toast(
-            f"Stems ready: {result.track_dir}", "success",
-        )
-
-    def _on_mpc_error(self, error: Exception) -> None:
-        self._mpc_exporting = False
-        if self._mpc_btn is not None:
-            self._mpc_btn.configure(state="normal", text="↻  Retry MPC Workflow")
-        self._ctx.publish_toast(f"MPC workflow failed: {error}", "error")
+        else:
+            self._mpc_btn.configure(
+                text="↻  Retry MPC Workflow",
+                state="normal",
+                fg_color=t.surface.raised,
+            )
 
     def _record(self, *, was_queued: bool) -> None:
         if self._ctx.discovery is None:
