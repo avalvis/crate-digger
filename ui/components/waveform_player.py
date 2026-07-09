@@ -44,6 +44,9 @@ class WaveformPlayer(ctk.CTkFrame):
     """Waveform + transport for previewing a single track in-app."""
 
     _TICK_MS = 33  # ~30fps playhead animation
+    _DISPLAY_BARS = 128  # fixed bar count — never draw one line per pixel
+    _DRAW_MIN_WIDTH = 32  # canvas must be laid out before drawing bars
+    _DRAW_RETRY_MAX = 40
 
     # Registry of live players so we can enforce single-playback.
     _live_players: "weakref.WeakSet[WaveformPlayer]" = weakref.WeakSet()
@@ -78,11 +81,15 @@ class WaveformPlayer(ctk.CTkFrame):
         self._peaks: Optional[np.ndarray] = None
         self._canvas_w = 1
         self._canvas_h = self._wave_height
+        self._drawn_canvas_w = 0
+        self._draw_retry_count = 0
         self._playhead_id: Optional[int] = None
         self._waveform_drawn = False
         self._last_configure_w = 0
         self._configure_after: Optional[str] = None
         self._scroll_paused = False
+        self._draw_after: Optional[str] = None
+        self._stream_warm_thread: Optional[threading.Thread] = None
 
         self._build_body()
         WaveformPlayer._live_players.add(self)
@@ -211,7 +218,7 @@ class WaveformPlayer(ctk.CTkFrame):
             return
         self._teardown_stream()
         self._data = data
-        self._peaks = data.peaks
+        self._peaks = self._peaks_for_display(data.peaks)
         self._on_load_full = on_load_full if data.is_partial else None
         with self._pos_lock:
             self._read_pos = 0
@@ -224,7 +231,10 @@ class WaveformPlayer(ctk.CTkFrame):
             self._hide_full_load_button()
         self._update_time_label()
         self._waveform_drawn = False
-        self._redraw_waveform_static()
+        self._drawn_canvas_w = 0
+        self._draw_retry_count = 0
+        self._schedule_waveform_draw()
+        self._warm_stream_async()
 
     def clear(self) -> None:
         self._teardown_stream()
@@ -299,16 +309,27 @@ class WaveformPlayer(ctk.CTkFrame):
                     pass
 
         if self._stream is None:
-            if not self._open_stream():
-                # Playback unavailable — leave the waveform usable.
-                self._time_label.configure(
-                    text="Audio output unavailable on this system.",
-                    text_color=self._theme.status.warning,
-                )
-                return
+            self._play_btn.configure(state="disabled", text="…")
+            threading.Thread(
+                target=self._open_stream_and_start,
+                name="waveform-open-stream",
+                daemon=True,
+            ).start()
+            return
+
+        self._start_stream_playback()
+
+    def _start_stream_playback(self) -> None:
+        if self._destroyed or self._data is None or self._stream is None:
+            try:
+                self._play_btn.configure(state="normal", text="▶")
+            except Exception:
+                pass
+            return
         try:
             self._stream.start()
         except Exception:
+            self._play_btn.configure(state="normal", text="▶")
             self._time_label.configure(
                 text="Could not start audio output.",
                 text_color=self._theme.status.warning,
@@ -316,7 +337,7 @@ class WaveformPlayer(ctk.CTkFrame):
             return
 
         self._playing = True
-        self._play_btn.configure(text="⏸")
+        self._play_btn.configure(state="normal", text="⏸")
         self._schedule_tick()
 
     def _pause(self) -> None:
@@ -330,30 +351,69 @@ class WaveformPlayer(ctk.CTkFrame):
         self._cancel_tick()
         self._update_playhead()
 
-    def _open_stream(self) -> bool:
+    def _build_output_stream(self):
         try:
             import sounddevice as sd
         except Exception:
             _log.exception("sounddevice import failed")
-            return False
+            return None
         if self._data is None:
-            return False
+            return None
         try:
-            self._stream = sd.OutputStream(
+            return sd.OutputStream(
                 samplerate=self._data.samplerate,
                 channels=self._data.channels,
                 dtype="float32",
                 callback=self._audio_callback,
                 finished_callback=None,
             )
-            return True
         except Exception:
             _log.exception(
                 "Could not open OutputStream (samplerate=%s, channels=%s)",
                 self._data.samplerate, self._data.channels,
             )
-            self._stream = None
+            return None
+
+    def _attach_output_stream(self, stream) -> bool:
+        if stream is None or self._destroyed:
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
             return False
+        if self._stream is not None:
+            try:
+                self._stream.close()
+            except Exception:
+                pass
+        self._stream = stream
+        return True
+
+    def _open_stream(self) -> bool:
+        return self._attach_output_stream(self._build_output_stream())
+
+    def _open_stream_and_start(self) -> None:
+        stream = self._build_output_stream()
+        try:
+            self.after(0, lambda s=stream: self._on_background_stream_built(s, start=True))
+        except Exception:
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+
+    def _on_background_stream_built(self, stream, *, start: bool) -> None:
+        if not self._attach_output_stream(stream):
+            self._play_btn.configure(state="normal", text="▶")
+            self._time_label.configure(
+                text="Audio output unavailable on this system.",
+                text_color=self._theme.status.warning,
+            )
+            return
+        if start:
+            self._start_stream_playback()
 
     def _audio_callback(self, outdata, frames, time_info, status) -> None:
         """Runs on the PortAudio thread. Feed frames from the buffer."""
@@ -435,11 +495,70 @@ class WaveformPlayer(ctk.CTkFrame):
 
     def _on_configure_idle(self) -> None:
         self._configure_after = None
-        self._waveform_drawn = False
+        if self._peaks is None:
+            return
+        w = max(1, self._last_configure_w)
+        self._canvas_w = w
+        if self._waveform_drawn:
+            if abs(w - self._drawn_canvas_w) >= 2:
+                self._waveform_drawn = False
+                self._schedule_waveform_draw()
+            else:
+                self._update_playhead()
+            return
+        self._schedule_waveform_draw()
+
+    def _sync_canvas_geometry(self) -> bool:
+        """Return True once the canvas has a real layout width."""
+        if self._destroyed:
+            return False
+        try:
+            self.update_idletasks()
+        except Exception:
+            pass
+        w = max(1, self._canvas.winfo_width())
+        h = max(1, self._canvas.winfo_height())
+        if w < self._DRAW_MIN_WIDTH:
+            return False
+        self._canvas_w = w
+        self._canvas_h = h
+        return True
+
+    def _schedule_waveform_draw(self) -> None:
+        if self._destroyed:
+            return
+        if self._draw_after is not None:
+            try:
+                self.after_cancel(self._draw_after)
+            except Exception:
+                pass
+        self._draw_after = self.after_idle(self._deferred_waveform_draw)
+
+    def _deferred_waveform_draw(self) -> None:
+        self._draw_after = None
         if self._peaks is not None:
+            if not self._sync_canvas_geometry():
+                self._draw_retry_count += 1
+                if self._draw_retry_count < self._DRAW_RETRY_MAX:
+                    self._draw_after = self.after(16, self._deferred_waveform_draw)
+                return
+            self._draw_retry_count = 0
             self._redraw_waveform_static()
         else:
             self._draw_placeholder(self._current_placeholder_text())
+
+    @staticmethod
+    def _peaks_for_display(peaks: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        """Downsample peaks so canvas drawing stays cheap on the UI thread."""
+        if peaks is None or peaks.size == 0:
+            return peaks
+        target = WaveformPlayer._DISPLAY_BARS
+        if peaks.size <= target:
+            return peaks
+        per = int(np.ceil(peaks.size / target))
+        pad = per * target - peaks.size
+        padded = np.concatenate([peaks, np.zeros(pad, dtype=peaks.dtype)])
+        return padded.reshape(target, per).max(axis=1).astype(np.float32)
 
     def _current_placeholder_text(self) -> str:
         try:
@@ -459,27 +578,29 @@ class WaveformPlayer(ctk.CTkFrame):
         c = self._canvas
         if self._destroyed:
             return
-        c.delete("all")
-        self._playhead_id = None
         peaks = self._peaks
         if peaks is None or peaks.size == 0:
             self._waveform_drawn = False
             return
+        c.delete("all")
+        self._playhead_id = None
         t = self._theme
-        w = self._canvas_w
+        w = max(1, self._canvas_w)
         h = self._canvas_h
         mid = h / 2.0
-        step = 2
         n_peaks = peaks.size
-        for x in range(0, w, step):
-            idx = int((x / w) * n_peaks)
-            if idx >= n_peaks:
-                idx = n_peaks - 1
+        bar_count = min(self._DISPLAY_BARS, n_peaks)
+        bar_w = max(1, w // bar_count)
+        for i in range(bar_count):
+            x0 = i * bar_w
+            x1 = min(w, x0 + bar_w - 1)
+            idx = min(n_peaks - 1, int((i / max(1, bar_count - 1)) * (n_peaks - 1)))
             amp = float(peaks[idx])
             bar_h = max(1.0, amp * (mid - 2))
-            c.create_line(
-                x, mid - bar_h, x, mid + bar_h,
-                fill=t.border.strong, width=1, tags="wave",
+            c.create_rectangle(
+                x0, mid - bar_h, x1, mid + bar_h,
+                fill=t.border.strong, outline="",
+                tags="wave",
             )
         played_x = self._progress_fraction() * w
         if self._data is not None:
@@ -487,6 +608,7 @@ class WaveformPlayer(ctk.CTkFrame):
                 played_x, 0, played_x, h,
                 fill=t.accent.blue_bright, width=2, tags="playhead",
             )
+        self._drawn_canvas_w = w
         self._waveform_drawn = True
 
     def _redraw_waveform(self) -> None:
@@ -494,18 +616,49 @@ class WaveformPlayer(ctk.CTkFrame):
 
     def _update_playhead(self) -> None:
         if self._scroll_paused or not self._waveform_drawn:
-            if not self._scroll_paused:
-                self._redraw_waveform_static()
             return
         c = self._canvas
         if self._playhead_id is None or self._data is None:
-            self._redraw_waveform_static()
             return
         played_x = self._progress_fraction() * self._canvas_w
         try:
             c.coords(self._playhead_id, played_x, 0, played_x, self._canvas_h)
         except Exception:
-            self._redraw_waveform_static()
+            self._schedule_waveform_draw()
+
+    def _warm_stream_async(self) -> None:
+        """Open PortAudio in the background so Play does not hitch the UI."""
+        if self._destroyed or self._data is None:
+            return
+        if self._stream is not None:
+            return
+        thread = threading.Thread(
+            target=self._warm_stream_worker,
+            name="waveform-warm-stream",
+            daemon=True,
+        )
+        self._stream_warm_thread = thread
+        thread.start()
+
+    def _warm_stream_worker(self) -> None:
+        if self._destroyed or self._data is None:
+            return
+        stream = self._build_output_stream()
+        try:
+            self.after(0, lambda s=stream: self._on_background_stream_built(s, start=False))
+        except Exception:
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+        try:
+            self.after(0, self._on_stream_warmed)
+        except Exception:
+            pass
+
+    def _on_stream_warmed(self) -> None:
+        self._stream_warm_thread = None
 
     def _draw_placeholder(self, message: str, *, animated: bool = False) -> None:
         c = self._canvas
@@ -578,6 +731,12 @@ class WaveformPlayer(ctk.CTkFrame):
 
     def _teardown_stream(self) -> None:
         self._cancel_tick()
+        if self._draw_after is not None:
+            try:
+                self.after_cancel(self._draw_after)
+            except Exception:
+                pass
+            self._draw_after = None
         if self._stream is not None:
             try:
                 self._stream.stop()

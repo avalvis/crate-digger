@@ -55,12 +55,14 @@ class _PrefetchEntry:
     percent: float = 0.0
     error_message: Optional[str] = None
     cancel_event: threading.Event = field(default_factory=threading.Event)
+    started_at: float = 0.0
 
 
 class PreviewPrefetchService:
     """Bounded background prefetch pool for reel previews."""
 
     _DECODED_LRU_MAX = 8
+    _JOB_TIMEOUT_S = 90.0
 
     def __init__(
         self,
@@ -138,6 +140,7 @@ class PreviewPrefetchService:
     def enqueue_batch(self, video_ids: list[str]) -> None:
         """Queue reel previews top-to-bottom; skips already-ready IDs."""
         ids = [self._preview.normalize_video_id(v) for v in video_ids if v]
+        pending: list[PrefetchEvent] = []
         with self._lock:
             self._batch_ids = list(ids)
             self._batch_drained = False
@@ -146,7 +149,7 @@ class PreviewPrefetchService:
             for vid in ids:
                 if vid in self._decoded_lru:
                     self._ensure_entry(vid).state = PrefetchState.READY
-                    self._publish(
+                    pending.append(
                         PrefetchEvent(
                             PrefetchEventType.STATE_CHANGED,
                             vid,
@@ -176,7 +179,7 @@ class PreviewPrefetchService:
                     entry.cancel_event = threading.Event()
                     entry.state = PrefetchState.PENDING
                 self._queue.append(vid)
-                self._publish(
+                pending.append(
                     PrefetchEvent(
                         PrefetchEventType.STATE_CHANGED,
                         vid,
@@ -184,8 +187,10 @@ class PreviewPrefetchService:
                         message="Queued",
                     ),
                 )
-            self._check_batch_drained_locked()
+        for event in pending:
+            self._publish(event)
         self._pump()
+        self._emit_drain_check()
 
     def cancel_batch(self, video_ids: Optional[list[str]] = None) -> None:
         with self._lock:
@@ -206,8 +211,8 @@ class PreviewPrefetchService:
                         self._queue.remove(vid)
                 except ValueError:
                     pass
-            self._check_batch_drained_locked()
         self._pump()
+        self._emit_drain_check()
 
     def get_state(self, video_id: str) -> PrefetchState:
         vid = self._preview.normalize_video_id(video_id)
@@ -247,16 +252,64 @@ class PreviewPrefetchService:
         return self.get_decoded(vid)
 
     def batch_progress(self) -> tuple[int, int]:
+        """Return (finished, total) where finished = ready, failed, or cancelled."""
         with self._lock:
             total = len(self._batch_ids)
             if total == 0:
-                return 0, 1
-            ready = sum(
-                1 for vid in self._batch_ids
-                if self._entries.get(vid) is not None
-                and self._entries[vid].state == PrefetchState.READY
+                return 0, 0
+            terminal = (
+                PrefetchState.READY,
+                PrefetchState.FAILED,
+                PrefetchState.CANCELLED,
             )
-            return ready, total
+            done = sum(
+                1 for vid in self._batch_ids
+                if (entry := self._entries.get(vid)) is not None
+                and entry.state in terminal
+            )
+            return done, total
+
+    def reap_stale_jobs(self, *, timeout_s: Optional[float] = None) -> int:
+        """Fail in-flight jobs that exceeded the warmup timeout."""
+        limit = float(timeout_s if timeout_s is not None else self._JOB_TIMEOUT_S)
+        now = time.monotonic()
+        reaped = 0
+        events: list[PrefetchEvent] = []
+        with self._lock:
+            for vid in list(self._batch_ids):
+                entry = self._entries.get(vid)
+                if entry is None:
+                    continue
+                if entry.state in (
+                    PrefetchState.READY,
+                    PrefetchState.FAILED,
+                    PrefetchState.CANCELLED,
+                ):
+                    continue
+                if entry.started_at <= 0:
+                    continue
+                if now - entry.started_at < limit:
+                    continue
+                entry.cancel_event.set()
+                entry.state = PrefetchState.FAILED
+                entry.error_message = "Preview warmup timed out"
+                entry.message = "Timed out"
+                reaped += 1
+                events.append(
+                    PrefetchEvent(
+                        PrefetchEventType.STATE_CHANGED,
+                        vid,
+                        state=PrefetchState.FAILED,
+                        message="Timed out",
+                        error_message=entry.error_message,
+                    ),
+                )
+        for event in events:
+            self._publish(event)
+        if reaped:
+            self._emit_drain_check()
+            self._pump()
+        return reaped
 
     def is_batch_drained(self) -> bool:
         with self._lock:
@@ -281,21 +334,25 @@ class PreviewPrefetchService:
                 return False
         return True
 
-    def _check_batch_drained_locked(self) -> None:
+    def _check_batch_drained_locked(self) -> Optional[PrefetchEvent]:
         if self._batch_drained or not self._batch_ids:
-            return
+            return None
         if not self._batch_terminal_locked():
-            return
+            return None
         if self._queue or self._active > 0:
-            return
+            return None
         self._batch_drained = True
         last_id = self._batch_ids[-1] if self._batch_ids else ""
-        self._publish(
-            PrefetchEvent(
-                PrefetchEventType.BATCH_DRAINED,
-                last_id,
-            ),
+        return PrefetchEvent(
+            PrefetchEventType.BATCH_DRAINED,
+            last_id,
         )
+
+    def _emit_drain_check(self) -> None:
+        with self._lock:
+            event = self._check_batch_drained_locked()
+        if event is not None:
+            self._publish(event)
 
     def configure(
         self,
@@ -319,10 +376,8 @@ class PreviewPrefetchService:
                 vid = self._queue.popleft()
                 entry = self._entries.get(vid)
                 if entry is None or entry.cancel_event.is_set():
-                    self._check_batch_drained_locked()
                     continue
                 if entry.state == PrefetchState.READY:
-                    self._check_batch_drained_locked()
                     continue
                 self._active += 1
                 threading.Thread(
@@ -331,6 +386,7 @@ class PreviewPrefetchService:
                     name=f"preview-prefetch-{vid}",
                     daemon=True,
                 ).start()
+        self._emit_drain_check()
 
     def _worker(self, video_id: str) -> None:
         try:
@@ -338,17 +394,24 @@ class PreviewPrefetchService:
         finally:
             with self._lock:
                 self._active = max(0, self._active - 1)
-                self._check_batch_drained_locked()
+            self._emit_drain_check()
             self._pump()
 
     def _run_prefetch(self, video_id: str) -> None:
         entry = self._entries.get(video_id)
         if entry is None or entry.cancel_event.is_set():
             return
+        entry.started_at = time.monotonic()
+        last_progress_pub = 0.0
 
         def on_progress(pct: float, msg: str) -> None:
+            nonlocal last_progress_pub
             if entry.cancel_event.is_set():
                 return
+            now = time.monotonic()
+            if pct < 99.0 and now - last_progress_pub < 0.25:
+                return
+            last_progress_pub = now
             state = (
                 PrefetchState.DOWNLOADING
                 if pct < 65.0
@@ -408,8 +471,6 @@ class PreviewPrefetchService:
             entry.message = "Ready"
             entry.percent = 100.0
             data = self.get_decoded(video_id)
-            with self._lock:
-                self._check_batch_drained_locked()
             self._publish(
                 PrefetchEvent(
                     PrefetchEventType.STATE_CHANGED,
@@ -420,10 +481,9 @@ class PreviewPrefetchService:
                     data=data,
                 ),
             )
+            self._emit_drain_check()
         except PreviewCancelledError:
             entry.state = PrefetchState.CANCELLED
-            with self._lock:
-                self._check_batch_drained_locked()
             self._publish(
                 PrefetchEvent(
                     PrefetchEventType.STATE_CHANGED,
@@ -431,11 +491,10 @@ class PreviewPrefetchService:
                     state=PrefetchState.CANCELLED,
                 ),
             )
+            self._emit_drain_check()
         except PreviewError as e:
             entry.state = PrefetchState.FAILED
             entry.error_message = str(e)
-            with self._lock:
-                self._check_batch_drained_locked()
             self._publish(
                 PrefetchEvent(
                     PrefetchEventType.STATE_CHANGED,
@@ -446,11 +505,10 @@ class PreviewPrefetchService:
                 ),
             )
             self._log.warning("Prefetch failed for %s: %s", video_id, e)
+            self._emit_drain_check()
         except Exception as e:  # noqa: BLE001
             entry.state = PrefetchState.FAILED
             entry.error_message = str(e)
-            with self._lock:
-                self._check_batch_drained_locked()
             self._publish(
                 PrefetchEvent(
                     PrefetchEventType.STATE_CHANGED,
@@ -460,6 +518,7 @@ class PreviewPrefetchService:
                 ),
             )
             self._log.exception("Unexpected prefetch failure for %s", video_id)
+            self._emit_drain_check()
 
     def _ensure_entry(self, video_id: str) -> _PrefetchEntry:
         entry = self._entries.get(video_id)

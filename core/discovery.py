@@ -16,7 +16,8 @@ The "Dig" button workflow:
 
 `dig_many()` returns a batch for the reel UI and does NOT record the
 suggestions — the caller records via `record_suggestion()` only once the
-user previews or queues one, so skipped-but-unseen gems can resurface.
+user previews or queues one. Masters shown on a reel are tracked for the
+app session so the next Dig explores a wider slice of the catalog.
 `dig()` remains for single-shot callers and records immediately.
 
 Rate limiting (critical):
@@ -42,9 +43,9 @@ import random
 import re
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 import requests
 
@@ -173,6 +174,10 @@ class NoYouTubeMatchError(DiscoveryError):
     """Discogs candidate found but no suitable YouTube match."""
 
 
+class DiscoveryCancelledError(DiscoveryError):
+    """User cancelled an in-flight dig."""
+
+
 # ─── Rate limiter ────────────────────────────────────────────────────
 
 class _TokenBucket:
@@ -242,10 +247,26 @@ class DiscoveryEngine:
     USER_AGENT = "CrateDigger/0.1 +https://github.com/josh/cratedigger"
 
     # Max pages of Discogs search results to fetch per Dig. Discogs
-    # returns 50 per page; 6 pages = 300 candidates — a deep pool that
-    # keeps a full reel (and repeated Digs) fresh without hammering the
-    # rate budget. Range searches widen this further (see _search_discogs).
-    MAX_SEARCH_PAGES = 6
+    # returns 50 per page. Narrow-filter digs (country, era range, etc.)
+    # fetch more pages in random order until TARGET_POOL_SIZE is met.
+    MAX_SEARCH_PAGES = 8
+    MAX_SEARCH_PAGES_NARROW = 18
+
+    # Stop paging once we have this many post-filter candidates.
+    TARGET_POOL_SIZE = 120
+
+    # Relaxed min_have ceiling when filters already narrow the catalog.
+    FILTERED_MIN_HAVE_CAP = 15
+    FILTERED_MIN_HAVE_FLOOR = 5
+
+    # Masters surfaced on recent reels (preview not required) — excluded
+    # from the next dig so repeated clicks explore outward.
+    SESSION_SURFACED_MAX = 250
+
+    # Discogs sort keys that reshuffle which masters appear in each window.
+    _DISCOGS_SORT_FIELDS: tuple[str, ...] = (
+        "want", "have", "year", "title", "label", "catno", "released",
+    )
 
     # How many Discogs candidates to try when the first YT match fails.
     MAX_YT_MATCH_ATTEMPTS = 10
@@ -280,6 +301,10 @@ class DiscoveryEngine:
         self._ytm_limiter = _TokenBucket(max_calls=45, window_seconds=60.0)
 
         self._stats = _CallStats()
+
+        # Recently surfaced master IDs (current app session). LRU so memory
+        # stays bounded; cleared only when the engine is recreated.
+        self._session_surfaced: OrderedDict[int, None] = OrderedDict()
 
         # ytmusicapi.YTMusic is thread-safe in practice for search/get
         # calls; we hold one client for the app lifetime.
@@ -324,7 +349,12 @@ class DiscoveryEngine:
         return suggestion
 
     def dig_many(
-        self, filters: DiscoveryFilters, count: int = 8,
+        self,
+        filters: DiscoveryFilters,
+        count: int = 8,
+        *,
+        cancel_event: Optional[threading.Event] = None,
+        progress: Optional[Callable[[str], None]] = None,
     ) -> list[DiscoverySuggestion]:
         """
         Surface up to `count` resolved suggestions for the reel UI.
@@ -332,8 +362,9 @@ class DiscoveryEngine:
         Ranking blends Discogs desirability with sample-friendliness
         affinity (genre/style/era/country) when `filters.prioritize_samples`
         is set. Suggestions are NOT recorded here — call
-        `record_suggestion()` when the user previews or queues one, so
-        skipped gems can resurface on a later Dig.
+        `record_suggestion()` when the user previews or queues one.
+        Masters returned on the reel are remembered for the session so
+        the next Dig explores further into the catalog.
         """
         if not self._token:
             raise DiscoveryConfigError(
@@ -342,25 +373,41 @@ class DiscoveryEngine:
 
         count = max(1, int(count))
         self._log.info("Dig (batch of %d) started: %s", count, filters)
+        self._emit_progress(progress, "Searching Discogs…")
 
-        candidates = self._search_discogs(filters)
+        candidates = self._search_discogs(
+            filters, cancel_event=cancel_event, progress=progress,
+        )
+        self._check_cancel(cancel_event)
         if not candidates:
             raise NoResultsError(
                 "No Discogs masters matched the filters. Try widening them."
             )
 
         pool = self._rank_and_shuffle(candidates, filters)
+        self._emit_progress(
+            progress,
+            f"Found {len(candidates)} records — matching on YouTube Music…",
+        )
 
         # Walk the ranked pool, resolving YT matches until we fill the
         # reel or exhaust a generous attempt budget.
         suggestions: list[DiscoverySuggestion] = []
         seen_video_ids: set[str] = set()
         last_error: Optional[Exception] = None
-        max_attempts = min(len(pool), count * 3 + self.MAX_YT_MATCH_ATTEMPTS)
+        max_attempts = min(
+            len(pool),
+            max(count * 5 + self.MAX_YT_MATCH_ATTEMPTS, len(pool) // 2),
+        )
 
         for cand in pool[:max_attempts]:
+            self._check_cancel(cancel_event)
             if len(suggestions) >= count:
                 break
+            self._emit_progress(
+                progress,
+                f"Matching on YouTube — {len(suggestions)}/{count}…",
+            )
             try:
                 suggestion = self._match_youtube(cand)
             except NoYouTubeMatchError as e:
@@ -386,6 +433,8 @@ class DiscoveryEngine:
                 f"Tried {max_attempts} Discogs candidates; none resolved on "
                 f"YouTube Music. Last error: {last_error}"
             )
+
+        self._remember_surfaced(s.discogs_master_id for s in suggestions)
         return suggestions
 
     def record_suggestion(
@@ -413,17 +462,55 @@ class DiscoveryEngine:
                 suggestion.discogs_master_id,
             )
 
+    @staticmethod
+    def _emit_progress(
+        progress: Optional[Callable[[str], None]], message: str,
+    ) -> None:
+        if progress is None:
+            return
+        try:
+            progress(message)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _check_cancel(cancel_event: Optional[threading.Event]) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise DiscoveryCancelledError("Dig cancelled by user")
+
+    def _remember_surfaced(self, master_ids: Iterable[int]) -> None:
+        """Track masters shown on a reel so the next dig explores outward."""
+        for mid in master_ids:
+            self._session_surfaced[mid] = None
+            self._session_surfaced.move_to_end(mid)
+        while len(self._session_surfaced) > self.SESSION_SURFACED_MAX:
+            self._session_surfaced.popitem(last=False)
+
     def _rank_and_shuffle(
         self, candidates: list[DiscogsCandidate], filters: DiscoveryFilters,
     ) -> list[DiscogsCandidate]:
         """
-        Produce an exploration-friendly ranked pool: drop already-seen
-        masters, sort by blended score, then shuffle the desirable top
-        tier so repeated Digs feel fresh. A few random wildcards from the
-        long tail are spliced in so nothing is ever fully excluded.
+        Exploration-friendly pool: drop session-surfaced and DB-recorded
+        masters, then rank the full list with per-dig score jitter so
+        repeated digs draw from the whole candidate set — not just a
+        fixed top tier.
         """
-        fresh = [c for c in candidates
-                 if not self._db.is_already_suggested(c.master_id)]
+        session_seen = set(self._session_surfaced)
+        fresh = [
+            c for c in candidates
+            if c.master_id not in session_seen
+            and not self._db.is_already_suggested(c.master_id)
+        ]
+        if not fresh:
+            fresh = [
+                c for c in candidates
+                if not self._db.is_already_suggested(c.master_id)
+            ]
+            if fresh:
+                self._log.info(
+                    "Session pool exhausted; reusing %d DB-fresh candidates.",
+                    len(fresh),
+                )
         if not fresh:
             self._log.info(
                 "All %d candidates already suggested; reusing pool.",
@@ -433,53 +520,76 @@ class DiscoveryEngine:
 
         prioritize = filters.prioritize_samples
         intensity = filters.sample_intensity
-        ranked = sorted(
-            fresh,
-            key=lambda c: c.rank_score(prioritize=prioritize, intensity=intensity),
-            reverse=True,
+
+        def _jittered_score(c: DiscogsCandidate) -> float:
+            base = c.rank_score(prioritize=prioritize, intensity=intensity)
+            return base * (0.25 + 0.75 * self._rng.random())
+
+        return sorted(fresh, key=_jittered_score, reverse=True)
+
+    @staticmethod
+    def _has_narrow_filters(filters: DiscoveryFilters) -> bool:
+        """True when the user narrowed the catalog beyond wide-open dig."""
+        return not DiscoveryEngine._is_wide_open(filters)
+
+    @staticmethod
+    def _effective_min_have(filters: DiscoveryFilters) -> int:
+        """
+        Relax min_have when country/era/genre filters already shrink the
+        pool — many regional gems never hit high collector counts.
+        """
+        if not DiscoveryEngine._has_narrow_filters(filters):
+            return filters.min_have
+        return max(
+            DiscoveryEngine.FILTERED_MIN_HAVE_FLOOR,
+            min(filters.min_have, DiscoveryEngine.FILTERED_MIN_HAVE_CAP),
         )
 
-        # Top tier: the best quarter (min 12). Shuffle for exploration.
-        cut = max(12, len(ranked) // 4)
-        top_pool = ranked[:cut]
-        tail = ranked[cut:]
-        self._rng.shuffle(top_pool)
+    def _pick_discogs_sort(self) -> tuple[str, str]:
+        """Random sort axis so each dig sees a different Discogs window."""
+        return (
+            self._rng.choice(self._DISCOGS_SORT_FIELDS),
+            self._rng.choice(("asc", "desc")),
+        )
 
-        # Splice in up to 3 wildcards from the tail so the roulette can
-        # still surprise — "weight, never exclude" made literal.
-        if tail:
-            wildcards = self._rng.sample(tail, k=min(3, len(tail)))
-            for wc in wildcards:
-                insert_at = self._rng.randint(0, len(top_pool))
-                top_pool.insert(insert_at, wc)
-
-        return top_pool
+    def _page_budget(
+        self, filters: DiscoveryFilters, *, has_range: bool,
+    ) -> int:
+        if self._has_narrow_filters(filters):
+            return self.MAX_SEARCH_PAGES_NARROW
+        if has_range:
+            return self.MAX_SEARCH_PAGES + 3
+        return self.MAX_SEARCH_PAGES
 
     # ── Discogs ──
 
     def _search_discogs(
-        self, filters: DiscoveryFilters,
+        self,
+        filters: DiscoveryFilters,
+        *,
+        cancel_event: Optional[threading.Event] = None,
+        progress: Optional[Callable[[str], None]] = None,
     ) -> list[DiscogsCandidate]:
-        """Paginated Discogs search with filter-to-param translation."""
+        """Paginated Discogs search with exploration-friendly paging."""
         effective = filters
-        start_page = 1
-        if self._is_wide_open(filters):
+        min_have_floor = self._effective_min_have(filters)
+        wide_open = self._is_wide_open(filters)
+
+        if wide_open:
             field_name, seed_value = pick_wide_open_discogs_seed(self._rng)
             effective = replace(filters, **{field_name: seed_value})
-            # Skip page 1 — it's dominated by mega-mainstream masters that
-            # fail max_have even inside a genre bucket.
-            start_page = self._rng.randint(2, 4)
             self._log.info(
-                "Wide-open dig — exploring %s=%r (page %d+)",
-                field_name, seed_value, start_page,
+                "Wide-open dig — exploring %s=%r",
+                field_name, seed_value,
             )
 
+        sort_field, sort_order = self._pick_discogs_sort()
         params: dict[str, Any] = {
             "type": "master",
             "per_page": 50,
+            "sort": sort_field,
+            "sort_order": sort_order,
         }
-        # Exact year narrows server-side. For an era *range* Discogs has no
-        # native param, so we omit it and filter candidates client-side.
         if effective.year is not None:
             params["year"] = effective.year
         if effective.country:
@@ -493,43 +603,82 @@ class DiscoveryEngine:
         if effective.query:
             params["q"] = effective.query
 
-        # A range filter throws away many hits client-side, so widen the
-        # page budget to keep the reel well-fed.
         has_range = effective.year is None and (
             effective.year_min is not None or effective.year_max is not None
         )
-        max_pages = self.MAX_SEARCH_PAGES + (3 if has_range else 0)
+        page_budget = self._page_budget(effective, has_range=has_range)
 
+        probe = self._discogs_get("/database/search", {**params, "page": 1})
+        pagination = probe.get("pagination") or {}
+        total_pages = max(1, int(pagination.get("pages") or 1))
+
+        seen_masters: set[int] = set()
         candidates: list[DiscogsCandidate] = []
-        for page in range(start_page, start_page + max_pages):
-            params["page"] = page
-            data = self._discogs_get("/database/search", params)
-            results = data.get("results") or []
-            if not results:
-                break
 
-            for r in results:
+        def _ingest(data: dict[str, Any]) -> None:
+            for r in data.get("results") or []:
                 cand = self._result_to_candidate(
                     r, allow_compilations=effective.allow_compilations,
                 )
-                if cand is None:
+                if cand is None or cand.master_id in seen_masters:
                     continue
-                if cand.have < effective.min_have:
-                    continue
-                if cand.have > effective.max_have:
+                if cand.have < min_have_floor or cand.have > effective.max_have:
                     continue
                 if not self._year_in_range(cand.year, effective):
                     continue
+                seen_masters.add(cand.master_id)
                 candidates.append(cand)
 
-            # Honor pagination-provided total if present
-            pagination = data.get("pagination") or {}
-            if page >= int(pagination.get("pages") or 0):
+        if not wide_open:
+            _ingest(probe)
+
+        remaining = list(range(1, total_pages + 1))
+        if not wide_open:
+            remaining = [p for p in remaining if p != 1]
+        self._rng.shuffle(remaining)
+
+        if wide_open:
+            preferred = [p for p in range(2, min(5, total_pages + 1))]
+            rest = [p for p in remaining if p not in preferred]
+            self._rng.shuffle(preferred)
+            self._rng.shuffle(rest)
+            page_order = preferred + rest
+        else:
+            page_order = remaining
+
+        max_extra = max(0, page_budget - 1)
+        page_order = page_order[:max_extra]
+
+        fetches = 1
+        for page in page_order:
+            self._check_cancel(cancel_event)
+            if fetches >= page_budget:
+                break
+            if page == 1 and not wide_open:
+                continue
+            self._emit_progress(
+                progress,
+                f"Searching Discogs — page {fetches}/{page_budget} "
+                f"({len(candidates)} candidates)…",
+            )
+            data = self._discogs_get(
+                "/database/search", {**params, "page": page},
+            )
+            _ingest(data)
+            fetches += 1
+            if len(candidates) >= self.TARGET_POOL_SIZE:
                 break
 
+        if min_have_floor != filters.min_have:
+            self._log.info(
+                "Narrow-filter dig — min_have relaxed %d → %d",
+                filters.min_have, min_have_floor,
+            )
         self._log.debug(
-            "Discogs yielded %d candidates (filters=%s)",
-            len(candidates), effective,
+            "Discogs yielded %d candidates (sort=%s %s, pages=%d/%d, "
+            "min_have=%d, filters=%s)",
+            len(candidates), sort_field, sort_order, fetches, total_pages,
+            min_have_floor, effective,
         )
         return candidates
 

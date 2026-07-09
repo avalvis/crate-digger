@@ -85,6 +85,13 @@ class DigRouletteSpinner(ctk.CTkFrame):
     def _tick(self) -> None:
         if not self._running:
             return
+        try:
+            if not self.winfo_exists():
+                self.stop()
+                return
+        except Exception:
+            self.stop()
+            return
         self._angle = (self._angle + self._DEGREES_PER_TICK) % 360.0
         self._pulse_phase = (self._pulse_phase + 1) % 24
         self._paint_vinyl()

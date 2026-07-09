@@ -14,6 +14,7 @@ boom-bap/lo-fi/Greek gems but can still surprise with a wildcard.
 
 from __future__ import annotations
 
+import queue
 import threading
 import webbrowser
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import customtkinter as ctk
 
 from core.discovery import (
+    DiscoveryCancelledError,
     DiscoveryConfigError,
     DiscoveryError,
     DiscoveryFilters,
@@ -130,6 +132,9 @@ class DigitalCrateTab(ctk.CTkFrame):
         # State
         self._digging = False
         self._dig_generation = 0
+        self._dig_cancel_event: Optional[threading.Event] = None
+        self._dig_progress_queue: queue.Queue[str] = queue.Queue()
+        self._dig_progress_after: Optional[str] = None
         self._dig_lock = threading.Lock()
         self._cards: list[_ReelCard] = []
         self._filters_locked = False
@@ -139,8 +144,13 @@ class DigitalCrateTab(ctk.CTkFrame):
         self._render_index = 0
         self._render_after: Optional[str] = None
         self._config_save_after: Optional[str] = None
-        self._prefetch_status_after: Optional[str] = None
         self._prefetch_watchdog_after: Optional[str] = None
+        self._prefetch_inbox: queue.Queue[PrefetchEvent] = queue.Queue()
+        self._mpc_inbox: queue.Queue = queue.Queue()
+        self._prefetch_drain_after: Optional[str] = None
+        self._mpc_drain_after: Optional[str] = None
+        self._prefetch_progress_latest: dict[str, PrefetchEvent] = {}
+        self._health_update_after: Optional[str] = None
 
         # Widget refs
         self._from_var: Optional[ctk.StringVar] = None
@@ -175,6 +185,8 @@ class DigitalCrateTab(ctk.CTkFrame):
         self._build_body()
         self._wire_prefetch_events()
         self._wire_mpc_events()
+        self._schedule_prefetch_drain()
+        self._schedule_mpc_drain()
         self._ctx.on_config_changed(self._on_config_changed)
         self._refresh_token_gate()
         self._update_health()
@@ -221,14 +233,15 @@ class DigitalCrateTab(ctk.CTkFrame):
         header.grid(row=0, column=0, sticky="ew", padx=t.space.xl,
                     pady=(t.space.lg, t.space.sm))
         header.grid_columnconfigure(0, weight=1)
+        header.grid_columnconfigure(1, weight=0)
 
-        title_row = ctk.CTkFrame(header, fg_color="transparent")
-        title_row.grid(row=0, column=0, sticky="ew")
-        title_row.grid_columnconfigure(0, weight=1)
-        title_row.grid_columnconfigure(1, weight=0)
-        ctk.CTkLabel(title_row, text="Digital Crate",
+        ctk.CTkLabel(header, text="Digital Crate",
                      **style_label_heading(t)).grid(row=0, column=0, sticky="w")
-        self._build_dig_row(title_row, 0)
+        self._health_label = ctk.CTkLabel(
+            header, text="", text_color=t.text.muted, font=t.font.micro,
+            anchor="e")
+        self._health_label.grid(row=0, column=1, sticky="e", padx=(t.space.md, 0))
+        self._update_health()
 
         scroll = ctk.CTkScrollableFrame(
             self,
@@ -264,6 +277,7 @@ class DigitalCrateTab(ctk.CTkFrame):
         next_row = self._build_token_warning(content, next_row)
         next_row = self._build_presets(content, next_row)
         next_row = self._build_filters_card(content, next_row)
+        next_row = self._build_dig_row(content, next_row)
         next_row = self._build_reel_area(content, next_row)
         self._build_recent_digs(content, next_row)
 
@@ -540,26 +554,23 @@ class DigitalCrateTab(ctk.CTkFrame):
     def _build_dig_row(self, parent, row: int) -> int:
         t = self._theme
         dig_row = ctk.CTkFrame(parent, fg_color="transparent")
-        dig_row.grid(row=row, column=1, sticky="e", padx=(t.space.lg, 0))
+        dig_row.grid(row=row, column=0, sticky="ew", pady=(0, t.space.lg))
+        dig_row.grid_columnconfigure(0, weight=1)
 
         self._dig_button = ctk.CTkButton(
             dig_row, text="◆   Dig the crate", command=self._on_dig_clicked,
-            **style_primary_button(t), width=200)
-        self._dig_button.configure(font=t.font.body_emphasis, height=44)
-        self._dig_button.pack(side="left")
+            **style_primary_button(t), width=280)
+        self._dig_button.configure(font=t.font.body_emphasis, height=48)
+        self._dig_button.grid(row=0, column=0, pady=(0, t.space.sm))
 
         status_frame = ctk.CTkFrame(dig_row, fg_color="transparent")
-        status_frame.pack(side="left", padx=(t.space.md, 0))
-        self._dig_spinner = DigRouletteSpinner(status_frame, t, size=36)
+        status_frame.grid(row=1, column=0, sticky="ew")
+        self._dig_spinner = DigRouletteSpinner(status_frame, t, size=32)
+        self._dig_spinner.pack(side="left")
         self._dig_status_label = ctk.CTkLabel(
             status_frame, text="", text_color=t.text.secondary,
-            font=t.font.caption, anchor="w", wraplength=280, justify="left")
-        self._dig_status_label.pack(side="left")
-
-        self._health_label = ctk.CTkLabel(
-            dig_row, text="", text_color=t.text.muted, font=t.font.micro,
-            anchor="e")
-        self._health_label.pack(side="right", padx=(t.space.md, 0))
+            font=t.font.caption, anchor="w", wraplength=520, justify="left")
+        self._dig_status_label.pack(side="left", padx=(t.space.sm, 0))
 
         self._set_dig_status(None)
         return row + 1
@@ -583,7 +594,7 @@ class DigitalCrateTab(ctk.CTkFrame):
         ctk.CTkLabel(empty_inner, text="Nothing dug up yet.",
                      text_color=t.text.secondary, font=t.font.subheading).pack()
         ctk.CTkLabel(empty_inner,
-                     text="Pick a preset or set filters, then hit Dig.",
+                     text="Set filters above, then Dig the crate to spin up a reel.",
                      **style_label_meta(t)).pack(pady=(t.space.xs, 0))
         self._reel_empty = empty
         return row + 2
@@ -741,14 +752,97 @@ class DigitalCrateTab(ctk.CTkFrame):
 
         return self.after(ms, _wrapped)
 
+    def _stop_prefetch_workers(self) -> None:
+        """Cancel in-flight preview warmup — safe from any thread."""
+        self._cancel_prefetch_watchdog()
+        while True:
+            try:
+                self._prefetch_inbox.get_nowait()
+            except queue.Empty:
+                break
+        self._prefetch_progress_latest.clear()
+        pf = self._ctx.preview_prefetch
+        if pf is not None:
+            pf.cancel_batch()
+
+    def _schedule_prefetch_drain(self) -> None:
+        if not self._is_alive():
+            return
+        if self._prefetch_drain_after is not None:
+            return
+        self._prefetch_drain_after = self.after(33, self._drain_prefetch_inbox)
+
+    def _drain_prefetch_inbox(self) -> None:
+        self._prefetch_drain_after = None
+        if not self._is_alive():
+            return
+        processed = 0
+        while processed < 48:
+            try:
+                event = self._prefetch_inbox.get_nowait()
+            except queue.Empty:
+                break
+            if event.type == PrefetchEventType.PROGRESS:
+                self._prefetch_progress_latest[event.video_id] = event
+            else:
+                self._flush_prefetch_progress()
+                self._apply_prefetch_event(event)
+            processed += 1
+        self._flush_prefetch_progress()
+        if self._is_alive():
+            self._schedule_prefetch_drain()
+
+    def _flush_prefetch_progress(self) -> None:
+        if not self._prefetch_progress_latest:
+            return
+        latest = self._prefetch_progress_latest
+        self._prefetch_progress_latest = {}
+        for event in latest.values():
+            self._apply_prefetch_event(event)
+
+    def _schedule_mpc_drain(self) -> None:
+        if not self._is_alive():
+            return
+        if self._mpc_drain_after is not None:
+            return
+        self._mpc_drain_after = self.after(33, self._drain_mpc_inbox)
+
+    def _drain_mpc_inbox(self) -> None:
+        self._mpc_drain_after = None
+        if not self._is_alive():
+            return
+        processed = 0
+        while processed < 32:
+            try:
+                event = self._mpc_inbox.get_nowait()
+            except queue.Empty:
+                break
+            self._apply_mpc_export_event(event)
+            processed += 1
+        if self._is_alive():
+            self._schedule_mpc_drain()
+
+    def _schedule_health_update(self) -> None:
+        if self._health_update_after is not None:
+            return
+        self._health_update_after = self.after(500, self._do_health_update)
+
+    def _do_health_update(self) -> None:
+        self._health_update_after = None
+        self._update_health()
+
     def _on_dig_clicked(self) -> None:
         with self._dig_lock:
             if self._digging:
+                self._cancel_dig()
                 return
             self._digging = True
             self._dig_generation += 1
             generation = self._dig_generation
+            self._dig_cancel_event = threading.Event()
         self._cancel_pending_render()
+        self._stop_prefetch_workers()
+        self._stop_dig_progress_drain()
         self._set_dig_in_flight(True)
 
         snap = self._ctx.config.snapshot()
@@ -766,6 +860,7 @@ class DigitalCrateTab(ctk.CTkFrame):
             if self._intensity_slider is not None else 0.6
         )
         self._schedule_discovery_pref_save()
+        cancel_event = self._dig_cancel_event
         threading.Thread(
             target=self._persist_dig_prefs_worker,
             args=(
@@ -778,28 +873,97 @@ class DigitalCrateTab(ctk.CTkFrame):
         ).start()
         threading.Thread(
             target=self._run_dig_worker,
-            args=(filters, count, generation),
+            args=(filters, count, generation, cancel_event),
             daemon=True,
         ).start()
+
+    def _cancel_dig(self) -> None:
+        if self._dig_cancel_event is not None:
+            self._dig_cancel_event.set()
+        self._set_dig_status("Stopping…", animate=True)
+        if self._dig_button is not None:
+            self._dig_button.configure(state="disabled")
+
+    def _dig_progress_callback(self, message: str) -> None:
+        try:
+            self._dig_progress_queue.put_nowait(message)
+        except queue.Full:
+            pass
+        self._schedule_dig_progress_drain()
+
+    def _schedule_dig_progress_drain(self) -> None:
+        if not self._is_alive() or not self._digging:
+            return
+        if self._dig_progress_after is not None:
+            return
+        self._dig_progress_after = self.after(150, self._drain_dig_progress)
+
+    def _drain_dig_progress(self) -> None:
+        self._dig_progress_after = None
+        if not self._is_alive() or not self._digging:
+            return
+        latest: Optional[str] = None
+        while True:
+            try:
+                latest = self._dig_progress_queue.get_nowait()
+            except queue.Empty:
+                break
+        if latest:
+            self._set_dig_status(latest, animate=True)
+        if self._digging:
+            self._schedule_dig_progress_drain()
+
+    def _stop_dig_progress_drain(self) -> None:
+        if self._dig_progress_after is not None:
+            try:
+                self.after_cancel(self._dig_progress_after)
+            except Exception:
+                pass
+            self._dig_progress_after = None
+        while True:
+            try:
+                self._dig_progress_queue.get_nowait()
+            except queue.Empty:
+                break
 
     def _run_dig_worker(
         self,
         filters: DiscoveryFilters,
         count: int,
         generation: int,
+        cancel_event: Optional[threading.Event],
     ) -> None:
         results: list[DiscoverySuggestion] = []
         error: Optional[Exception] = None
+        cancelled = False
         try:
-            results = self._ctx.discovery.dig_many(filters, count=count)
+            results = self._ctx.discovery.dig_many(
+                filters,
+                count=count,
+                cancel_event=cancel_event,
+                progress=self._dig_progress_callback,
+            )
+        except DiscoveryCancelledError:
+            cancelled = True
         except Exception as e:  # noqa: BLE001 — surfaced via toast
             error = e
         if not self._is_alive():
+            return
+        if cancelled:
+            self._safe_after(
+                0, lambda: self._on_dig_cancelled(generation),
+            )
             return
         self._safe_after(
             0,
             lambda: self._on_dig_finished(results, error, generation),
         )
+
+    def _on_dig_cancelled(self, generation: int) -> None:
+        if generation != self._dig_generation:
+            return
+        self._ctx.publish_toast("Dig cancelled.", "info")
+        self._finish_dig_session(generation, unlock_filters=True)
 
     def _finish_dig_session(
         self,
@@ -810,8 +974,11 @@ class DigitalCrateTab(ctk.CTkFrame):
         if generation != self._dig_generation:
             return
         self._digging = False
+        self._dig_cancel_event = None
+        self._stop_dig_progress_drain()
         if unlock_filters:
             self._set_dig_in_flight(False)
+            self._clear_dig_status()
 
     def _on_dig_finished(
         self,
@@ -864,26 +1031,17 @@ class DigitalCrateTab(ctk.CTkFrame):
             self._ctx.publish_toast(f"Dig failed: {error}", "error")
 
     def _start_prefetch(self, results: list[DiscoverySuggestion]) -> None:
+        """Warm previews in the background — never blocks the dig-complete UX."""
         pf = self._ctx.preview_prefetch
         if pf is None:
-            self._clear_warming_status()
             return
         snap = self._ctx.config.snapshot().config.discovery
         if not snap.preview_prefetch_enabled:
-            self._clear_warming_status()
             return
         ids = [s.youtube_video_id for s in results if s.youtube_video_id]
         if not ids:
-            self._clear_warming_status()
             return
         pf.enqueue_batch(ids)
-        if pf.is_batch_drained() or pf.is_batch_idle():
-            self._clear_warming_status()
-            return
-        done, total = pf.batch_progress()
-        self._set_dig_status(
-            f"Warming previews ({done}/{total})…", animate=False,
-        )
         self._schedule_prefetch_watchdog()
 
     def _schedule_prefetch_watchdog(self) -> None:
@@ -893,17 +1051,20 @@ class DigitalCrateTab(ctk.CTkFrame):
             except Exception:
                 pass
         self._prefetch_watchdog_after = self._safe_after(
-            2000, self._prefetch_status_watchdog,
+            5000, self._prefetch_status_watchdog,
         )
 
     def _prefetch_status_watchdog(self) -> None:
         self._prefetch_watchdog_after = None
         pf = self._ctx.preview_prefetch
         if pf is None:
-            self._clear_warming_status()
             return
+        pf.reap_stale_jobs()
         if pf.is_batch_drained() or pf.is_batch_idle():
-            self._clear_warming_status()
+            self._update_health()
+            return
+        self._update_health()
+        self._schedule_prefetch_watchdog()
 
     def _render_reel_chunked(
         self,
@@ -983,11 +1144,11 @@ class DigitalCrateTab(ctk.CTkFrame):
             self._ctx.publish_toast("MPC export manager unavailable.", "error")
             return
         try:
+            self._ensure_mpc_manager_window()
             mgr.enqueue(suggestion, mode)
         except Exception as e:  # noqa: BLE001
             self._ctx.publish_toast(f"Could not queue MPC export: {e}", "error")
             return
-        self._ensure_mpc_manager_window()
         self._ctx.publish_toast(f"Queued MPC export: {suggestion.display_name}", "info")
 
     def _on_card_queued(self, suggestion: DiscoverySuggestion) -> None:
@@ -1074,6 +1235,11 @@ class DigitalCrateTab(ctk.CTkFrame):
         ]
         if stats.throttle_events:
             parts.append(f"⚠ {stats.throttle_events} throttles")
+        pf = self._ctx.preview_prefetch
+        if pf is not None and not pf.is_batch_idle():
+            done, total = pf.batch_progress()
+            if total > 0 and done < total:
+                parts.append(f"Previews {done}/{total}")
         self._health_label.configure(text="   ·   ".join(parts))
 
     # ── Dig button state ──
@@ -1082,38 +1248,38 @@ class DigitalCrateTab(ctk.CTkFrame):
         t = self._theme
         self._set_filters_enabled(not in_flight)
         if in_flight:
-            self._dig_button.configure(text="Digging…", state="disabled",
-                                       fg_color=t.accent.blue_dim)
+            self._dig_button.configure(
+                text="■   Stop dig", state="normal",
+                fg_color=t.status.warning,
+                hover_color=t.accent.blue_dim,
+            )
             self._set_dig_status(
-                "Spinning the crate — searching Discogs & YouTube Music…",
+                "Searching Discogs…",
                 animate=True,
             )
+            self._schedule_dig_progress_drain()
         else:
             self._refresh_token_gate()
             self._dig_button.configure(text="◆   Dig the crate",
                                        fg_color=t.accent.blue)
 
-    def _clear_warming_status(self) -> None:
-        self._cancel_prefetch_status_updates()
-        if self._prefetch_watchdog_after is not None:
-            try:
-                self.after_cancel(self._prefetch_watchdog_after)
-            except Exception:
-                pass
-            self._prefetch_watchdog_after = None
+    def _clear_dig_status(self) -> None:
         try:
             self._dig_spinner.stop()
             self._dig_status_label.configure(text="")
         except Exception:
             pass
 
-    def _cancel_prefetch_status_updates(self) -> None:
-        if self._prefetch_status_after is not None:
+    def _cancel_prefetch_watchdog(self) -> None:
+        if self._prefetch_watchdog_after is not None:
             try:
-                self.after_cancel(self._prefetch_status_after)
+                self.after_cancel(self._prefetch_watchdog_after)
             except Exception:
                 pass
-            self._prefetch_status_after = None
+            self._prefetch_watchdog_after = None
+
+    def _cancel_prefetch_status_updates(self) -> None:
+        self._cancel_prefetch_watchdog()
 
     def _set_dig_status(self, message: Optional[str], *, animate: bool = True) -> None:
         try:
@@ -1124,7 +1290,7 @@ class DigitalCrateTab(ctk.CTkFrame):
                     self._dig_spinner.stop()
                 self._dig_status_label.configure(text=message)
             else:
-                self._clear_warming_status()
+                self._clear_dig_status()
         except Exception:
             self._log.debug("Could not update dig status", exc_info=True)
 
@@ -1191,12 +1357,16 @@ class DigitalCrateTab(ctk.CTkFrame):
         if scroll is None:
             return
         try:
-            scroll.update_idletasks()
             canvas = getattr(scroll, "_parent_canvas", None)
             if canvas is not None:
-                bbox = canvas.bbox("all")
-                if bbox:
-                    canvas.configure(scrollregion=bbox)
+                def _update() -> None:
+                    try:
+                        bbox = canvas.bbox("all")
+                        if bbox:
+                            canvas.configure(scrollregion=bbox)
+                    except Exception:
+                        pass
+                self.after_idle(_update)
             for card in self._cards:
                 try:
                     card.bind("<MouseWheel>", self._reel_wheel_handler, add="+")
@@ -1266,9 +1436,11 @@ class DigitalCrateTab(ctk.CTkFrame):
         self._mpc_unsub = mgr.subscribe(self._on_mpc_export_event, weak=True)
 
     def _on_prefetch_event(self, event: PrefetchEvent) -> None:
-        if not self._is_alive():
-            return
-        self._safe_after(0, lambda e=event: self._apply_prefetch_event(e))
+        # Prefetch workers call subscribers off-thread — never touch Tk here.
+        try:
+            self._prefetch_inbox.put_nowait(event)
+        except Exception:
+            pass
 
     def _apply_prefetch_event(self, event: PrefetchEvent) -> None:
         try:
@@ -1279,41 +1451,15 @@ class DigitalCrateTab(ctk.CTkFrame):
                 else:
                     card.apply_prefetch_event(event)
             if event.type == PrefetchEventType.BATCH_DRAINED:
-                self._clear_warming_status()
-            elif event.type == PrefetchEventType.STATE_CHANGED:
-                pf = self._ctx.preview_prefetch
-                if pf is not None and (
-                    pf.is_batch_drained() or pf.is_batch_idle()
-                ):
-                    self._clear_warming_status()
-                else:
-                    self._schedule_prefetch_status_update()
+                self._schedule_health_update()
         except Exception:
             self._log.exception("Prefetch UI update failed")
 
-    def _schedule_prefetch_status_update(self) -> None:
-        if self._prefetch_status_after is not None:
-            return
-        self._prefetch_status_after = self._safe_after(
-            250, self._update_prefetch_status,
-        )
-
-    def _update_prefetch_status(self) -> None:
-        self._prefetch_status_after = None
-        pf = self._ctx.preview_prefetch
-        if pf is None:
-            self._clear_warming_status()
-            return
-        if pf.is_batch_drained() or pf.is_batch_idle():
-            self._clear_warming_status()
-            return
-        done, total = pf.batch_progress()
-        self._set_dig_status(
-            f"Warming previews ({done}/{total})…", animate=False,
-        )
-
     def _on_mpc_export_event(self, event) -> None:
-        self._safe_after(0, lambda e=event: self._apply_mpc_export_event(e))
+        try:
+            self._mpc_inbox.put_nowait(event)
+        except Exception:
+            pass
 
     def _apply_mpc_export_event(self, event) -> None:
         card = self._video_to_card.get(event.video_id)
@@ -1325,8 +1471,7 @@ class DigitalCrateTab(ctk.CTkFrame):
             self._mpc_manager_window = MpcExportManagerWindow(
                 self.winfo_toplevel(), self._ctx,
             )
-        else:
-            self._mpc_manager_window.lift_window()
+        self._mpc_manager_window.lift_window()
         return self._mpc_manager_window
 
 
@@ -1380,12 +1525,12 @@ class _MpcModePopover(ctk.CTkFrame):
         buttons = ctk.CTkFrame(self, fg_color="transparent")
         buttons.grid(row=4, column=0, sticky="e", padx=t.space.md, pady=t.space.sm)
         ctk.CTkButton(
-            buttons, text="Cancel", command=on_cancel,
-            **style_ghost_button(t), width=80, height=28,
+            buttons, text="Cancel", command=on_cancel, width=80,
+            **{**style_ghost_button(t), "height": 28},
         ).pack(side="right")
         ctk.CTkButton(
-            buttons, text="Queue export", command=self._confirm,
-            **style_primary_button(t), width=110, height=28,
+            buttons, text="Queue export", command=self._confirm, width=110,
+            **{**style_primary_button(t), "height": 28},
         ).pack(side="right", padx=(0, t.space.sm))
 
     def _confirm(self) -> None:
@@ -1551,7 +1696,7 @@ class _ReelCard(ctk.CTkFrame):
             PrefetchState.DOWNLOADING: "Fetching…",
             PrefetchState.DECODING: "Decoding…",
             PrefetchState.READY: "Ready",
-            PrefetchState.FAILED: "Preview failed",
+            PrefetchState.FAILED: "Tap Preview",
             PrefetchState.CANCELLED: "",
         }
         self._set_prefetch_chip(labels.get(state, ""), state)
@@ -1574,7 +1719,7 @@ class _ReelCard(ctk.CTkFrame):
         elif event.type == PrefetchEventType.STATE_CHANGED:
             msg = event.message or {
                 PrefetchState.READY: "Ready",
-                PrefetchState.FAILED: "Preview failed",
+                PrefetchState.FAILED: "Tap Preview",
                 PrefetchState.DOWNLOADING: "Fetching…",
                 PrefetchState.DECODING: "Decoding…",
             }.get(event.state, "")
@@ -1662,7 +1807,12 @@ class _ReelCard(ctk.CTkFrame):
         if pf is not None:
             cached = pf.get_decoded(vid)
             if cached is not None:
-                self._show_preview_data(cached, full=False)
+                player = self._ensure_player()
+                player.grid()
+                player.set_loading("Loading preview…")
+                self._safe_after(
+                    0, lambda d=cached: self._show_preview_data(d, full=False),
+                )
                 return
             state = pf.get_state(vid)
             if state in (
@@ -1720,9 +1870,17 @@ class _ReelCard(ctk.CTkFrame):
         ).start()
 
     def _preview_worker(self, *, full: bool) -> None:
+        import time as time_mod
+        last_progress_at = 0.0
+
         def on_progress(pct: float, msg: str) -> None:
             if self._cancel_event.is_set():
                 return
+            nonlocal last_progress_at
+            now = time_mod.monotonic()
+            if now - last_progress_at < 0.2:
+                return
+            last_progress_at = now
             self._safe_after(0, lambda m=msg: self._on_preview_progress(m))
 
         try:
@@ -1747,6 +1905,13 @@ class _ReelCard(ctk.CTkFrame):
             self._set_prefetch_chip(message, PrefetchState.DOWNLOADING)
 
     def _show_preview_data(self, data, *, full: bool) -> None:
+        if self._cancel_event.is_set():
+            return
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
         player = self._ensure_player()
         if full:
             self._full_preview_loading = False
@@ -1756,6 +1921,21 @@ class _ReelCard(ctk.CTkFrame):
         if self._preview_btn is not None:
             self._preview_btn.pack_forget()
             self._preview_btn.grid_remove()
+        self._safe_after(50, self._request_scroll_refresh)
+
+    def _request_scroll_refresh(self) -> None:
+        node = self
+        for _ in range(10):
+            node = getattr(node, "master", None)
+            if node is None:
+                return
+            refresh = getattr(node, "_refresh_reel_scroll", None)
+            if callable(refresh):
+                try:
+                    refresh()
+                except Exception:
+                    pass
+                return
 
     def _on_preview_error(self, error: Exception, *, full: bool = False) -> None:
         if full:

@@ -89,6 +89,33 @@ class PreviewPrefetchSmokeTest(unittest.TestCase):
             state = self._service.get_state("slowvid")
             self.assertIn(state, (PrefetchState.CANCELLED, PrefetchState.FAILED))
 
+    def test_batch_progress_counts_terminal_states(self) -> None:
+        with self._service._lock:
+            self._service._batch_ids = ["a", "b"]
+            self._service._entries["a"] = __import__(
+                "core.preview_prefetch", fromlist=["_PrefetchEntry"],
+            )._PrefetchEntry(video_id="a", state=PrefetchState.READY)
+            self._service._entries["b"] = __import__(
+                "core.preview_prefetch", fromlist=["_PrefetchEntry"],
+            )._PrefetchEntry(video_id="b", state=PrefetchState.FAILED)
+        self.assertEqual(self._service.batch_progress(), (2, 2))
+
+    def test_reap_stale_jobs(self) -> None:
+        import time as time_mod
+        with self._service._lock:
+            self._service._batch_ids = ["stale"]
+            entry = __import__(
+                "core.preview_prefetch", fromlist=["_PrefetchEntry"],
+            )._PrefetchEntry(
+                video_id="stale",
+                state=PrefetchState.DOWNLOADING,
+                started_at=time_mod.monotonic() - 120.0,
+            )
+            self._service._entries["stale"] = entry
+        reaped = self._service.reap_stale_jobs(timeout_s=90.0)
+        self.assertEqual(reaped, 1)
+        self.assertEqual(self._service.get_state("stale"), PrefetchState.FAILED)
+
 
 if __name__ == "__main__":
     unittest.main()

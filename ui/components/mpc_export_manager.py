@@ -5,6 +5,7 @@ Single minimizable window for all Digital Crate MPC exports.
 """
 from __future__ import annotations
 
+import queue
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
@@ -98,9 +99,9 @@ class _MpcExportRow(ctk.CTkFrame):
         self._bar.set(0.0)
 
         self._cancel_btn = ctk.CTkButton(
-            self, text="Cancel", width=72, height=28,
+            self, text="Cancel",
             command=lambda: on_cancel(job_id),
-            **style_ghost_button(t),
+            **{**style_ghost_button(t), "width": 72, "height": 28},
         )
         self._cancel_btn.grid(row=2, column=0, sticky="e", padx=t.space.md,
                               pady=(0, t.space.sm))
@@ -147,19 +148,88 @@ class MpcExportManagerWindow(ctk.CTkToplevel):
         self._mini_bar: Optional[ctk.CTkFrame] = None
         self._summary_label: Optional[ctk.CTkLabel] = None
         self._dest_label: Optional[ctk.CTkLabel] = None
+        self._empty_label: Optional[ctk.CTkLabel] = None
+        self._event_inbox: queue.Queue[MpcExportEvent] = queue.Queue()
+        self._drain_after: Optional[str] = None
+        self._progress_latest: dict[str, MpcExportEvent] = {}
 
         self.title("MPC Exports")
-        self.configure(fg_color=t.surface.base)
+        self.configure(fg_color=t.surface.raised)
         self.resizable(False, False)
         self.attributes("-topmost", False)
 
         self._build()
+        mgr = ctx.mpc_export_manager
+        self._unsub = (
+            mgr.subscribe(self._on_event, weak=True)
+            if mgr is not None else (lambda: None)
+        )
+        self._hydrate_from_manager()
         self._position_bottom_right()
         self._refresh_summary()
-        self._unsub = ctx.mpc_export_manager.subscribe(
-            self._on_event, weak=True,
-        )
+        self._refresh_empty_state()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._schedule_event_drain()
+        try:
+            self.deiconify()
+            self.lift()
+        except Exception:
+            pass
+
+    def _is_alive(self) -> bool:
+        try:
+            return bool(self.winfo_exists())
+        except Exception:
+            return False
+
+    def _schedule_event_drain(self) -> None:
+        if not self._is_alive():
+            return
+        if self._drain_after is not None:
+            return
+        self._drain_after = self.after(33, self._drain_event_inbox)
+
+    def _stop_event_drain(self) -> None:
+        if self._drain_after is not None:
+            try:
+                self.after_cancel(self._drain_after)
+            except Exception:
+                pass
+            self._drain_after = None
+        while True:
+            try:
+                self._event_inbox.get_nowait()
+            except queue.Empty:
+                break
+        self._progress_latest.clear()
+
+    def _drain_event_inbox(self) -> None:
+        self._drain_after = None
+        if not self._is_alive():
+            return
+        processed = 0
+        while processed < 48:
+            try:
+                event = self._event_inbox.get_nowait()
+            except queue.Empty:
+                break
+            if event.type == MpcExportEventType.PROGRESS:
+                self._progress_latest[event.job_id] = event
+            else:
+                self._flush_progress_updates()
+                self._apply_event_ui(event)
+            processed += 1
+        self._flush_progress_updates()
+        if self._is_alive():
+            self._schedule_event_drain()
+
+    def _flush_progress_updates(self) -> None:
+        if not self._progress_latest:
+            return
+        latest = self._progress_latest
+        self._progress_latest = {}
+        for event in latest.values():
+            self._apply_event_ui(event)
 
     def lift_window(self) -> None:
         if self._minimized:
@@ -179,7 +249,6 @@ class MpcExportManagerWindow(ctk.CTkToplevel):
             self, fg_color=t.surface.elevated,
             corner_radius=t.radius.md, height=self._MINI_HEIGHT,
         )
-        self._mini_bar.pack(fill="x", side="bottom", padx=t.space.sm, pady=t.space.sm)
         self._mini_bar.pack_propagate(False)
         self._mini_bar.bind("<Button-1>", lambda _e: self._restore())
 
@@ -192,12 +261,12 @@ class MpcExportManagerWindow(ctk.CTkToplevel):
         self._summary_label.bind("<Button-1>", lambda _e: self._restore())
 
         ctk.CTkButton(
-            self._mini_bar, text="▲", width=32, height=28,
-            command=self._restore, **style_ghost_button(t),
+            self._mini_bar, text="▲",
+            command=self._restore,
+            **{**style_ghost_button(t), "width": 32, "height": 28},
         ).pack(side="right", padx=(0, t.space.xs))
-        self._mini_bar.pack_forget()
 
-        self._body = ctk.CTkFrame(self, fg_color="transparent")
+        self._body = ctk.CTkFrame(self, fg_color=t.surface.raised)
         self._body.pack(fill="both", expand=True, padx=t.space.lg, pady=t.space.lg)
         body = self._body
         body.grid_columnconfigure(0, weight=1)
@@ -223,25 +292,37 @@ class MpcExportManagerWindow(ctk.CTkToplevel):
         btn_row = ctk.CTkFrame(header, fg_color="transparent")
         btn_row.grid(row=0, column=1, rowspan=2, sticky="ne")
         ctk.CTkButton(
-            btn_row, text="—", width=32, height=28,
-            command=self._minimize, **style_ghost_button(t),
+            btn_row, text="—",
+            command=self._minimize,
+            **{**style_ghost_button(t), "width": 32, "height": 28},
         ).pack(side="left", padx=(0, t.space.xs))
         ctk.CTkButton(
-            btn_row, text="Clear finished", width=110, height=28,
-            command=self._clear_finished, **style_secondary_button(t),
+            btn_row, text="Clear finished",
+            command=self._clear_finished,
+            **{**style_secondary_button(t), "width": 110, "height": 28},
         ).pack(side="left")
 
         self._list = ctk.CTkScrollableFrame(
-            body, fg_color=t.surface.app,
+            body, fg_color=t.surface.elevated,
             corner_radius=t.radius.md,
             height=280,
         )
         self._list.grid(row=2, column=0, sticky="nsew", pady=(t.space.sm, 0))
         self._list.grid_columnconfigure(0, weight=1)
 
+        self._empty_label = ctk.CTkLabel(
+            self._list,
+            text="No exports in the queue.\n"
+                 "Use MPC Workflow on a reel card, then Queue export.",
+            text_color=t.text.muted,
+            font=t.font.caption,
+            justify="center",
+        )
+        self._empty_label.grid(row=0, column=0, sticky="ew", pady=t.space.xl)
+
         ctk.CTkButton(
             body, text="Close", command=self._on_close,
-            **style_secondary_button(t), width=100,
+            **{**style_secondary_button(t), "width": 100},
         ).grid(row=3, column=0, sticky="e", pady=(t.space.md, 0))
 
     def _truncate_path(self, path: Path, max_len: int = 42) -> str:
@@ -266,28 +347,111 @@ class MpcExportManagerWindow(ctk.CTkToplevel):
         except Exception:
             pass
 
+    def _hydrate_from_manager(self) -> None:
+        """Replay in-flight jobs — subscribe happens after first enqueue."""
+        mgr = self._ctx.mpc_export_manager
+        if mgr is None:
+            return
+        for job in mgr.list_jobs():
+            self._ensure_row(
+                job.job_id,
+                job.suggestion.display_name,
+                job.mode,
+            )
+            row = self._rows[job.job_id]
+            if job.state == "queued":
+                row._status.configure(text=job.message or "Queued")
+            elif job.state == "running":
+                row.apply_event(MpcExportEvent(
+                    MpcExportEventType.PROGRESS,
+                    job.job_id,
+                    job.suggestion.youtube_video_id,
+                    display_name=job.suggestion.display_name,
+                    mode=job.mode,
+                    message=job.message or "Working…",
+                    percent=job.percent,
+                ))
+            elif job.state == "completed":
+                row.apply_event(MpcExportEvent(
+                    MpcExportEventType.COMPLETED,
+                    job.job_id,
+                    job.suggestion.youtube_video_id,
+                    display_name=job.suggestion.display_name,
+                    mode=job.mode,
+                    track_dir=job.track_dir,
+                ))
+            elif job.state == "failed":
+                row.apply_event(MpcExportEvent(
+                    MpcExportEventType.FAILED,
+                    job.job_id,
+                    job.suggestion.youtube_video_id,
+                    display_name=job.suggestion.display_name,
+                    mode=job.mode,
+                    error_message=job.error_message or "Failed",
+                ))
+            elif job.state == "cancelled":
+                row.apply_event(MpcExportEvent(
+                    MpcExportEventType.CANCELLED,
+                    job.job_id,
+                    job.suggestion.youtube_video_id,
+                    display_name=job.suggestion.display_name,
+                    mode=job.mode,
+                ))
+
+    def _ensure_row(
+        self, job_id: str, display_name: str, mode: MpcExportMode,
+    ) -> None:
+        if job_id in self._rows:
+            return
+        row = _MpcExportRow(
+            self._list,
+            self._theme,
+            job_id=job_id,
+            display_name=display_name,
+            mode=mode,
+            on_cancel=self._cancel_job,
+        )
+        row.grid(
+            row=len(self._rows), column=0, sticky="ew",
+            pady=(0, self._theme.space.sm),
+        )
+        self._rows[job_id] = row
+        self._refresh_empty_state()
+
+    def _refresh_empty_state(self) -> None:
+        if self._empty_label is None:
+            return
+        if self._rows:
+            self._empty_label.grid_remove()
+        else:
+            self._empty_label.grid(row=0, column=0, sticky="ew", pady=self._theme.space.xl)
+
     def _on_event(self, event: MpcExportEvent) -> None:
-        self.after(0, lambda e=event: self._apply_event_ui(e))
+        """Called from MPC worker threads — queue only, never touch Tk here."""
+        try:
+            self._event_inbox.put_nowait(event)
+        except queue.Full:
+            pass
 
     def _apply_event_ui(self, event: MpcExportEvent) -> None:
+        if not self._is_alive():
+            return
         if event.type == MpcExportEventType.ENQUEUED:
-            if event.job_id not in self._rows:
-                row = _MpcExportRow(
-                    self._list,
-                    self._theme,
-                    job_id=event.job_id,
-                    display_name=event.display_name,
-                    mode=event.mode,
-                    on_cancel=self._cancel_job,
-                )
-                row.grid(
-                    row=len(self._rows), column=0, sticky="ew",
-                    pady=(0, self._theme.space.sm),
-                )
-                self._rows[event.job_id] = row
+            self._ensure_row(event.job_id, event.display_name, event.mode)
         elif event.job_id in self._rows:
             self._rows[event.job_id].apply_event(event)
+        if event.type == MpcExportEventType.COMPLETED:
+            self._ctx.publish_toast(
+                f"MPC export ready: {event.display_name}",
+                "success",
+            )
+        elif event.type == MpcExportEventType.FAILED:
+            self._ctx.publish_toast(
+                event.error_message or f"MPC export failed: {event.display_name}",
+                "error",
+            )
         self._refresh_summary()
+        self._refresh_empty_state()
 
     def _cancel_job(self, job_id: str) -> None:
         if self._ctx.mpc_export_manager is not None:
@@ -310,6 +474,7 @@ class MpcExportManagerWindow(ctk.CTkToplevel):
                 except Exception:
                     pass
         self._repack_rows()
+        self._refresh_empty_state()
 
     def _repack_rows(self) -> None:
         for i, row in enumerate(self._rows.values()):
@@ -353,10 +518,12 @@ class MpcExportManagerWindow(ctk.CTkToplevel):
 
     def _on_close(self) -> None:
         mgr = self._ctx.mpc_export_manager
-        running, queued = (0, 0) if mgr is None else mgr.counts()
-        if running or queued:
-            self._minimize()
-            return
+        if mgr is not None:
+            running, queued = mgr.counts()
+            if running or queued:
+                self._minimize()
+                return
+        self._stop_event_drain()
         try:
             self._unsub()
         except Exception:
@@ -364,6 +531,7 @@ class MpcExportManagerWindow(ctk.CTkToplevel):
         self.destroy()
 
     def destroy(self) -> None:  # type: ignore[override]
+        self._stop_event_drain()
         try:
             self._unsub()
         except Exception:

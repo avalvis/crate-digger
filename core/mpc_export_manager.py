@@ -100,6 +100,8 @@ class MpcExportManager:
 
         self._subscribers: list[Callable[[MpcExportEvent], None]] = []
         self._weak_subs: list[weakref.WeakMethod] = []
+        self._progress_throttle: dict[str, float] = {}
+        self._PROGRESS_MIN_INTERVAL = 0.25
 
     # ── Lifecycle ──
 
@@ -174,12 +176,14 @@ class MpcExportManager:
         if not vid:
             raise ValueError("Suggestion has no YouTube video id.")
 
+        pending: list[MpcExportEvent] = []
+        job_id: str
         with self._lock:
             existing_id = self._video_active.get(vid)
             if existing_id:
                 job = self._jobs.get(existing_id)
                 if job and job.state in ("queued", "running"):
-                    self._publish(
+                    pending.append(
                         MpcExportEvent(
                             MpcExportEventType.ENQUEUED,
                             existing_id,
@@ -188,29 +192,34 @@ class MpcExportManager:
                             mode=job.mode,
                         ),
                     )
-                    return existing_id
-
-            job_id = uuid.uuid4().hex[:12]
-            job = _MpcJob(
-                job_id=job_id,
-                suggestion=suggestion,
-                mode=mode,
-            )
-            self._jobs[job_id] = job
-            self._video_active[vid] = job_id
-            self._queue.put(job_id)
-            self._publish(
-                MpcExportEvent(
-                    MpcExportEventType.ENQUEUED,
-                    job_id,
-                    vid,
-                    display_name=suggestion.display_name,
+                    job_id = existing_id
+                else:
+                    existing_id = None
+            if not existing_id:
+                job_id = uuid.uuid4().hex[:12]
+                job = _MpcJob(
+                    job_id=job_id,
+                    suggestion=suggestion,
                     mode=mode,
-                ),
-            )
+                )
+                self._jobs[job_id] = job
+                self._video_active[vid] = job_id
+                self._queue.put(job_id)
+                pending.append(
+                    MpcExportEvent(
+                        MpcExportEventType.ENQUEUED,
+                        job_id,
+                        vid,
+                        display_name=suggestion.display_name,
+                        mode=mode,
+                    ),
+                )
+        for event in pending:
+            self._publish(event)
         return job_id
 
     def cancel_job(self, job_id: str) -> None:
+        pending: Optional[MpcExportEvent] = None
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
@@ -218,15 +227,15 @@ class MpcExportManager:
             job.cancel_event.set()
             if job.state == "queued":
                 job.state = "cancelled"
-                self._publish(
-                    MpcExportEvent(
-                        MpcExportEventType.CANCELLED,
-                        job_id,
-                        job.suggestion.youtube_video_id,
-                        display_name=job.suggestion.display_name,
-                        mode=job.mode,
-                    ),
+                pending = MpcExportEvent(
+                    MpcExportEventType.CANCELLED,
+                    job_id,
+                    job.suggestion.youtube_video_id,
+                    display_name=job.suggestion.display_name,
+                    mode=job.mode,
                 )
+        if pending is not None:
+            self._publish(pending)
 
     def get_job_for_video(self, video_id: str) -> Optional[_MpcJob]:
         vid = (video_id or "").strip()
@@ -401,6 +410,19 @@ class MpcExportManager:
                 )
 
     def _publish(self, event: MpcExportEvent) -> None:
+        if event.type == MpcExportEventType.PROGRESS:
+            now = time.monotonic()
+            last = self._progress_throttle.get(event.job_id, 0.0)
+            if now - last < self._PROGRESS_MIN_INTERVAL:
+                return
+            self._progress_throttle[event.job_id] = now
+        elif event.type in (
+            MpcExportEventType.COMPLETED,
+            MpcExportEventType.FAILED,
+            MpcExportEventType.CANCELLED,
+        ):
+            self._progress_throttle.pop(event.job_id, None)
+
         with self._lock:
             strong = list(self._subscribers)
             alive: list[Callable[[MpcExportEvent], None]] = []

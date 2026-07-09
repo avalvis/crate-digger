@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
@@ -219,6 +221,9 @@ class CrateDiggerApp:
         self._content_host: Optional[ctk.CTkFrame] = None
         self._queue_status_label: Optional[ctk.CTkLabel] = None
         self._toast_layer: Optional[ToastLayer] = None
+        self._shutting_down = False
+        self._shutdown_done = threading.Event()
+        self._shutdown_deadline = 0.0
 
         self._build_layout()
         self._show_root_window()
@@ -260,49 +265,163 @@ class CrateDiggerApp:
         self._root.mainloop()
 
     def shutdown(self) -> None:
-        self._log.info("Shutting down…")
+        """Synchronous shutdown — used by tests and programmatic exit."""
+        if self._shutting_down:
+            self._shutdown_done.wait(timeout=12.0)
+            try:
+                if self._root.winfo_exists():
+                    self._finalize_shutdown()
+            except Exception:
+                pass
+            return
+        self._shutting_down = True
+        self._shutdown_done.clear()
         try:
             self._persist_window_state()
         except Exception:
             self._log.exception("Could not persist window state")
         try:
-            if self._toast_layer is not None:
-                self._toast_layer.clear()
+            self._bridge.stop()
+        except Exception:
+            self._log.exception("Error stopping UI event bridge")
+        self._cancel_active_tab_work()
+        try:
+            self._root.withdraw()
         except Exception:
             pass
+        self._shutdown_services()
+        self._finalize_shutdown()
+
+    def _on_close_request(self) -> None:
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+        self._shutdown_done.clear()
+        self._shutdown_deadline = time.monotonic() + 8.0
+        try:
+            self._root.protocol("WM_DELETE_WINDOW", lambda: None)
+        except Exception:
+            pass
+        try:
+            self._persist_window_state()
+        except Exception:
+            self._log.exception("Could not persist window state")
         try:
             self._bridge.stop()
         except Exception:
             self._log.exception("Error stopping UI event bridge")
+        self._cancel_active_tab_work()
         try:
-            self._queue.shutdown(timeout=5.0, cancel_in_flight=True)
+            self._root.withdraw()
         except Exception:
-            self._log.exception("Error shutting down queue manager")
+            pass
+        threading.Thread(
+            target=self._shutdown_services,
+            name="app-shutdown",
+            daemon=True,
+        ).start()
+        self._schedule_shutdown_finalize()
+
+    def _shutdown_services(self) -> None:
+        """Blocking service teardown — runs off the Tk thread."""
         try:
-            if self._mpc_export_manager is not None:
-                self._mpc_export_manager.shutdown(cancel_pending=True)
-        except Exception:
-            self._log.exception("Error shutting down MPC export manager")
+            self._log.info("Shutting down…")
+            try:
+                self._queue.shutdown(timeout=3.0, cancel_in_flight=True)
+            except Exception:
+                self._log.exception("Error shutting down queue manager")
+            try:
+                if self._mpc_export_manager is not None:
+                    self._mpc_export_manager.shutdown(cancel_pending=True)
+            except Exception:
+                self._log.exception("Error shutting down MPC export manager")
+            try:
+                if self._preview_prefetch is not None:
+                    self._preview_prefetch.shutdown(cancel_pending=True)
+            except Exception:
+                self._log.exception("Error shutting down preview prefetch")
+            try:
+                self._db.close()
+            except Exception:
+                self._log.exception("Error closing database")
+        finally:
+            self._shutdown_done.set()
+
+    def _schedule_shutdown_finalize(self) -> None:
+        if self._shutdown_done.is_set() or time.monotonic() >= self._shutdown_deadline:
+            if not self._shutdown_done.is_set():
+                self._log.warning("Shutdown timed out; forcing exit")
+            self._finalize_shutdown()
+            return
         try:
-            if self._preview_prefetch is not None:
-                self._preview_prefetch.shutdown(cancel_pending=True)
-        except Exception:
-            self._log.exception("Error shutting down preview prefetch")
+            if not self._root.winfo_exists():
+                return
+            self._root.after(50, self._schedule_shutdown_finalize)
+        except tk.TclError:
+            pass
+
+    def _finalize_shutdown(self) -> None:
+        """Last-mile Tk teardown — must run on the Tk thread."""
         try:
-            self._db.close()
+            if self._toast_layer is not None:
+                self._toast_layer.clear()
         except Exception:
-            self._log.exception("Error closing database")
+            pass
+        self._close_auxiliary_windows()
         try:
             self._cancel_pending_tk_after_callbacks()
         except Exception:
             self._log.exception("Error canceling pending Tk callbacks")
         try:
+            self._root.quit()
+        except Exception:
+            pass
+        try:
             self._root.destroy()
         except Exception:
             pass
 
-    def _on_close_request(self) -> None:
-        self.shutdown()
+    def _cancel_active_tab_work(self) -> None:
+        tab = self._built_tabs.get("digital_crate")
+        if tab is None:
+            return
+        try:
+            if getattr(tab, "_digging", False):
+                tab._cancel_dig()
+        except Exception:
+            self._log.exception("Error canceling active dig")
+
+    def _close_auxiliary_windows(self) -> None:
+        tab = self._built_tabs.get("digital_crate")
+        if tab is not None:
+            try:
+                win = getattr(tab, "_mpc_manager_window", None)
+                if win is not None:
+                    try:
+                        if win.winfo_exists():
+                            win._stop_event_drain()
+                            try:
+                                win._unsub()
+                            except Exception:
+                                pass
+                            win.destroy()
+                    except tk.TclError:
+                        pass
+                    tab._mpc_manager_window = None
+            except Exception:
+                self._log.exception("Error closing MPC export window")
+        self._destroy_stray_toplevels()
+
+    def _destroy_stray_toplevels(self) -> None:
+        try:
+            for child in self._root.winfo_children():
+                try:
+                    if child.winfo_class() in ("Toplevel", "CTkToplevel"):
+                        child.destroy()
+                except tk.TclError:
+                    pass
+        except tk.TclError:
+            pass
 
     def _persist_window_state(self) -> None:
         maximized = self._is_window_maximized()
