@@ -4,21 +4,18 @@ core/mpc_export.py
 Crate Digger — Digital Crate → MPC Sample Workflow
 
 One-click path from a Digital Crate discovery straight to an MPC-ready
-sample folder: reuse (or fetch) the source audio, split it into stems,
-convert each stem to MPC-native PCM WAV, and file them under a single
-per-track folder. This deliberately bypasses the Vault entirely —
-nothing here touches vault.db or the ingestion pipeline; it's a
-lighter, sample-digging-focused sibling to "Queue it".
+sample folder: reuse (or fetch) the source audio, optionally split into
+stems, and convert to MPC-native PCM WAV under a per-track folder.
 
     <destination_root>/<Artist - Title>/
-        vocals.wav
+        original.wav          (when song and/or both)
+        vocals.wav            (when stems and/or both)
         drums.wav
         bass.wav
         other.wav
 
-Zero UI ties. Callers are expected to invoke `export_sample_to_mpc`
-from a background thread, matching the rest of the app's worker-thread
-conventions (see ui/tabs/digital_crate.py's _ReelCard).
+Zero UI ties. Callers invoke `export_sample_to_mpc` from a background
+thread (see ui/tabs/digital_crate.py).
 """
 from __future__ import annotations
 
@@ -29,6 +26,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -43,6 +41,15 @@ from utils.paths import sanitize_filename_component
 # (htdemucs_ft runs four models back-to-back on CPU).
 MPC_WORKFLOW_STEM_MODEL = StemModel.HTDEMUCS
 MPC_WORKFLOW_MAX_SECONDS = 120.0
+_ORIGINAL_WAV_STEM = "original"
+
+
+class MpcExportMode(str, Enum):
+  """What to write into the MPC sample folder."""
+
+  SONG = "song"    # full track as original.wav
+  STEMS = "stems"  # trimmed stem split only
+  BOTH = "both"    # full original.wav + trimmed stems
 
 
 # ─── Public types ────────────────────────────────────────────────────
@@ -51,7 +58,8 @@ MPC_WORKFLOW_MAX_SECONDS = 120.0
 @dataclass(slots=True, frozen=True)
 class MpcSampleResult:
     track_dir: Path
-    stems: dict[str, Path]  # {'vocals': Path, 'drums': Path, ...}
+    stems: dict[str, Path]           # stem name → wav path
+    original: Optional[Path] = None  # full-track original.wav, if exported
 
 
 # ─── Public exceptions ───────────────────────────────────────────────
@@ -78,6 +86,7 @@ def export_sample_to_mpc(
     preview: PreviewService,
     stem_separator: StemSeparator,
     exporter: MPCExporter,
+    mode: MpcExportMode = MpcExportMode.STEMS,
     ffmpeg_path: Optional[str] = None,
     stem_model: StemModel = MPC_WORKFLOW_STEM_MODEL,
     max_duration_seconds: float = MPC_WORKFLOW_MAX_SECONDS,
@@ -86,18 +95,17 @@ def export_sample_to_mpc(
     logger: Optional[logging.Logger] = None,
 ) -> MpcSampleResult:
     """
-    Download (or reuse a cached preview), split into stems, convert to
-    MPC-native WAV, and file under `destination_root/<Artist - Title>/`.
+    Download (or reuse cached audio), then export per `mode`:
 
-    `progress_callback(stage_label, percent_0_100)` reports coarse
-    overall progress across the three phases (fetch / separate / convert).
-    Raises MpcSampleExportError (or the Cancelled subclass) on failure;
-    never leaves a partial track folder full of stray demucs scratch files
-    behind — the stems staging dir is always cleaned up.
+    • SONG  — full track as ``original.wav`` (no stem separation)
+    • STEMS — opening slice split into stem WAVs (fast CPU path)
+    • BOTH  — full ``original.wav`` plus trimmed stem WAVs
     """
     log = logger or logging.getLogger("cratedigger.mpc_export")
     started = time.monotonic()
     display_name = f"{artist} — {title}"
+    want_song = mode in (MpcExportMode.SONG, MpcExportMode.BOTH)
+    want_stems = mode in (MpcExportMode.STEMS, MpcExportMode.BOTH)
 
     def emit(label: str, pct: float) -> None:
         if progress_callback is not None:
@@ -110,135 +118,144 @@ def export_sample_to_mpc(
         if cancel_event is not None and cancel_event.is_set():
             raise MpcSampleExportCancelledError("Cancelled by user.")
 
-    log.info("MPC export started: %s (video_id=%s)", display_name, video_id)
+    log.info(
+        "MPC export started: %s (video_id=%s, mode=%s)",
+        display_name, video_id, mode.value,
+    )
+
+    track_name = sanitize_filename_component(
+        f"{artist} - {title}", max_length=150,
+    )
+    track_dir = Path(destination_root) / track_name
+    stage_dir = (
+        Path(staging_root) / "mpc_export"
+        / sanitize_filename_component(video_id, max_length=32, fallback="track")
+    )
+    ffmpeg = ffmpeg_path or exporter.ffmpeg_path
+    original_path: Optional[Path] = None
+    stem_files: dict[str, Path] = {}
 
     try:
-        # ── 1. Source audio: reuse the preview cache if we already have it ──
         check_cancel()
-        cached = preview.get_cached_path(video_id)
-        if cached is not None:
-            log.info("MPC export: reusing cached audio for %s (%s)",
-                     display_name, cached)
-            audio_path = cached
-            emit("Using cached audio…", 20.0)
-        else:
-            log.info("MPC export: no cache hit for %s — downloading", display_name)
-            emit("Downloading…", 2.0)
+        emit("Locating audio…", 2.0)
+        audio_path = _resolve_audio(
+            video_id,
+            preview,
+            emit,
+            check_cancel,
+            cancel_event,
+            log,
+            display_name,
+        )
+
+        track_dir.mkdir(parents=True, exist_ok=True)
+
+        if want_song:
+            emit("Converting original…", 15.0 if want_stems else 40.0)
             try:
-                data = preview.fetch(
-                    video_id,
-                    progress_callback=lambda pct, msg: emit(
-                        msg or "Downloading…", pct * 0.2,
+                original_path = _export_original_wav(
+                    audio_path,
+                    track_dir,
+                    stage_dir,
+                    exporter,
+                    emit,
+                    check_cancel,
+                    cancel_event,
+                    progress_end=30.0 if want_stems else 95.0,
+                )
+            finally:
+                if want_stems:
+                    pass  # stage_dir reused for stems below
+                elif stage_dir.exists():
+                    shutil.rmtree(stage_dir, ignore_errors=True)
+            log.info("MPC export: original saved → %s", original_path)
+
+        if want_stems:
+            if stage_dir.exists():
+                shutil.rmtree(stage_dir, ignore_errors=True)
+            stage_dir.mkdir(parents=True, exist_ok=True)
+
+            stem_input = _maybe_trim_audio(
+                audio_path,
+                max_duration_seconds=max_duration_seconds,
+                ffmpeg_path=ffmpeg,
+                work_dir=stage_dir,
+                logger=log,
+            )
+            if stem_input != audio_path:
+                emit("Trimmed for stem split…", 35.0 if want_song else 22.0)
+
+            try:
+                emit("Splitting stems…", 40.0 if want_song else 25.0)
+                stems_started = time.monotonic()
+                stems_result = stem_separator.separate(
+                    stem_input,
+                    stage_dir,
+                    progress_callback=lambda p: emit(
+                        p.message or "Splitting stems…",
+                        (40.0 if want_song else 25.0)
+                        + (p.percent / 100.0) * (45.0 if want_song else 55.0),
+                    ),
+                    cancel_event=cancel_event,
+                    model=stem_model,
+                )
+                log.info(
+                    "MPC export: stems separated for %s in %.1fs (%s)",
+                    display_name, time.monotonic() - stems_started,
+                    ", ".join(sorted(stems_result.stems)),
+                )
+
+                check_cancel()
+
+                for existing in track_dir.glob("*.wav"):
+                    if existing.stem.lower() in stems_result.stems:
+                        try:
+                            existing.unlink()
+                        except OSError:
+                            pass
+
+                emit("Converting stems…", 88.0)
+                convert_started = time.monotonic()
+                export_result = exporter.export_batch(
+                    sources=list(stems_result.stems.values()),
+                    destination_root=track_dir,
+                    flatten=True,
+                    progress_callback=lambda p: emit(
+                        "Converting stems…",
+                        88.0 + (p.overall_percent / 100.0) * 12.0,
                     ),
                     cancel_event=cancel_event,
                 )
-            except PreviewError as e:
-                raise MpcSampleExportError(f"Could not fetch audio: {e}") from e
-            if data.source_path is None:
-                raise MpcSampleExportError(
-                    "Download completed but no source file was cached."
+                log.info(
+                    "MPC export: converted %d/%d stem(s) for %s in %.1fs",
+                    len(export_result.exported),
+                    len(export_result.exported) + len(export_result.failed),
+                    display_name, time.monotonic() - convert_started,
                 )
-            audio_path = data.source_path
-            log.info(
-                "MPC export: download complete for %s in %.1fs",
-                display_name, time.monotonic() - started,
-            )
+            except (StemSeparationError, ExportError) as e:
+                raise MpcSampleExportError(str(e)) from e
+            finally:
+                shutil.rmtree(stage_dir, ignore_errors=True)
 
-        check_cancel()
+            if export_result.failed:
+                names = ", ".join(p.name for p, _ in export_result.failed)
+                raise MpcSampleExportError(f"Could not convert stems: {names}")
 
-        # ── 2. Stem separation into a scratch dir ──
-        track_name = sanitize_filename_component(
-            f"{artist} - {title}", max_length=150,
-        )
-        stage_dir = (
-            Path(staging_root) / "mpc_export"
-            / sanitize_filename_component(video_id, max_length=32, fallback="track")
-        )
-        if stage_dir.exists():
-            shutil.rmtree(stage_dir, ignore_errors=True)
-        stage_dir.mkdir(parents=True, exist_ok=True)
-
-        ffmpeg = ffmpeg_path or exporter.ffmpeg_path
-        stem_input = _maybe_trim_audio(
-            audio_path,
-            max_duration_seconds=max_duration_seconds,
-            ffmpeg_path=ffmpeg,
-            work_dir=stage_dir,
-            logger=log,
-        )
-        if stem_input != audio_path:
-            emit("Trimmed to sample length…", 22.0)
-
-        try:
-            emit("Splitting stems…", 25.0)
-            stems_started = time.monotonic()
-            stems_result = stem_separator.separate(
-                stem_input,
-                stage_dir,
-                progress_callback=lambda p: emit(
-                    p.message or "Splitting stems…",
-                    20.0 + (p.percent / 100.0) * 55.0,
-                ),
-                cancel_event=cancel_event,
-                model=stem_model,
-            )
-            log.info(
-                "MPC export: stems separated for %s in %.1fs (%s)",
-                display_name, time.monotonic() - stems_started,
-                ", ".join(sorted(stems_result.stems)),
-            )
-
-            check_cancel()
-
-            # ── 3. Convert stems to MPC-native WAV in the final track folder ──
-            track_dir = Path(destination_root) / track_name
-            track_dir.mkdir(parents=True, exist_ok=True)
-
-            # Clean up any stems from a prior export of this same track so
-            # re-running doesn't pile up "vocals (2).wav" siblings.
-            for existing in track_dir.glob("*.wav"):
-                if existing.stem.lower() in stems_result.stems:
-                    try:
-                        existing.unlink()
-                    except OSError:
-                        pass
-
-            emit("Converting to WAV…", 80.0)
-            convert_started = time.monotonic()
-            export_result = exporter.export_batch(
-                sources=list(stems_result.stems.values()),
-                destination_root=track_dir,
-                flatten=True,
-                progress_callback=lambda p: emit(
-                    "Converting to WAV…", 80.0 + (p.overall_percent / 100.0) * 20.0,
-                ),
-                cancel_event=cancel_event,
-            )
-            log.info(
-                "MPC export: converted %d/%d stem(s) for %s in %.1fs",
-                len(export_result.exported),
-                len(export_result.exported) + len(export_result.failed),
-                display_name, time.monotonic() - convert_started,
-            )
-        except (StemSeparationError, ExportError) as e:
-            raise MpcSampleExportError(str(e)) from e
-        finally:
-            shutil.rmtree(stage_dir, ignore_errors=True)
-
-        if export_result.failed:
-            names = ", ".join(p.name for p, _ in export_result.failed)
-            raise MpcSampleExportError(f"Could not convert: {names}")
+            stem_files = {
+                f.destination_path.stem.lower(): f.destination_path
+                for f in export_result.exported
+            }
 
         emit("Done", 100.0)
-        stem_files = {
-            f.destination_path.stem.lower(): f.destination_path
-            for f in export_result.exported
-        }
         log.info(
-            "MPC export complete: %s → %s (%.1fs total)",
-            display_name, track_dir, time.monotonic() - started,
+            "MPC export complete: %s → %s (%.1fs, mode=%s)",
+            display_name, track_dir, time.monotonic() - started, mode.value,
         )
-        return MpcSampleResult(track_dir=track_dir, stems=stem_files)
+        return MpcSampleResult(
+            track_dir=track_dir,
+            stems=stem_files,
+            original=original_path,
+        )
 
     except MpcSampleExportCancelledError:
         log.info("MPC export cancelled: %s", display_name)
@@ -249,6 +266,91 @@ def export_sample_to_mpc(
     except Exception as e:
         log.exception("MPC export failed with an unexpected error: %s", display_name)
         raise MpcSampleExportError(str(e)) from e
+
+
+def _resolve_audio(
+    video_id: str,
+    preview: PreviewService,
+    emit: Callable[[str, float], None],
+    check_cancel: Callable[[], None],
+    cancel_event: Optional[threading.Event],
+    log: logging.Logger,
+    display_name: str,
+) -> Path:
+    cached = preview.get_cached_path(video_id)
+    if cached is not None:
+        log.info("MPC export: reusing cached audio for %s (%s)", display_name, cached)
+        emit("Using cached audio…", 12.0)
+        return cached
+
+    log.info("MPC export: no cache hit for %s — downloading", display_name)
+    emit("Downloading…", 5.0)
+    try:
+        data = preview.fetch(
+            video_id,
+            progress_callback=lambda pct, msg: emit(
+                msg or "Downloading…", 5.0 + pct * 0.12,
+            ),
+            cancel_event=cancel_event,
+        )
+    except PreviewError as e:
+        raise MpcSampleExportError(f"Could not fetch audio: {e}") from e
+    check_cancel()
+    if data.source_path is None:
+        raise MpcSampleExportError(
+            "Download completed but no source file was cached."
+        )
+    return data.source_path
+
+
+def _export_original_wav(
+    audio_path: Path,
+    track_dir: Path,
+    stage_dir: Path,
+    exporter: MPCExporter,
+    emit: Callable[[str, float], None],
+    check_cancel: Callable[[], None],
+    cancel_event: Optional[threading.Event],
+    *,
+    progress_end: float,
+) -> Path:
+    """Convert the full source file to ``original.wav`` in ``track_dir``."""
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    staging_copy = stage_dir / f"{_ORIGINAL_WAV_STEM}{audio_path.suffix}"
+    if staging_copy.exists():
+        staging_copy.unlink()
+    shutil.copy2(audio_path, staging_copy)
+
+    final = track_dir / f"{_ORIGINAL_WAV_STEM}.wav"
+    if final.exists():
+        try:
+            final.unlink()
+        except OSError:
+            pass
+
+    check_cancel()
+    export_result = exporter.export_batch(
+        sources=[staging_copy],
+        destination_root=track_dir,
+        flatten=True,
+        progress_callback=lambda p: emit(
+            "Converting original…",
+            15.0 + (p.overall_percent / 100.0) * (progress_end - 15.0),
+        ),
+        cancel_event=cancel_event,
+    )
+    if export_result.failed:
+        names = ", ".join(p.name for p, _ in export_result.failed)
+        raise MpcSampleExportError(f"Could not convert original: {names}")
+    if not export_result.exported:
+        raise MpcSampleExportError("Original conversion produced no output.")
+
+    produced = export_result.exported[0].destination_path
+    if produced.name != final.name:
+        if final.exists():
+            final.unlink()
+        produced.rename(final)
+    return final
 
 
 def _probe_duration(ffmpeg_path: str, source: Path) -> Optional[float]:
@@ -292,7 +394,7 @@ def _maybe_trim_audio(
     work_dir: Path,
     logger: logging.Logger,
 ) -> Path:
-    """Shorten long sources so MPC workflow stays responsive on CPU."""
+    """Shorten long sources so MPC stem separation stays responsive on CPU."""
     if max_duration_seconds is None or max_duration_seconds <= 0:
         return audio_path
 
@@ -316,7 +418,6 @@ def _maybe_trim_audio(
         raise MpcSampleExportError(f"Could not trim audio: {e}") from e
 
     if res.returncode != 0 or not trimmed.exists():
-        # Stream copy can fail on some containers — fall back to re-encode.
         cmd = [
             ffmpeg_path,
             "-y",

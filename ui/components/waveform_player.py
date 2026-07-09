@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 import threading
 import weakref
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import customtkinter as ctk
 import numpy as np
@@ -71,6 +71,8 @@ class WaveformPlayer(ctk.CTkFrame):
         self._finished = False
         self._tick_handle: Optional[str] = None
         self._destroyed = False
+        self._on_load_full: Optional[Callable[[], None]] = None
+        self._full_load_btn: Optional[ctk.CTkButton] = None
 
         # Cached draw geometry
         self._peaks: Optional[np.ndarray] = None
@@ -132,6 +134,22 @@ class WaveformPlayer(ctk.CTkFrame):
         )
         self._time_label.grid(row=0, column=0, sticky="w")
 
+        self._full_load_btn = ctk.CTkButton(
+            info_row,
+            text="Load full track",
+            width=110,
+            height=24,
+            command=self._on_load_full_clicked,
+            fg_color=t.surface.elevated,
+            hover_color=t.surface.raised,
+            text_color=t.accent.blue,
+            border_width=1,
+            border_color=t.border.strong,
+            corner_radius=t.radius.sm,
+            font=t.font.micro,
+        )
+        # Hidden until a partial preview is attached.
+
         # Volume slider
         self._volume_slider = ctk.CTkSlider(
             info_row,
@@ -157,34 +175,48 @@ class WaveformPlayer(ctk.CTkFrame):
         self._teardown_stream()
         self._data = None
         self._peaks = None
+        self._on_load_full = None
         self._playing = False
         self._finished = False
         self._play_btn.configure(state="disabled", text="▶")
         self._time_label.configure(text=message, text_color=self._theme.text.muted)
+        self._hide_full_load_button()
         self._draw_placeholder(message, animated=True)
 
     def set_error(self, message: str) -> None:
         self._teardown_stream()
         self._data = None
         self._peaks = None
+        self._on_load_full = None
         self._play_btn.configure(state="disabled", text="▶")
         self._time_label.configure(
             text=message, text_color=self._theme.status.error
         )
+        self._hide_full_load_button()
         self._draw_placeholder(message)
 
-    def set_preview(self, data: "PreviewData") -> None:
+    def set_preview(
+        self,
+        data: "PreviewData",
+        *,
+        on_load_full: Optional[Callable[[], None]] = None,
+    ) -> None:
         """Attach decoded PCM + peaks and enable the transport."""
         if self._destroyed:
             return
         self._teardown_stream()
         self._data = data
         self._peaks = data.peaks
+        self._on_load_full = on_load_full if data.is_partial else None
         with self._pos_lock:
             self._read_pos = 0
         self._playing = False
         self._finished = False
         self._play_btn.configure(state="normal", text="▶")
+        if data.is_partial and on_load_full is not None:
+            self._show_full_load_button()
+        else:
+            self._hide_full_load_button()
         self._update_time_label()
         self._redraw_waveform()
 
@@ -192,10 +224,26 @@ class WaveformPlayer(ctk.CTkFrame):
         self._teardown_stream()
         self._data = None
         self._peaks = None
+        self._on_load_full = None
         self._playing = False
         self._play_btn.configure(state="disabled", text="▶")
         self._time_label.configure(text="")
+        self._hide_full_load_button()
         self._draw_placeholder("")
+
+    def set_full_loading(self, loading: bool) -> None:
+        """Show loading state on the 'Load full track' control only."""
+        if self._full_load_btn is None:
+            return
+        if loading:
+            self._full_load_btn.configure(state="disabled", text="Loading…")
+            self._time_label.configure(
+                text="Loading full track…",
+                text_color=self._theme.text.muted,
+            )
+        else:
+            self._full_load_btn.configure(state="normal", text="Load full track")
+            self._update_time_label()
 
     def stop(self) -> None:
         """Stop playback (used when another player starts or on hide)."""
@@ -437,10 +485,40 @@ class WaveformPlayer(ctk.CTkFrame):
             return
         total = self._data.duration_seconds
         cur = self._progress_fraction() * total
+        text = f"{self._fmt_time(cur)} / {self._fmt_time(total)}"
+        if self._data.is_partial:
+            text += " · quick"
+            if self._data.full_duration_seconds:
+                text += f" ({self._fmt_time(self._data.full_duration_seconds)} total)"
         self._time_label.configure(
-            text=f"{self._fmt_time(cur)} / {self._fmt_time(total)}",
+            text=text,
             text_color=self._theme.text.secondary,
         )
+
+    def _on_load_full_clicked(self) -> None:
+        if self._on_load_full is None:
+            return
+        self._full_load_btn.configure(state="disabled", text="Loading…")
+        try:
+            self._on_load_full()
+        except Exception:
+            self._full_load_btn.configure(state="normal", text="Load full track")
+
+    def _show_full_load_button(self) -> None:
+        if self._full_load_btn is None:
+            return
+        t = self._theme
+        self._full_load_btn.configure(state="normal", text="Load full track")
+        self._full_load_btn.grid(
+            row=0, column=1, sticky="e", padx=(t.space.sm, t.space.sm),
+        )
+        self._volume_slider.grid(row=0, column=2, sticky="e")
+
+    def _hide_full_load_button(self) -> None:
+        if self._full_load_btn is None:
+            return
+        self._full_load_btn.grid_forget()
+        self._volume_slider.grid(row=0, column=1, sticky="e")
 
     # ── Seeking / volume ──
 

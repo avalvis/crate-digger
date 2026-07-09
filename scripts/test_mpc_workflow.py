@@ -3,8 +3,7 @@
 Run from project root:
     python scripts/test_mpc_workflow.py
 
-Uses a short public YouTube clip, downloads preview audio, splits stems
-with the fast MPC preset, and writes WAVs under a temp folder.
+Uses a short public YouTube clip and exercises SONG, STEMS, and BOTH modes.
 """
 
 from __future__ import annotations
@@ -34,7 +33,7 @@ def main() -> int:
 
     from utils.ffmpeg_setup import provision_ffmpeg
     from core.exporter import MPCExporter
-    from core.mpc_export import export_sample_to_mpc
+    from core.mpc_export import MpcExportMode, export_sample_to_mpc
     from core.preview import PreviewService
     from core.stems import StemModel, StemSeparator
 
@@ -78,40 +77,69 @@ def main() -> int:
         log.info("Fetching preview for %s …", _TEST_VIDEO_ID)
         preview.fetch(_TEST_VIDEO_ID)
 
-        log.info("Running MPC export …")
-        result = export_sample_to_mpc(
-            video_id=_TEST_VIDEO_ID,
-            artist=_TEST_ARTIST,
-            title=_TEST_TITLE,
-            destination_root=dest,
-            staging_root=staging,
-            preview=preview,
-            stem_separator=stems,
-            exporter=exporter,
-            progress_callback=on_progress,
-            logger=log,
-        )
+        for mode in (MpcExportMode.SONG, MpcExportMode.STEMS, MpcExportMode.BOTH):
+            mode_dest = dest / mode.value
+            mode_dest.mkdir(parents=True, exist_ok=True)
+            log.info("Running MPC export (mode=%s) …", mode.value)
+            result = export_sample_to_mpc(
+                video_id=_TEST_VIDEO_ID,
+                artist=_TEST_ARTIST,
+                title=f"{_TEST_TITLE} ({mode.value})",
+                destination_root=mode_dest,
+                staging_root=staging,
+                preview=preview,
+                stem_separator=stems,
+                exporter=exporter,
+                mode=mode,
+                progress_callback=on_progress,
+                logger=log,
+            )
+
+            wavs = sorted(result.track_dir.glob("*.wav"))
+            if mode == MpcExportMode.SONG:
+                if result.original is None or not result.original.exists():
+                    log.error("SONG mode: missing original.wav")
+                    return 1
+                if result.stems:
+                    log.error("SONG mode: unexpected stems %s", list(result.stems))
+                    return 1
+                if len(wavs) != 1 or wavs[0].name != "original.wav":
+                    log.error("SONG mode: expected only original.wav, got %s", wavs)
+                    return 1
+            elif mode == MpcExportMode.STEMS:
+                if result.original is not None:
+                    log.error("STEMS mode: unexpected original %s", result.original)
+                    return 1
+                if len(wavs) < 4:
+                    log.error("STEMS mode: expected 4+ stem WAVs, got %d", len(wavs))
+                    return 1
+            else:
+                if result.original is None or not result.original.exists():
+                    log.error("BOTH mode: missing original.wav")
+                    return 1
+                if len(result.stems) < 4:
+                    log.error("BOTH mode: expected 4+ stems, got %d", len(result.stems))
+                    return 1
+                if not any(w.name == "original.wav" for w in wavs):
+                    log.error("BOTH mode: original.wav not in output folder")
+                    return 1
+
+            for wav in wavs:
+                size = wav.stat().st_size
+                if size < 1000:
+                    log.error("File too small: %s (%d bytes)", wav.name, size)
+                    return 1
+                log.info("  OK  [%s] %s  (%d bytes)", mode.value, wav.name, size)
+
+            log.info("PASS — mode=%s at %s", mode.value, result.track_dir)
+
     except Exception as e:
         log.exception("MPC workflow test failed: %s", e)
         shutil.rmtree(work, ignore_errors=True)
         return 1
 
-    wavs = sorted(result.track_dir.glob("*.wav"))
-    if len(wavs) < 4:
-        log.error("Expected 4 stem WAVs, got %d in %s", len(wavs), result.track_dir)
-        shutil.rmtree(work, ignore_errors=True)
-        return 1
-
-    for wav in wavs:
-        size = wav.stat().st_size
-        if size < 1000:
-            log.error("Stem file too small: %s (%d bytes)", wav.name, size)
-            shutil.rmtree(work, ignore_errors=True)
-            return 1
-        log.info("  OK  %s  (%d bytes)", wav.name, size)
-
-    log.info("PASS — stems at %s", result.track_dir)
     shutil.rmtree(work, ignore_errors=True)
+    log.info("All modes passed.")
     return 0
 
 

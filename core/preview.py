@@ -42,6 +42,9 @@ _PLAYBACK_CHANNELS = 2
 # crisp waveform on a wide card without ballooning memory.
 _DEFAULT_PEAK_BUCKETS = 2000
 
+# Quick preview length — enough to judge a break, fast to download on slow links.
+_QUICK_PREVIEW_SECONDS = 45.0
+
 # YouTube's per-format stream URLs are short-lived and occasionally get
 # rejected with a 403 even though the video itself is perfectly
 # downloadable — re-extracting fresh info (a new signed URL) and trying
@@ -64,6 +67,8 @@ class PreviewData:
     peaks: np.ndarray            # shape (buckets,), float32 in [0, 1]
     duration_seconds: float
     source_path: Optional[Path]  # cached compressed file on disk (reusable)
+    is_partial: bool = False     # True when only the opening slice is loaded
+    full_duration_seconds: Optional[float] = None  # whole track, if known
 
     @property
     def frame_count(self) -> int:
@@ -108,6 +113,7 @@ class PreviewService:
         *,
         target_sr: int = _PLAYBACK_SR,
         peak_buckets: int = _DEFAULT_PEAK_BUCKETS,
+        quick_seconds: float = _QUICK_PREVIEW_SECONDS,
     ) -> None:
         self._ffmpeg = ffmpeg_path
         self._cache_dir = Path(cache_dir)
@@ -115,8 +121,70 @@ class PreviewService:
         self._log = logger or logging.getLogger("cratedigger.preview")
         self._sr = int(target_sr)
         self._peak_buckets = int(peak_buckets)
+        self._quick_seconds = float(quick_seconds)
 
     # ── Public API ──
+
+    def fetch_quick(
+        self,
+        video_id: str,
+        *,
+        progress_callback: Optional[Callable[[float, str], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> PreviewData:
+        """
+        Return a short opening preview (~45s) for fast auditioning.
+
+        Downloads only the first slice when the full file is not cached yet.
+        If the full file is already on disk, decodes just the opening from it.
+        """
+        vid = self._normalize_video_id(video_id)
+        self._emit(progress_callback, 2.0, "Locating stream…")
+
+        full_path = self.get_cached_path(vid)
+        quick_path = self._quick_cache_path(vid)
+        full_duration: Optional[float] = None
+
+        if full_path is not None:
+            self._log.debug("Quick preview from cached full file: %s", full_path)
+            full_duration = self._probe_duration(full_path)
+            self._emit(progress_callback, 55.0, "Decoding quick preview…")
+            source = full_path
+            decode_limit = self._quick_seconds
+        elif quick_path is not None:
+            self._log.debug("Quick preview cache hit: %s", quick_path)
+            self._emit(progress_callback, 55.0, "Using cached quick preview")
+            source = quick_path
+            decode_limit = None
+            full_duration = self._probe_duration_from_info(vid)
+        else:
+            self._emit(progress_callback, 5.0, "Fetching quick preview…")
+            source, full_duration = self._download_quick(
+                vid, progress_callback, cancel_event,
+            )
+            decode_limit = None
+
+        self._check_cancel(cancel_event)
+        self._emit(progress_callback, 70.0, "Decoding audio…")
+        samples = self._decode_to_pcm(source, max_seconds=decode_limit)
+
+        self._check_cancel(cancel_event)
+        self._emit(progress_callback, 92.0, "Building waveform…")
+        peaks = self._compute_peaks(samples)
+        duration = samples.shape[0] / float(self._sr)
+
+        self._emit(progress_callback, 100.0, "Ready")
+        return PreviewData(
+            video_id=vid,
+            samplerate=self._sr,
+            channels=_PLAYBACK_CHANNELS,
+            samples=samples,
+            peaks=peaks,
+            duration_seconds=duration,
+            source_path=source,
+            is_partial=True,
+            full_duration_seconds=full_duration,
+        )
 
     def fetch(
         self,
@@ -159,6 +227,8 @@ class PreviewService:
             peaks=peaks,
             duration_seconds=duration,
             source_path=source,
+            is_partial=False,
+            full_duration_seconds=duration,
         )
 
     def load_file(
@@ -194,15 +264,33 @@ class PreviewService:
             peaks=peaks,
             duration_seconds=duration,
             source_path=path,
+            is_partial=False,
+            full_duration_seconds=duration,
         )
 
     def get_cached_path(self, video_id: str) -> Optional[Path]:
-        """Return a previously-downloaded file for this id, if present."""
+        """Return a previously-downloaded full audio file for this id."""
         vid = self._normalize_video_id(video_id)
         for p in self._cache_dir.glob(f"{vid}.*"):
+            if not p.is_file():
+                continue
+            if p.suffix.lower() == ".part":
+                continue
+            if self._is_quick_cache_path(p):
+                continue
+            return p
+        return None
+
+    def _quick_cache_path(self, video_id: str) -> Optional[Path]:
+        vid = self._normalize_video_id(video_id)
+        for p in self._cache_dir.glob(f"{vid}.quick.*"):
             if p.is_file() and p.suffix.lower() != ".part":
                 return p
         return None
+
+    @staticmethod
+    def _is_quick_cache_path(path: Path) -> bool:
+        return ".quick." in path.name
 
     def clear_cache(self) -> int:
         """Delete all cached preview files. Returns count removed."""
@@ -238,6 +326,137 @@ class PreviewService:
         return removed
 
     # ── Download ──
+
+    def _download_quick(
+        self,
+        vid: str,
+        progress_callback: Optional[Callable[[float, str], None]],
+        cancel_event: Optional[threading.Event],
+    ) -> tuple[Path, Optional[float]]:
+        """Download only the opening slice; returns (path, full_duration_hint)."""
+        import yt_dlp
+        from yt_dlp.utils import DownloadError, ExtractorError
+
+        duration_hint = self._probe_duration_from_info(vid)
+        quick_seconds = self._quick_seconds
+
+        def ranges_callback(_info: dict[str, Any], _ydl: Any) -> list[dict[str, float]]:
+            return [{"start_time": 0.0, "end_time": quick_seconds}]
+
+        def hook(d: dict[str, Any]) -> None:
+            if cancel_event is not None and cancel_event.is_set():
+                raise PreviewCancelledError("Cancelled by user.")
+            if progress_callback is None:
+                return
+            if d.get("status") == "downloading":
+                total = d.get("total_bytes") or d.get("total_bytes_estimate")
+                got = int(d.get("downloaded_bytes") or 0)
+                frac = (got / total) if total else 0.0
+                self._emit(
+                    progress_callback, 5.0 + frac * 50.0, "Fetching quick preview…",
+                )
+
+        opts: dict[str, Any] = {
+            "format": "bestaudio[ext=m4a]/bestaudio/best",
+            "ffmpeg_location": self._ffmpeg,
+            "quiet": True,
+            "no_warnings": True,
+            "no_color": True,
+            "noprogress": True,
+            "noplaylist": True,
+            "overwrites": True,
+            "retries": 3,
+            "outtmpl": {
+                "default": str(self._cache_dir / f"{vid}.quick.%(ext)s"),
+            },
+            "paths": {"home": str(self._cache_dir)},
+            "progress_hooks": [hook],
+            "download_ranges": ranges_callback,
+            "force_keyframes_at_cuts": True,
+        }
+
+        url = self._YT_WATCH.format(vid=vid)
+        info = None
+        last_error: Optional[Exception] = None
+        for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
+            self._check_cancel(cancel_event)
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                last_error = None
+                break
+            except PreviewCancelledError:
+                raise
+            except (DownloadError, ExtractorError) as e:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise PreviewCancelledError("Cancelled by user.") from e
+                last_error = e
+                if attempt < _DOWNLOAD_ATTEMPTS:
+                    self._log.warning(
+                        "Quick preview attempt %d/%d failed for %s (%s); retrying",
+                        attempt, _DOWNLOAD_ATTEMPTS, vid, e,
+                    )
+                    time.sleep(_DOWNLOAD_RETRY_DELAY_SECONDS)
+            except Exception as e:
+                raise PreviewFetchError(f"Unexpected quick fetch error: {e}") from e
+
+        if last_error is not None:
+            raise PreviewFetchError(
+                f"Could not fetch quick preview: {last_error}"
+            ) from last_error
+
+        path = self._locate_quick_download(info, vid)
+        if path is None:
+            raise PreviewFetchError(
+                "Quick preview download completed but no audio file found."
+            )
+        if duration_hint is None and info:
+            duration_hint = info.get("duration")
+            if duration_hint is not None:
+                duration_hint = float(duration_hint)
+        return path, duration_hint
+
+    def _probe_duration_from_info(self, vid: str) -> Optional[float]:
+        """Lightweight metadata probe — no download."""
+        import yt_dlp
+
+        url = self._YT_WATCH.format(vid=vid)
+        opts: dict[str, Any] = {
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "skip_download": True,
+        }
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except Exception:
+            return None
+        if not info:
+            return None
+        dur = info.get("duration")
+        try:
+            return float(dur) if dur is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _locate_quick_download(
+        self, info: Optional[dict[str, Any]], vid: str,
+    ) -> Optional[Path]:
+        candidates: list[Path] = []
+        if info:
+            for rd in info.get("requested_downloads", []) or []:
+                fp = rd.get("filepath") or rd.get("_filename")
+                if fp:
+                    candidates.append(Path(fp))
+            fp = info.get("filepath")
+            if fp:
+                candidates.append(Path(fp))
+        candidates.extend(self._cache_dir.glob(f"{vid}.quick.*"))
+        for p in candidates:
+            if p.is_file() and p.suffix.lower() != ".part":
+                return p
+        return None
 
     def _download(
         self,
@@ -329,12 +548,52 @@ class PreviewService:
         candidates.extend(self._cache_dir.glob(f"{vid}.*"))
         for p in candidates:
             if p.is_file() and p.suffix.lower() != ".part":
+                if self._is_quick_cache_path(p):
+                    continue
                 return p
         return None
 
+    def _probe_duration(self, source: Path) -> Optional[float]:
+        ffprobe = self._derive_ffprobe_path()
+        if ffprobe is None:
+            return None
+        cmd = [
+            ffprobe,
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(source),
+        ]
+        try:
+            res = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=15,
+                **self._subprocess_kwargs(),
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+        if res.returncode != 0:
+            return None
+        try:
+            return float((res.stdout or "").strip())
+        except ValueError:
+            return None
+
+    def _derive_ffprobe_path(self) -> Optional[str]:
+        import shutil
+
+        ffmpeg_p = Path(self._ffmpeg)
+        candidate = ffmpeg_p.with_name(
+            "ffprobe.exe" if sys.platform == "win32" else "ffprobe"
+        )
+        if candidate.exists():
+            return str(candidate)
+        return shutil.which("ffprobe")
+
     # ── Decode ──
 
-    def _decode_to_pcm(self, source: Path) -> np.ndarray:
+    def _decode_to_pcm(
+        self, source: Path, *, max_seconds: Optional[float] = None,
+    ) -> np.ndarray:
         """ffmpeg → interleaved float32 stereo at the playback rate."""
         cmd = [
             self._ffmpeg,
@@ -342,11 +601,15 @@ class PreviewService:
             "-loglevel", "error",
             "-nostdin",
             "-i", str(source),
+        ]
+        if max_seconds is not None and max_seconds > 0:
+            cmd.extend(["-t", str(max_seconds)])
+        cmd.extend([
             "-f", "f32le",
             "-ac", str(_PLAYBACK_CHANNELS),
             "-ar", str(self._sr),
             "-",
-        ]
+        ])
         try:
             result = subprocess.run(
                 cmd,
