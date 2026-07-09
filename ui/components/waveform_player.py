@@ -78,6 +78,11 @@ class WaveformPlayer(ctk.CTkFrame):
         self._peaks: Optional[np.ndarray] = None
         self._canvas_w = 1
         self._canvas_h = self._wave_height
+        self._playhead_id: Optional[int] = None
+        self._waveform_drawn = False
+        self._last_configure_w = 0
+        self._configure_after: Optional[str] = None
+        self._scroll_paused = False
 
         self._build_body()
         WaveformPlayer._live_players.add(self)
@@ -218,7 +223,8 @@ class WaveformPlayer(ctk.CTkFrame):
         else:
             self._hide_full_load_button()
         self._update_time_label()
-        self._redraw_waveform()
+        self._waveform_drawn = False
+        self._redraw_waveform_static()
 
     def clear(self) -> None:
         self._teardown_stream()
@@ -256,6 +262,10 @@ class WaveformPlayer(ctk.CTkFrame):
             self._volume_slider.set(self._volume)
         except Exception:
             pass
+
+    def set_scroll_paused(self, paused: bool) -> None:
+        """Pause playhead redraws while a parent scroll frame is moving."""
+        self._scroll_paused = bool(paused)
 
     @property
     def volume(self) -> float:
@@ -386,8 +396,9 @@ class WaveformPlayer(ctk.CTkFrame):
         if self._finished:
             self._on_playback_finished()
             return
-        self._update_playhead()
-        self._update_time_label()
+        if not self._scroll_paused:
+            self._update_playhead()
+            self._update_time_label()
         if self._playing:
             self._schedule_tick()
 
@@ -409,10 +420,24 @@ class WaveformPlayer(ctk.CTkFrame):
     # ── Drawing ──
 
     def _on_canvas_configure(self, event) -> None:
-        self._canvas_w = max(1, event.width)
+        w = max(1, event.width)
+        if w == self._last_configure_w:
+            return
+        self._last_configure_w = w
+        self._canvas_w = w
         self._canvas_h = max(1, event.height)
+        if self._configure_after is not None:
+            try:
+                self.after_cancel(self._configure_after)
+            except Exception:
+                pass
+        self._configure_after = self.after_idle(self._on_configure_idle)
+
+    def _on_configure_idle(self) -> None:
+        self._configure_after = None
+        self._waveform_drawn = False
         if self._peaks is not None:
-            self._redraw_waveform()
+            self._redraw_waveform_static()
         else:
             self._draw_placeholder(self._current_placeholder_text())
 
@@ -429,22 +454,21 @@ class WaveformPlayer(ctk.CTkFrame):
             pos = self._read_pos
         return max(0.0, min(1.0, pos / self._data.frame_count))
 
-    def _redraw_waveform(self) -> None:
+    def _redraw_waveform_static(self) -> None:
+        """Draw waveform bars once; playhead moves via canvas item coords."""
         c = self._canvas
         if self._destroyed:
             return
         c.delete("all")
+        self._playhead_id = None
         peaks = self._peaks
         if peaks is None or peaks.size == 0:
+            self._waveform_drawn = False
             return
         t = self._theme
         w = self._canvas_w
         h = self._canvas_h
         mid = h / 2.0
-        played_frac = self._progress_fraction()
-        played_x = played_frac * w
-
-        # One bar per 2px keeps redraw cheap and the wave crisp.
         step = 2
         n_peaks = peaks.size
         for x in range(0, w, step):
@@ -453,20 +477,35 @@ class WaveformPlayer(ctk.CTkFrame):
                 idx = n_peaks - 1
             amp = float(peaks[idx])
             bar_h = max(1.0, amp * (mid - 2))
-            color = t.accent.blue if x <= played_x else t.border.strong
-            c.create_line(x, mid - bar_h, x, mid + bar_h, fill=color, width=1)
-
-        # Playhead
-        if self._data is not None:
             c.create_line(
-                played_x, 0, played_x, h,
-                fill=t.accent.blue_bright, width=1,
+                x, mid - bar_h, x, mid + bar_h,
+                fill=t.border.strong, width=1, tags="wave",
             )
+        played_x = self._progress_fraction() * w
+        if self._data is not None:
+            self._playhead_id = c.create_line(
+                played_x, 0, played_x, h,
+                fill=t.accent.blue_bright, width=2, tags="playhead",
+            )
+        self._waveform_drawn = True
+
+    def _redraw_waveform(self) -> None:
+        self._redraw_waveform_static()
 
     def _update_playhead(self) -> None:
-        # A full redraw is cheap enough at ~300-500 bars; keeps played /
-        # unplayed coloring correct as the head moves.
-        self._redraw_waveform()
+        if self._scroll_paused or not self._waveform_drawn:
+            if not self._scroll_paused:
+                self._redraw_waveform_static()
+            return
+        c = self._canvas
+        if self._playhead_id is None or self._data is None:
+            self._redraw_waveform_static()
+            return
+        played_x = self._progress_fraction() * self._canvas_w
+        try:
+            c.coords(self._playhead_id, played_x, 0, played_x, self._canvas_h)
+        except Exception:
+            self._redraw_waveform_static()
 
     def _draw_placeholder(self, message: str, *, animated: bool = False) -> None:
         c = self._canvas
@@ -529,7 +568,7 @@ class WaveformPlayer(ctk.CTkFrame):
         with self._pos_lock:
             self._read_pos = int(frac * self._data.frame_count)
         self._finished = False
-        self._redraw_waveform()
+        self._redraw_waveform_static()
         self._update_time_label()
 
     def _on_volume_changed(self, value: float) -> None:

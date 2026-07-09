@@ -143,6 +143,12 @@ class GeneralConfig(BaseModel):
             "bypassing the Vault entirely."
         ),
     )
+    mpc_export_max_concurrent: int = Field(
+        default=1,
+        ge=1,
+        le=4,
+        description="Simultaneous MPC export jobs (demucs is CPU-heavy).",
+    )
 
 
 class DownloaderConfig(BaseModel):
@@ -194,6 +200,11 @@ class DiscoveryConfig(BaseModel):
     # Include "Various Artists" compilations. Many breaks live on comps,
     # but they resolve poorly on YouTube Music, so it's off by default.
     allow_compilations: bool = False
+
+    # Post-dig preview warmup (Digital Crate).
+    preview_prefetch_enabled: bool = True
+    preview_prefetch_concurrency: int = Field(default=2, ge=1, le=4)
+    preview_prefetch_keep_decoded: bool = True
 
 
 class UIConfig(BaseModel):

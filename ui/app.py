@@ -34,8 +34,10 @@ from utils.config import ConfigManager
 if TYPE_CHECKING:
     from core.discovery import DiscoveryEngine
     from core.exporter import MPCExporter
+    from core.mpc_export_manager import MpcExportManager
     from core.pipeline import IngestionPipeline
     from core.preview import PreviewService
+    from core.preview_prefetch import PreviewPrefetchService
     from core.stems import StemSeparator
 
 
@@ -65,7 +67,9 @@ class AppContext:
     logger: logging.Logger
     pipeline: Optional["IngestionPipeline"] = None  # for live enricher updates
     preview: Optional["PreviewService"] = None  # in-app waveform preview
+    preview_prefetch: Optional["PreviewPrefetchService"] = None
     stem_separator: Optional["StemSeparator"] = None  # shared demucs wrapper
+    mpc_export_manager: Optional["MpcExportManager"] = None
 
     _toast_publisher: Optional[Callable[[str, ToastKind], None]] = None
     _tab_switcher: Optional[Callable[[str], None]] = None
@@ -130,7 +134,9 @@ class CrateDiggerApp:
         discovery: Optional["DiscoveryEngine"] = None,
         exporter: Optional["MPCExporter"] = None,
         preview: Optional["PreviewService"] = None,
+        preview_prefetch: Optional["PreviewPrefetchService"] = None,
         stem_separator: Optional["StemSeparator"] = None,
+        mpc_export_manager: Optional["MpcExportManager"] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self._log = logger or logging.getLogger("cratedigger.app")
@@ -141,7 +147,9 @@ class CrateDiggerApp:
         self._discovery = discovery
         self._exporter = exporter
         self._preview = preview
+        self._preview_prefetch = preview_prefetch
         self._stem_separator = stem_separator
+        self._mpc_export_manager = mpc_export_manager
 
         self._root = ctk.CTk()
         self._root.report_callback_exception = self._on_tk_callback_exception
@@ -170,7 +178,9 @@ class CrateDiggerApp:
             logger=self._log.getChild("tabs"),
             pipeline=self._pipeline,
             preview=self._preview,
+            preview_prefetch=self._preview_prefetch,
             stem_separator=self._stem_separator,
+            mpc_export_manager=self._mpc_export_manager,
         )
         self._context._toast_publisher = self._publish_toast
         self._context._tab_switcher = self._show_tab
@@ -234,6 +244,16 @@ class CrateDiggerApp:
             self._queue.shutdown(timeout=5.0, cancel_in_flight=True)
         except Exception:
             self._log.exception("Error shutting down queue manager")
+        try:
+            if self._mpc_export_manager is not None:
+                self._mpc_export_manager.shutdown(cancel_pending=True)
+        except Exception:
+            self._log.exception("Error shutting down MPC export manager")
+        try:
+            if self._preview_prefetch is not None:
+                self._preview_prefetch.shutdown(cancel_pending=True)
+        except Exception:
+            self._log.exception("Error shutting down preview prefetch")
         try:
             self._db.close()
         except Exception:

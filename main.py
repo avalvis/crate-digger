@@ -494,6 +494,33 @@ def _bootstrap(splash: _SplashWindow, log: logging.Logger) -> int:
         logger=log.getChild("preview"),
     )
 
+    from core.preview_prefetch import PreviewPrefetchService
+
+    preview_prefetch = PreviewPrefetchService(
+        preview_service,
+        max_workers=snap.config.discovery.preview_prefetch_concurrency,
+        keep_decoded=snap.config.discovery.preview_prefetch_keep_decoded,
+        logger=log.getChild("preview_prefetch"),
+    )
+    preview_prefetch.start()
+
+    from core.mpc_export_manager import MpcExportManager
+
+    mpc_export_manager = MpcExportManager(
+        preview=preview_service,
+        stem_separator=stem_separator,
+        exporter=exporter,
+        destination_root=lambda: Path(
+            config.snapshot().config.general.mpc_samples_root,
+        ).expanduser(),
+        staging_root=lambda: Path(
+            config.snapshot().config.general.staging_root,
+        ).expanduser(),
+        max_workers=snap.config.general.mpc_export_max_concurrent,
+        logger=log.getChild("mpc_export_manager"),
+    )
+    mpc_export_manager.start()
+
     splash.set_status("Cleaning preview cache…")
     try:
         removed = preview_service.clear_stale_cache()
@@ -570,7 +597,9 @@ def _bootstrap(splash: _SplashWindow, log: logging.Logger) -> int:
         discovery=discovery,
         exporter=exporter,
         preview=preview_service,
+        preview_prefetch=preview_prefetch,
         stem_separator=stem_separator,
+        mpc_export_manager=mpc_export_manager,
         logger=log.getChild("app"),
     )
 

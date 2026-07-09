@@ -156,7 +156,7 @@ class PreviewService:
             self._emit(progress_callback, 55.0, "Using cached quick preview")
             source = quick_path
             decode_limit = None
-            full_duration = self._probe_duration_from_info(vid)
+            full_duration = self._probe_duration(quick_path)
         else:
             self._emit(progress_callback, 5.0, "Fetching quick preview…")
             source, full_duration = self._download_quick(
@@ -270,7 +270,7 @@ class PreviewService:
 
     def get_cached_path(self, video_id: str) -> Optional[Path]:
         """Return a previously-downloaded full audio file for this id."""
-        vid = self._normalize_video_id(video_id)
+        vid = self.normalize_video_id(video_id)
         for p in self._cache_dir.glob(f"{vid}.*"):
             if not p.is_file():
                 continue
@@ -280,6 +280,41 @@ class PreviewService:
                 continue
             return p
         return None
+
+    def get_quick_cached_path(self, video_id: str) -> Optional[Path]:
+        """Return a previously-downloaded quick-preview slice, if any."""
+        return self._quick_cache_path(self.normalize_video_id(video_id))
+
+    def is_warm(self, video_id: str) -> bool:
+        """True when full or quick preview audio exists on disk."""
+        vid = self.normalize_video_id(video_id)
+        return self.get_cached_path(vid) is not None or self._quick_cache_path(vid) is not None
+
+    def warm_cache(
+        self,
+        video_id: str,
+        *,
+        progress_callback: Optional[Callable[[float, str], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> Path:
+        """
+        Download quick-preview audio to disk without decoding to PCM.
+        No-op when full or quick cache already exists.
+        """
+        vid = self.normalize_video_id(video_id)
+        full_path = self.get_cached_path(vid)
+        if full_path is not None:
+            self._emit(progress_callback, 100.0, "Using cached audio")
+            return full_path
+        quick_path = self._quick_cache_path(vid)
+        if quick_path is not None:
+            self._emit(progress_callback, 100.0, "Using cached quick preview")
+            return quick_path
+        path, _ = self._download_quick(vid, progress_callback, cancel_event)
+        return path
+
+    def normalize_video_id(self, video_id: str) -> str:
+        return self._normalize_video_id(video_id)
 
     def _quick_cache_path(self, video_id: str) -> Optional[Path]:
         vid = self._normalize_video_id(video_id)
@@ -337,7 +372,7 @@ class PreviewService:
         import yt_dlp
         from yt_dlp.utils import DownloadError, ExtractorError
 
-        duration_hint = self._probe_duration_from_info(vid)
+        duration_hint: Optional[float] = None
         quick_seconds = self._quick_seconds
 
         def ranges_callback(_info: dict[str, Any], _ydl: Any) -> list[dict[str, float]]:

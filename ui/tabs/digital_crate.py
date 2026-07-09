@@ -31,23 +31,17 @@ from core.discovery import (
     NoResultsError,
     NoYouTubeMatchError,
 )
-from core.mpc_export import (
-    MpcExportMode,
-    MpcSampleExportCancelledError,
-    MpcSampleExportError,
-    MpcSampleResult,
-    MPC_WORKFLOW_MAX_SECONDS,
-    export_sample_to_mpc,
-)
+from core.mpc_export import MpcExportMode
 from core.pipeline import PipelineRequest
+from core.preview_prefetch import PrefetchEvent, PrefetchEventType, PrefetchState
 from core.sampling_taxonomy import sample_affinity
+from ui.components.mpc_export_manager import MpcExportManagerWindow
 from ui.components.dig_roulette_spinner import DigRouletteSpinner
 from ui.components.waveform_player import WaveformPlayer
 from ui.components.year_spinner import YearSpinner
 from ui.theme import (
     Theme,
     style_card_elevated,
-    style_danger_button,
     style_ghost_button,
     style_label_body,
     style_label_meta,
@@ -158,10 +152,20 @@ class DigitalCrateTab(ctk.CTkFrame):
         self._health_label: Optional[ctk.CTkLabel] = None
         self._reel_frame: Optional[ctk.CTkFrame] = None
         self._reel_empty: Optional[ctk.CTkFrame] = None
+        self._reel_scroll: Optional[ctk.CTkScrollableFrame] = None
+        self._scroll_content: Optional[ctk.CTkFrame] = None
         self._recent_frame: Optional[ctk.CTkFrame] = None
         self._token_warning_card: Optional[ctk.CTkFrame] = None
+        self._mpc_manager_window: Optional[MpcExportManagerWindow] = None
+        self._video_to_card: dict[str, _ReelCard] = {}
+        self._content_width_after: Optional[str] = None
+        self._scroll_pause_after: Optional[str] = None
+        self._prefetch_unsub: Optional[Callable[[], None]] = None
+        self._mpc_unsub: Optional[Callable[[], None]] = None
 
         self._build_body()
+        self._wire_prefetch_events()
+        self._wire_mpc_events()
         self._ctx.on_config_changed(self._on_config_changed)
         self._refresh_token_gate()
         self._update_health()
@@ -187,36 +191,31 @@ class DigitalCrateTab(ctk.CTkFrame):
         self._sync_discovery_prefs()
         self._refresh_token_gate()
         self._update_health()
+        pf = self._ctx.preview_prefetch
+        if pf is not None:
+            disc = self._ctx.config.snapshot().config.discovery
+            pf.configure(
+                max_workers=disc.preview_prefetch_concurrency,
+                keep_decoded=disc.preview_prefetch_keep_decoded,
+            )
 
     # ── Body construction ──
 
     def _build_body(self) -> None:
         t = self._theme
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=0)
+        self.grid_rowconfigure(1, weight=1)
 
-        scroll = ctk.CTkScrollableFrame(
-            self,
-            fg_color=t.surface.app,
-            corner_radius=0,
-            border_width=0,
-            scrollbar_button_color=t.border.strong,
-            scrollbar_button_hover_color=t.accent.purple,
-        )
-        scroll.grid(row=0, column=0, sticky="nsew")
-        scroll.grid_columnconfigure(0, weight=1)
+        header = ctk.CTkFrame(self, fg_color=t.surface.app)
+        header.grid(row=0, column=0, sticky="ew", padx=t.space.xl,
+                    pady=(t.space.xxl, t.space.md))
+        header.grid_columnconfigure(0, weight=1)
 
-        content = ctk.CTkFrame(scroll, fg_color="transparent")
-        content.grid(row=0, column=0, sticky="ew", padx=t.space.xl,
-                     pady=(t.space.xxl, t.space.xl))
-        content.grid_columnconfigure(0, weight=1)
-        self._content = content
-        content.bind("<Configure>", self._on_content_configure)
-
-        ctk.CTkLabel(content, text="Digital Crate",
+        ctk.CTkLabel(header, text="Digital Crate",
                      **style_label_heading(t)).grid(row=0, column=0, sticky="w")
         ctk.CTkLabel(
-            content,
+            header,
             text=(
                 "Spin the crate roulette. Pick an era preset or dial in "
                 "filters, then Dig a reel of sample-friendly gems — preview "
@@ -226,12 +225,34 @@ class DigitalCrateTab(ctk.CTkFrame):
         ).grid(row=1, column=0, sticky="w", pady=(t.space.xs, t.space.xl))
 
         next_row = 2
-        next_row = self._build_token_warning(content, next_row)
-        next_row = self._build_presets(content, next_row)
-        next_row = self._build_filters_card(content, next_row)
-        next_row = self._build_dig_row(content, next_row)
+        next_row = self._build_token_warning(header, next_row)
+        next_row = self._build_presets(header, next_row)
+        next_row = self._build_filters_card(header, next_row)
+        self._build_dig_row(header, next_row)
+
+        scroll = ctk.CTkScrollableFrame(
+            self,
+            fg_color=t.surface.app,
+            corner_radius=0,
+            border_width=0,
+            scrollbar_button_color=t.border.strong,
+            scrollbar_button_hover_color=t.accent.purple,
+        )
+        scroll.grid(row=1, column=0, sticky="nsew")
+        scroll.grid_columnconfigure(0, weight=1)
+        self._reel_scroll = scroll
+        self._bind_reel_scroll_pause(scroll)
+
+        content = ctk.CTkFrame(scroll, fg_color="transparent")
+        content.grid(row=0, column=0, sticky="ew", padx=t.space.xl,
+                     pady=(0, t.space.xl))
+        content.grid_columnconfigure(0, weight=1)
+        self._scroll_content = content
+        content.bind("<Configure>", self._on_content_configure)
+
+        next_row = 0
         next_row = self._build_reel_area(content, next_row)
-        next_row = self._build_recent_digs(content, next_row)
+        self._build_recent_digs(content, next_row)
 
     def _build_token_warning(self, parent, row: int) -> int:
         t = self._theme
@@ -651,6 +672,7 @@ class DigitalCrateTab(ctk.CTkFrame):
                                     "warning")
             return
         self._render_reel(results)
+        self._start_prefetch(results)
         self._ctx.publish_toast(
             f"Dug up {len(results)} gem{'s' if len(results) != 1 else ''}.",
             "success")
@@ -679,22 +701,65 @@ class DigitalCrateTab(ctk.CTkFrame):
         else:
             self._ctx.publish_toast(f"Dig failed: {error}", "error")
 
+    def _start_prefetch(self, results: list[DiscoverySuggestion]) -> None:
+        pf = self._ctx.preview_prefetch
+        if pf is None:
+            return
+        snap = self._ctx.config.snapshot().config.discovery
+        if not snap.preview_prefetch_enabled:
+            return
+        ids = [s.youtube_video_id for s in results if s.youtube_video_id]
+        if not ids:
+            return
+        pf.enqueue_batch(ids)
+        done, total = pf.batch_progress()
+        self._set_dig_status(f"Warming previews ({done}/{total})…")
+
     def _render_reel(self, results: list[DiscoverySuggestion]) -> None:
         self._clear_cards()
+        self._video_to_card.clear()
         self._reel_empty.grid_remove()
         t = self._theme
         for i, s in enumerate(results):
             card = _ReelCard(
                 self._reel_frame, self._ctx, s,
                 on_queued=self._on_card_queued,
+                on_mpc_confirm=self._on_card_mpc_confirm,
             )
             card.grid(row=i, column=0, sticky="ew", pady=(0, t.space.md))
             self._cards.append(card)
+            if s.youtube_video_id:
+                self._video_to_card[s.youtube_video_id] = card
+                pf = self._ctx.preview_prefetch
+                if pf is not None:
+                    card.apply_prefetch_state(pf.get_state(s.youtube_video_id))
+
+    def _on_card_mpc_confirm(
+        self, suggestion: DiscoverySuggestion, mode: MpcExportMode,
+    ) -> None:
+        mgr = self._ctx.mpc_export_manager
+        if mgr is None:
+            self._ctx.publish_toast("MPC export manager unavailable.", "error")
+            return
+        try:
+            mgr.enqueue(suggestion, mode)
+        except Exception as e:  # noqa: BLE001
+            self._ctx.publish_toast(f"Could not queue MPC export: {e}", "error")
+            return
+        self._ensure_mpc_manager_window()
+        self._ctx.publish_toast(f"Queued MPC export: {suggestion.display_name}", "info")
 
     def _on_card_queued(self, suggestion: DiscoverySuggestion) -> None:
         self._refresh_recent_digs()
 
     def _clear_cards(self) -> None:
+        ids = [
+            c._s.youtube_video_id for c in self._cards
+            if c._s.youtube_video_id
+        ]
+        pf = self._ctx.preview_prefetch
+        if pf is not None and ids:
+            pf.cancel_batch(ids)
         for card in self._cards:
             try:
                 card.teardown()
@@ -702,6 +767,7 @@ class DigitalCrateTab(ctk.CTkFrame):
             except Exception:
                 pass
         self._cards = []
+        self._video_to_card.clear()
 
     # ── Recent digs ──
 
@@ -836,22 +902,109 @@ class DigitalCrateTab(ctk.CTkFrame):
             return self._ctx.config.snapshot().config.discovery.reel_size
 
     def _on_content_configure(self, _event) -> None:
+        if self._content_width_after is not None:
+            try:
+                self.after_cancel(self._content_width_after)
+            except Exception:
+                pass
+        self._content_width_after = self.after(50, self._apply_content_width)
+
+    def _apply_content_width(self) -> None:
+        self._content_width_after = None
+        content = self._scroll_content
+        if content is None:
+            return
         t = self._theme
-        parent_width = self._content.master.winfo_width()
+        parent_width = content.master.winfo_width()
         target = min(1000, max(480, parent_width - 2 * t.space.xl))
-        if abs(self._content.winfo_width() - target) > 8:
-            self._content.configure(width=target)
+        if abs(content.winfo_width() - target) > 8:
+            content.configure(width=target)
+
+    def _bind_reel_scroll_pause(self, scroll: ctk.CTkScrollableFrame) -> None:
+        def pause(_event=None) -> None:
+            self._set_reel_scroll_paused(True)
+            if self._scroll_pause_after is not None:
+                try:
+                    self.after_cancel(self._scroll_pause_after)
+                except Exception:
+                    pass
+            self._scroll_pause_after = self.after(120, self._resume_reel_scroll)
+
+        scroll.bind("<MouseWheel>", pause, add="+")
+        scroll.bind("<Button-4>", pause, add="+")
+        scroll.bind("<Button-5>", pause, add="+")
+        try:
+            sb = getattr(scroll, "_scrollbar", None)
+            if sb is not None:
+                sb.bind("<ButtonPress-1>", pause, add="+")
+                sb.bind("<B1-Motion>", pause, add="+")
+        except Exception:
+            pass
+
+    def _resume_reel_scroll(self) -> None:
+        self._scroll_pause_after = None
+        self._set_reel_scroll_paused(False)
+
+    def _set_reel_scroll_paused(self, paused: bool) -> None:
+        for card in self._cards:
+            try:
+                card.set_scroll_paused(paused)
+            except Exception:
+                pass
+
+    def _wire_prefetch_events(self) -> None:
+        pf = self._ctx.preview_prefetch
+        if pf is None:
+            return
+        self._prefetch_unsub = pf.subscribe(self._on_prefetch_event, weak=True)
+
+    def _wire_mpc_events(self) -> None:
+        mgr = self._ctx.mpc_export_manager
+        if mgr is None:
+            return
+        self._mpc_unsub = mgr.subscribe(self._on_mpc_export_event, weak=True)
+
+    def _on_prefetch_event(self, event: PrefetchEvent) -> None:
+        self.after(0, lambda e=event: self._apply_prefetch_event(e))
+
+    def _apply_prefetch_event(self, event: PrefetchEvent) -> None:
+        card = self._video_to_card.get(event.video_id)
+        if card is not None:
+            card.apply_prefetch_event(event)
+        if event.type == PrefetchEventType.BATCH_DRAINED:
+            self._set_dig_status(None)
+        elif event.type in (
+            PrefetchEventType.STATE_CHANGED,
+            PrefetchEventType.PROGRESS,
+        ):
+            pf = self._ctx.preview_prefetch
+            if pf is not None:
+                done, total = pf.batch_progress()
+                self._set_dig_status(f"Warming previews ({done}/{total})…")
+
+    def _on_mpc_export_event(self, event) -> None:
+        self.after(0, lambda e=event: self._apply_mpc_export_event(e))
+
+    def _apply_mpc_export_event(self, event) -> None:
+        card = self._video_to_card.get(event.video_id)
+        if card is not None:
+            card.apply_mpc_event(event)
+
+    def _ensure_mpc_manager_window(self) -> MpcExportManagerWindow:
+        if self._mpc_manager_window is None or not self._mpc_manager_window.winfo_exists():
+            self._mpc_manager_window = MpcExportManagerWindow(
+                self.winfo_toplevel(), self._ctx,
+            )
+        else:
+            self._mpc_manager_window.lift_window()
+        return self._mpc_manager_window
 
 
-# ─── MPC workflow progress dialog ────────────────────────────────────
+# ─── MPC mode popover (per card) ───────────────────────────────────────
 
 
-class _MpcWorkflowDialog(ctk.CTkToplevel):
-    """Choose export contents, then show progress for MPC workflow."""
-
-    _WIDTH = 520
-    _HEIGHT_CHOICE_MIN = 420
-    _HEIGHT_PROGRESS = 240
+class _MpcModePopover(ctk.CTkFrame):
+    """Compact mode picker anchored on a reel card."""
 
     def __init__(
         self,
@@ -859,353 +1012,65 @@ class _MpcWorkflowDialog(ctk.CTkToplevel):
         ctx: "AppContext",
         suggestion: DiscoverySuggestion,
         *,
-        on_finished: Callable[[bool], None],
+        on_confirm: Callable[[MpcExportMode], None],
+        on_cancel: Callable[[], None],
     ) -> None:
-        super().__init__(parent)
+        t = ctx.theme
+        super().__init__(
+            parent,
+            fg_color=t.surface.elevated,
+            border_color=t.border.strong,
+            border_width=t.stroke.regular,
+            corner_radius=t.radius.md,
+        )
+        self._on_confirm = on_confirm
+        self._on_cancel = on_cancel
+        self.grid_columnconfigure(0, weight=1)
 
-        self._ctx = ctx
-        self._theme = ctx.theme
-        self._s = suggestion
-        self._on_finished = on_finished
-        self._log = ctx.logger.getChild("mpc_dialog")
-        self._cancel_event = threading.Event()
-        self._finished = False
-        self._mode: Optional[MpcExportMode] = None
-        self._body_frame: Optional[ctk.CTkFrame] = None
-        self._status_label: Optional[ctk.CTkLabel] = None
-        self._progress_bar: Optional[ctk.CTkProgressBar] = None
-        self._cancel_btn: Optional[ctk.CTkButton] = None
-        self._close_btn: Optional[ctk.CTkButton] = None
-
-        t = self._theme
-        self.title("MPC Workflow")
-        self.configure(fg_color=t.surface.base)
-        self.resizable(False, False)
-        self.transient(parent)
-        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
-
-        self._body_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self._body_frame.pack(fill="both", expand=True, padx=t.space.xl, pady=t.space.xl)
-        self._build_choice_phase()
-        self._fit_choice_window(parent)
-
-    def _fit_choice_window(self, parent: ctk.CTkBaseClass) -> None:
-        self.update_idletasks()
-        height = max(self._HEIGHT_CHOICE_MIN, self.winfo_reqheight() + 24)
-        self.geometry(f"{self._WIDTH}x{height}")
-        self._center_over(parent, height=height)
-
-    def _center_over(
-        self, parent: ctk.CTkBaseClass, *, height: Optional[int] = None,
-    ) -> None:
-        parent.update_idletasks()
-        px = parent.winfo_rootx()
-        py = parent.winfo_rooty()
-        pw = parent.winfo_width()
-        ph = parent.winfo_height()
-        h = height if height is not None else self.winfo_height()
-        self.geometry(f"+{px + (pw - self._WIDTH) // 2}+{py + (ph - h) // 2}")
-
-    def _build_choice_phase(self) -> None:
-        assert self._body_frame is not None
-        frame = self._body_frame
-        for child in frame.winfo_children():
-            child.destroy()
-        frame.grid_columnconfigure(0, weight=1)
-        t = self._theme
+        from core.mpc_export import MPC_WORKFLOW_MAX_SECONDS
 
         ctk.CTkLabel(
-            frame,
-            text=self._s.display_name,
-            text_color=t.text.primary,
-            font=t.font.subheading,
-            anchor="w",
-            wraplength=self._WIDTH - 64,
-            justify="left",
-        ).grid(row=0, column=0, sticky="ew")
-
-        ctk.CTkLabel(
-            frame,
-            text="What should go to your MPC folder?",
-            text_color=t.text.secondary,
-            font=t.font.body,
-            anchor="w",
-        ).grid(row=1, column=0, sticky="w", pady=(t.space.xs, t.space.md))
+            self, text="Export to MPC folder",
+            text_color=t.text.primary, font=t.font.body_emphasis, anchor="w",
+        ).grid(row=0, column=0, sticky="ew", padx=t.space.md, pady=(t.space.sm, 0))
 
         self._mode_var = ctk.StringVar(value=MpcExportMode.BOTH.value)
-
         options = (
-            (
-                MpcExportMode.SONG,
-                "Original song only",
-                "Full track as original.wav — fastest when you just want the record.",
-            ),
-            (
-                MpcExportMode.STEMS,
-                "Stems only",
-                f"First {int(MPC_WORKFLOW_MAX_SECONDS)}s split into vocals / drums / bass / other.",
-            ),
-            (
-                MpcExportMode.BOTH,
-                "Both (recommended)",
-                "Full original.wav plus the trimmed stem set.",
-            ),
+            (MpcExportMode.SONG, "Original song only"),
+            (MpcExportMode.STEMS, f"Stems only ({int(MPC_WORKFLOW_MAX_SECONDS)}s)"),
+            (MpcExportMode.BOTH, "Both (recommended)"),
         )
-        for idx, (mode, title, blurb) in enumerate(options):
-            row = ctk.CTkFrame(frame, fg_color=t.surface.raised, corner_radius=t.radius.md)
-            row.grid(row=2 + idx, column=0, sticky="ew", pady=(0, t.space.sm))
-            row.grid_columnconfigure(1, weight=1)
-
+        for idx, (mode, label) in enumerate(options):
             ctk.CTkRadioButton(
-                row,
-                text="",
-                variable=self._mode_var,
-                value=mode.value,
-                width=20,
-                radiobutton_width=18,
-                radiobutton_height=18,
-                fg_color=t.accent.blue,
-                hover_color=t.accent.blue_bright,
-            ).grid(row=0, column=0, rowspan=2, padx=(t.space.md, t.space.sm), pady=t.space.md)
+                self, text=label, variable=self._mode_var, value=mode.value,
+                fg_color=t.accent.blue, hover_color=t.accent.blue_bright,
+                text_color=t.text.primary, font=t.font.caption,
+            ).grid(row=1 + idx, column=0, sticky="w", padx=t.space.md, pady=2)
 
-            ctk.CTkLabel(
-                row, text=title, text_color=t.text.primary,
-                font=t.font.body_emphasis, anchor="w",
-            ).grid(row=0, column=1, sticky="w", pady=(t.space.sm, 0))
-
-            ctk.CTkLabel(
-                row, text=blurb, text_color=t.text.secondary,
-                font=t.font.caption, anchor="w", justify="left",
-                wraplength=self._WIDTH - 120,
-            ).grid(row=1, column=1, sticky="w", pady=(0, t.space.sm))
-
-        buttons = ctk.CTkFrame(frame, fg_color="transparent")
-        buttons.grid(row=5, column=0, sticky="e", pady=(t.space.md, 0))
-
+        buttons = ctk.CTkFrame(self, fg_color="transparent")
+        buttons.grid(row=4, column=0, sticky="e", padx=t.space.md, pady=t.space.sm)
         ctk.CTkButton(
-            buttons, text="Cancel", command=self._cancel_choice,
-            **style_secondary_button(t), width=100,
+            buttons, text="Cancel", command=on_cancel,
+            **style_ghost_button(t), width=80, height=28,
         ).pack(side="right")
-
         ctk.CTkButton(
-            buttons, text="Start export", command=self._begin_export,
-            **style_primary_button(t), width=120,
+            buttons, text="Queue export", command=self._confirm,
+            **style_primary_button(t), width=110, height=28,
         ).pack(side="right", padx=(0, t.space.sm))
 
-    def _build_progress_phase(self) -> None:
-        assert self._body_frame is not None
-        frame = self._body_frame
-        for child in frame.winfo_children():
-            child.destroy()
-        frame.grid_columnconfigure(0, weight=1)
-        t = self._theme
-        self.geometry(f"{self._WIDTH}x{self._HEIGHT_PROGRESS}")
-        self._center_over(self.master, height=self._HEIGHT_PROGRESS)
-
-        mode_label = {
-            MpcExportMode.SONG: "Exporting original song…",
-            MpcExportMode.STEMS: "Exporting stems…",
-            MpcExportMode.BOTH: "Exporting original + stems…",
-        }.get(self._mode or MpcExportMode.STEMS, "Exporting…")
-
-        ctk.CTkLabel(
-            frame,
-            text=self._s.display_name,
-            text_color=t.text.primary,
-            font=t.font.subheading,
-            anchor="w",
-            wraplength=self._WIDTH - 64,
-            justify="left",
-        ).grid(row=0, column=0, sticky="ew")
-
-        ctk.CTkLabel(
-            frame,
-            text=mode_label,
-            text_color=t.text.secondary,
-            font=t.font.caption,
-            anchor="w",
-        ).grid(row=1, column=0, sticky="w", pady=(t.space.xs, t.space.md))
-
-        self._status_label = ctk.CTkLabel(
-            frame, text="Starting…", text_color=t.text.secondary,
-            font=t.font.body, anchor="w",
-        )
-        self._status_label.grid(row=2, column=0, sticky="ew")
-
-        self._progress_bar = ctk.CTkProgressBar(
-            frame, height=10, progress_color=t.accent.purple,
-        )
-        self._progress_bar.grid(
-            row=3, column=0, sticky="ew", pady=(t.space.sm, t.space.md),
-        )
-        self._progress_bar.set(0.0)
-
-        buttons = ctk.CTkFrame(frame, fg_color="transparent")
-        buttons.grid(row=4, column=0, sticky="e")
-
-        self._cancel_btn = ctk.CTkButton(
-            buttons, text="Cancel", command=self._on_cancel,
-            **style_danger_button(t), width=100,
-        )
-        self._cancel_btn.pack(side="right")
-
-        self._close_btn = ctk.CTkButton(
-            buttons, text="Close", command=self._close,
-            **style_secondary_button(t), width=100, state="disabled",
-        )
-        self._close_btn.pack(side="right", padx=(0, t.space.sm))
-
-    def _cancel_choice(self) -> None:
-        self._on_finished(False)
-        self._close()
-
-    def _begin_export(self) -> None:
+    def _confirm(self) -> None:
         try:
-            self._mode = MpcExportMode(self._mode_var.get())
+            mode = MpcExportMode(self._mode_var.get())
         except ValueError:
-            self._mode = MpcExportMode.BOTH
-        self._build_progress_phase()
-        self._start_worker()
-
-    def _start_worker(self) -> None:
-        snap = self._ctx.config.snapshot().config
-        dest = snap.general.mpc_samples_root
-        staging = snap.general.staging_root
-        mode = self._mode or MpcExportMode.BOTH
-        threading.Thread(
-            target=self._worker,
-            args=(dest, staging, mode),
-            name=f"mpc-workflow-{self._s.youtube_video_id}",
-            daemon=True,
-        ).start()
-
-    def _worker(
-        self, destination_root: str, staging_root: str, mode: MpcExportMode,
-    ) -> None:
-        s = self._s
-        try:
-            result = export_sample_to_mpc(
-                video_id=s.youtube_video_id,
-                artist=s.artist,
-                title=s.title,
-                destination_root=Path(destination_root),
-                staging_root=Path(staging_root),
-                preview=self._ctx.preview,  # type: ignore[arg-type]
-                stem_separator=self._ctx.stem_separator,  # type: ignore[arg-type]
-                exporter=self._ctx.exporter,  # type: ignore[arg-type]
-                mode=mode,
-                progress_callback=lambda label, pct: self.after(
-                    0, lambda l=label, p=pct: self._apply_progress(l, p),
-                ),
-                cancel_event=self._cancel_event,
-                logger=self._log,
-            )
-        except MpcSampleExportCancelledError:
-            self.after(0, self._finish_cancelled)
-            return
-        except MpcSampleExportError as e:
-            self.after(0, lambda err=e: self._finish_error(err))
-            return
-        except Exception as e:  # noqa: BLE001 — surfaced in dialog
-            self._log.exception("Unexpected MPC export failure for %s", s.display_name)
-            self.after(0, lambda err=e: self._finish_error(err))
-            return
-        self.after(0, lambda r=result: self._finish_ok(r))
-
-    def _apply_progress(self, label: str, percent: float) -> None:
-        if self._finished or self._status_label is None or self._progress_bar is None:
-            return
-        self._status_label.configure(text=label)
-        self._progress_bar.set(max(0.0, min(1.0, percent / 100.0)))
-
-    def _finish_ok(self, result: MpcSampleResult) -> None:
-        if self._finished:
-            return
-        self._finished = True
-        t = self._theme
-        parts: list[str] = []
-        if result.original is not None:
-            parts.append("original")
-        if result.stems:
-            parts.append(f"{len(result.stems)} stems")
-        summary = " + ".join(parts) if parts else "files"
-        if self._progress_bar is not None:
-            self._progress_bar.set(1.0)
-            self._progress_bar.configure(progress_color=t.status.success)
-        if self._status_label is not None:
-            self._status_label.configure(
-                text=f"Done — {summary} saved to {result.track_dir}",
-                text_color=t.status.success,
-                wraplength=self._WIDTH - 64,
-                justify="left",
-            )
-        if self._cancel_btn is not None:
-            self._cancel_btn.configure(state="disabled")
-        if self._close_btn is not None:
-            self._close_btn.configure(state="normal")
-        self._ctx.publish_toast(f"MPC export ready: {result.track_dir}", "success")
-        self._on_finished(True)
-
-    def _finish_error(self, error: Exception) -> None:
-        if self._finished:
-            return
-        self._finished = True
-        t = self._theme
-        if self._progress_bar is not None:
-            self._progress_bar.configure(progress_color=t.status.error)
-        if self._status_label is not None:
-            self._status_label.configure(
-                text=f"Failed: {error}",
-                text_color=t.status.error,
-                wraplength=self._WIDTH - 64,
-                justify="left",
-            )
-        if self._cancel_btn is not None:
-            self._cancel_btn.configure(state="disabled")
-        if self._close_btn is not None:
-            self._close_btn.configure(state="normal")
-        self._ctx.publish_toast(f"MPC workflow failed: {error}", "error")
-        self._on_finished(False)
-
-    def _finish_cancelled(self) -> None:
-        if self._finished:
-            return
-        self._finished = True
-        if self._status_label is not None:
-            self._status_label.configure(
-                text="Cancelled.",
-                text_color=self._theme.text.muted,
-            )
-        if self._cancel_btn is not None:
-            self._cancel_btn.configure(state="disabled")
-        if self._close_btn is not None:
-            self._close_btn.configure(state="normal")
-        self._ctx.publish_toast("MPC workflow cancelled.", "warning")
-        self._on_finished(False)
-
-    def _on_cancel(self) -> None:
-        if self._finished:
-            self._close()
-            return
-        if self._mode is None:
-            self._cancel_choice()
-            return
-        self._cancel_event.set()
-        if self._status_label is not None:
-            self._status_label.configure(text="Cancelling…")
-
-    def _close(self) -> None:
-        try:
-            self.destroy()
-        except Exception:
-            pass
+            mode = MpcExportMode.BOTH
+        self._on_confirm(mode)
 
 
 # ─── Reel card ───────────────────────────────────────────────────────
 
 
 class _ReelCard(ctk.CTkFrame):
-    """One discovery suggestion: metadata + waveform preview + actions."""
+    """One discovery suggestion: metadata + lazy waveform preview + actions."""
 
     def __init__(
         self,
@@ -1214,6 +1079,7 @@ class _ReelCard(ctk.CTkFrame):
         suggestion: DiscoverySuggestion,
         *,
         on_queued: Optional[Callable[[DiscoverySuggestion], None]] = None,
+        on_mpc_confirm: Optional[Callable[[DiscoverySuggestion, MpcExportMode], None]] = None,
     ) -> None:
         t = ctx.theme
         super().__init__(parent, **style_card_elevated(t))
@@ -1223,18 +1089,22 @@ class _ReelCard(ctk.CTkFrame):
         self._log = ctx.logger.getChild("reel_card")
         self._s = suggestion
         self._on_queued = on_queued
+        self._on_mpc_confirm = on_mpc_confirm
 
         self._cancel_event = threading.Event()
         self._preview_started = False
         self._full_preview_loading = False
         self._recorded = False
         self._queued = False
-        self._mpc_exporting = False
-        self._mpc_dialog: Optional[_MpcWorkflowDialog] = None
         self._player: Optional[WaveformPlayer] = None
+        self._player_slot: Optional[ctk.CTkFrame] = None
+        self._wave_placeholder: Optional[ctk.CTkLabel] = None
+        self._prefetch_chip: Optional[ctk.CTkLabel] = None
         self._preview_btn: Optional[ctk.CTkButton] = None
         self._queue_btn: Optional[ctk.CTkButton] = None
         self._mpc_btn: Optional[ctk.CTkButton] = None
+        self._mpc_popover: Optional[_MpcModePopover] = None
+        self._inner: Optional[ctk.CTkFrame] = None
 
         self.grid_columnconfigure(0, weight=1)
         self._build()
@@ -1246,8 +1116,8 @@ class _ReelCard(ctk.CTkFrame):
         inner.grid(row=0, column=0, sticky="ew", padx=t.space.xl,
                    pady=t.space.lg)
         inner.grid_columnconfigure(0, weight=1)
+        self._inner = inner
 
-        # Title / meta
         ctk.CTkLabel(inner, text=s.artist, text_color=t.accent.purple,
                      font=t.font.body_emphasis, anchor="w").grid(
             row=0, column=0, sticky="w")
@@ -1264,31 +1134,41 @@ class _ReelCard(ctk.CTkFrame):
                      text_color=t.text.secondary, font=t.font.caption,
                      anchor="w").grid(row=2, column=0, sticky="w")
 
-        # Sample-friendly chip when the taxonomy rates this highly.
         affinity = sample_affinity(
             genres=[s.genre] if s.genre else [],
             styles=[s.style] if s.style else [],
             country=s.country, year=s.year,
         )
+        chip_row = 3
         if affinity >= 1.25:
             ctk.CTkLabel(
                 inner, text="◆ sample-friendly", text_color=t.accent.blue,
-                font=t.font.micro, anchor="w").grid(row=3, column=0,
+                font=t.font.micro, anchor="w").grid(row=chip_row, column=0,
                                                     sticky="w",
                                                     pady=(t.space.xxs, 0))
+            chip_row += 1
 
-        # Preview player (hidden until loaded)
-        self._player = WaveformPlayer(
-            inner, t, height=84,
-            initial_volume=self._ctx.config.snapshot().config.ui.preview_volume,
+        self._prefetch_chip = ctk.CTkLabel(
+            inner, text="", text_color=t.text.muted, font=t.font.micro,
+            anchor="w",
         )
-        self._player.grid(row=4, column=0, sticky="ew",
-                          pady=(t.space.md, t.space.md))
-        self._player.grid_remove()
+        self._prefetch_chip.grid(row=chip_row, column=0, sticky="w",
+                                 pady=(t.space.xxs, 0))
+        chip_row += 1
 
-        # Actions
+        self._player_slot = ctk.CTkFrame(inner, fg_color="transparent")
+        self._player_slot.grid(row=chip_row, column=0, sticky="ew",
+                               pady=(t.space.md, t.space.md))
+        self._player_slot.grid_columnconfigure(0, weight=1)
+        self._wave_placeholder = ctk.CTkLabel(
+            self._player_slot,
+            text="Press Preview to load waveform",
+            text_color=t.text.muted, font=t.font.caption, anchor="w",
+        )
+        self._wave_placeholder.grid(row=0, column=0, sticky="ew")
+
         actions = ctk.CTkFrame(inner, fg_color="transparent")
-        actions.grid(row=5, column=0, sticky="w")
+        actions.grid(row=chip_row + 1, column=0, sticky="w")
 
         self._preview_btn = ctk.CTkButton(
             actions, text="▶  Preview", command=self._on_preview_clicked,
@@ -1312,10 +1192,99 @@ class _ReelCard(ctk.CTkFrame):
                       command=self._on_open_youtube, **style_ghost_button(t),
                       width=80).pack(side="left", padx=(t.space.sm, 0))
 
+    # ── Prefetch / MPC status ──
+
+    def apply_prefetch_state(self, state: PrefetchState) -> None:
+        labels = {
+            PrefetchState.PENDING: "Preview queued",
+            PrefetchState.DOWNLOADING: "Fetching…",
+            PrefetchState.DECODING: "Decoding…",
+            PrefetchState.READY: "Ready",
+            PrefetchState.FAILED: "Preview failed",
+            PrefetchState.CANCELLED: "",
+        }
+        self._set_prefetch_chip(labels.get(state, ""), state)
+
+    def apply_prefetch_event(self, event: PrefetchEvent) -> None:
+        if event.type == PrefetchEventType.PROGRESS:
+            msg = event.message or "Warming…"
+            self._set_prefetch_chip(msg, event.state)
+        elif event.type == PrefetchEventType.STATE_CHANGED:
+            msg = event.message or {
+                PrefetchState.READY: "Ready",
+                PrefetchState.FAILED: "Preview failed",
+                PrefetchState.DOWNLOADING: "Fetching…",
+                PrefetchState.DECODING: "Decoding…",
+            }.get(event.state, "")
+            self._set_prefetch_chip(msg, event.state)
+            if event.state == PrefetchState.READY and event.data and self._preview_started:
+                self._show_preview_data(event.data, full=False)
+
+    def _set_prefetch_chip(self, text: str, state: PrefetchState) -> None:
+        if self._prefetch_chip is None:
+            return
+        t = self._theme
+        if not text:
+            self._prefetch_chip.configure(text="")
+            return
+        color = t.text.muted
+        if state == PrefetchState.READY:
+            color = t.status.success
+        elif state == PrefetchState.FAILED:
+            color = t.status.error
+        elif state in (PrefetchState.DOWNLOADING, PrefetchState.DECODING):
+            color = t.accent.purple
+        self._prefetch_chip.configure(text=text, text_color=color)
+
+    def apply_mpc_event(self, event) -> None:
+        from core.mpc_export_manager import MpcExportEventType
+        if self._mpc_btn is None:
+            return
+        t = self._theme
+        if event.type == MpcExportEventType.ENQUEUED:
+            self._mpc_btn.configure(text="Queued", state="disabled")
+        elif event.type == MpcExportEventType.STARTED:
+            self._mpc_btn.configure(text="Exporting…", state="disabled")
+        elif event.type == MpcExportEventType.COMPLETED:
+            self._mpc_btn.configure(
+                text="Sent to MPC ✓", state="disabled", fg_color=t.status.success,
+            )
+            self._ctx.publish_toast(
+                f"MPC export ready: {event.track_dir or event.display_name}",
+                "success",
+            )
+        elif event.type == MpcExportEventType.FAILED:
+            self._mpc_btn.configure(
+                text="↻  Retry MPC", state="normal", fg_color=t.surface.raised,
+            )
+        elif event.type == MpcExportEventType.CANCELLED:
+            self._mpc_btn.configure(
+                text="◈  MPC Workflow", state="normal", fg_color=t.surface.raised,
+            )
+
+    def set_scroll_paused(self, paused: bool) -> None:
+        if self._player is not None:
+            self._player.set_scroll_paused(paused)
+
+    # ── Lazy player ──
+
+    def _ensure_player(self) -> WaveformPlayer:
+        if self._player is not None:
+            return self._player
+        assert self._player_slot is not None
+        if self._wave_placeholder is not None:
+            self._wave_placeholder.grid_remove()
+        self._player = WaveformPlayer(
+            self._player_slot, self._theme, height=84,
+            initial_volume=self._ctx.config.snapshot().config.ui.preview_volume,
+        )
+        self._player.grid(row=0, column=0, sticky="ew")
+        return self._player
+
     # ── Preview ──
 
     def _on_preview_clicked(self) -> None:
-        if self._preview_started or self._player is None:
+        if self._preview_started:
             return
         if self._ctx.preview is None:
             self._ctx.publish_toast("Preview engine unavailable.", "error")
@@ -1324,9 +1293,52 @@ class _ReelCard(ctk.CTkFrame):
         self._full_preview_loading = False
         if self._preview_btn is not None:
             self._preview_btn.configure(state="disabled", text="Loading…")
-        self._player.grid()
-        self._player.set_loading("Fetching quick preview…")
         self._record(was_queued=False)
+
+        pf = self._ctx.preview_prefetch
+        vid = self._s.youtube_video_id
+        if pf is not None:
+            cached = pf.get_decoded(vid)
+            if cached is not None:
+                self._show_preview_data(cached, full=False)
+                return
+            state = pf.get_state(vid)
+            if state in (
+                PrefetchState.PENDING,
+                PrefetchState.DOWNLOADING,
+                PrefetchState.DECODING,
+            ):
+                player = self._ensure_player()
+                player.grid()
+                player.set_loading("Almost ready…")
+                threading.Thread(
+                    target=self._wait_prefetch_worker, daemon=True,
+                ).start()
+                return
+
+        player = self._ensure_player()
+        player.grid()
+        player.set_loading("Fetching quick preview…")
+        threading.Thread(
+            target=self._preview_worker,
+            kwargs={"full": False},
+            daemon=True,
+        ).start()
+
+    def _wait_prefetch_worker(self) -> None:
+        pf = self._ctx.preview_prefetch
+        if pf is None:
+            self.after(0, lambda: self._preview_worker_ui_start())
+            return
+        data = pf.wait_ready(self._s.youtube_video_id, timeout=120.0)
+        if data is not None:
+            self.after(0, lambda d=data: self._show_preview_data(d, full=False))
+        else:
+            self.after(0, self._preview_worker_ui_start)
+
+    def _preview_worker_ui_start(self) -> None:
+        player = self._ensure_player()
+        player.set_loading("Fetching quick preview…")
         threading.Thread(
             target=self._preview_worker,
             kwargs={"full": False},
@@ -1346,6 +1358,11 @@ class _ReelCard(ctk.CTkFrame):
         ).start()
 
     def _preview_worker(self, *, full: bool) -> None:
+        def on_progress(pct: float, msg: str) -> None:
+            if self._cancel_event.is_set():
+                return
+            self.after(0, lambda p=pct, m=msg: self._on_preview_progress(m))
+
         try:
             if full:
                 data = self._ctx.preview.fetch(
@@ -1355,27 +1372,28 @@ class _ReelCard(ctk.CTkFrame):
             else:
                 data = self._ctx.preview.fetch_quick(
                     self._s.youtube_video_id,
+                    progress_callback=on_progress,
                     cancel_event=self._cancel_event,
                 )
-        except Exception as e:  # noqa: BLE001 — surfaced in the player
+        except Exception as e:  # noqa: BLE001
             self.after(0, lambda err=e, f=full: self._on_preview_error(err, full=f))
             return
-        self.after(0, lambda d=data, f=full: self._on_preview_ready(d, full=f))
+        self.after(0, lambda d=data, f=full: self._show_preview_data(d, full=f))
 
-    def _on_preview_ready(self, data, *, full: bool) -> None:
-        if self._player is None:
-            return
+    def _on_preview_progress(self, message: str) -> None:
+        if self._prefetch_chip is not None:
+            self._set_prefetch_chip(message, PrefetchState.DOWNLOADING)
+
+    def _show_preview_data(self, data, *, full: bool) -> None:
+        player = self._ensure_player()
         if full:
             self._full_preview_loading = False
-            self._player.set_preview(data)
+            player.set_preview(data)
         else:
-            self._player.set_preview(
-                data,
-                on_load_full=self._on_load_full_preview,
-            )
+            player.set_preview(data, on_load_full=self._on_load_full_preview)
         if self._preview_btn is not None:
-            self._preview_btn.grid_remove()
             self._preview_btn.pack_forget()
+            self._preview_btn.grid_remove()
 
     def _on_preview_error(self, error: Exception, *, full: bool = False) -> None:
         if full:
@@ -1384,8 +1402,8 @@ class _ReelCard(ctk.CTkFrame):
                 self._player.set_full_loading(False)
             self._ctx.publish_toast(f"Full preview failed: {error}", "warning")
             return
-        if self._player is not None:
-            self._player.set_error(f"Preview failed: {error}")
+        player = self._ensure_player()
+        player.set_error(f"Preview failed: {error}")
         if self._preview_btn is not None:
             self._preview_btn.configure(state="normal", text="↻  Retry")
         self._preview_started = False
@@ -1420,26 +1438,20 @@ class _ReelCard(ctk.CTkFrame):
         if self._on_queued is not None:
             self._on_queued(s)
 
-    # ── MPC sample workflow ──
-
     def _on_mpc_clicked(self) -> None:
-        if self._mpc_exporting:
-            return
         if self._ctx.preview is None or self._ctx.stem_separator is None \
-                or self._ctx.exporter is None:
+                or self._ctx.exporter is None or self._ctx.mpc_export_manager is None:
             self._ctx.publish_toast(
-                "MPC workflow is unavailable (missing preview/stems/exporter engine).",
+                "MPC workflow is unavailable (missing engines).",
                 "error",
             )
             return
-
         if not (self._s.youtube_video_id or "").strip():
             self._ctx.publish_toast(
                 "No YouTube match for this dig — cannot run MPC workflow.",
                 "error",
             )
             return
-
         snap = self._ctx.config.snapshot().config
         dest = Path(snap.general.mpc_samples_root).expanduser()
         try:
@@ -1450,36 +1462,37 @@ class _ReelCard(ctk.CTkFrame):
                 "error",
             )
             return
+        self._toggle_mpc_popover()
 
-        self._mpc_exporting = True
-        if self._mpc_btn is not None:
-            self._mpc_btn.configure(state="disabled", text="Working…")
-
-        self._mpc_dialog = _MpcWorkflowDialog(
-            self.winfo_toplevel(),
+    def _toggle_mpc_popover(self) -> None:
+        if self._mpc_popover is not None:
+            self._close_mpc_popover()
+            return
+        assert self._inner is not None
+        self._mpc_popover = _MpcModePopover(
+            self._inner,
             self._ctx,
             self._s,
-            on_finished=self._on_mpc_dialog_finished,
+            on_confirm=self._confirm_mpc_mode,
+            on_cancel=self._close_mpc_popover,
+        )
+        t = self._theme
+        self._mpc_popover.grid(
+            row=20, column=0, sticky="ew", pady=(t.space.sm, 0),
         )
 
-    def _on_mpc_dialog_finished(self, success: bool) -> None:
-        self._mpc_exporting = False
-        self._mpc_dialog = None
-        if self._mpc_btn is None:
-            return
-        t = self._theme
-        if success:
-            self._mpc_btn.configure(
-                text="Sent to MPC ✓",
-                state="disabled",
-                fg_color=t.status.success,
-            )
-        else:
-            self._mpc_btn.configure(
-                text="↻  Retry MPC Workflow",
-                state="normal",
-                fg_color=t.surface.raised,
-            )
+    def _close_mpc_popover(self) -> None:
+        if self._mpc_popover is not None:
+            try:
+                self._mpc_popover.destroy()
+            except Exception:
+                pass
+            self._mpc_popover = None
+
+    def _confirm_mpc_mode(self, mode: MpcExportMode) -> None:
+        self._close_mpc_popover()
+        if self._on_mpc_confirm is not None:
+            self._on_mpc_confirm(self._s, mode)
 
     def _record(self, *, was_queued: bool) -> None:
         if self._ctx.discovery is None:
@@ -1499,10 +1512,7 @@ class _ReelCard(ctk.CTkFrame):
     def _on_open_youtube(self) -> None:
         webbrowser.open(self._s.youtube_url)
 
-    # ── Teardown ──
-
     def pause_preview(self) -> None:
-        """Stop playback when the tab is hidden (keeps the card alive)."""
         if self._player is not None:
             try:
                 self._player.stop()
@@ -1511,8 +1521,11 @@ class _ReelCard(ctk.CTkFrame):
 
     def teardown(self) -> None:
         self._cancel_event.set()
+        self._close_mpc_popover()
         if self._player is not None:
             try:
                 self._player.stop()
+                self._player.destroy()
             except Exception:
                 pass
+            self._player = None

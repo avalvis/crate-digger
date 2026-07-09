@@ -113,6 +113,12 @@ class SettingsTab(ctk.CTkFrame):
         self._compilations_var: Optional[ctk.BooleanVar] = None
         self._preview_volume_slider: Optional[ctk.CTkSlider] = None
         self._preview_volume_label: Optional[ctk.CTkLabel] = None
+        self._prefetch_enabled_var: Optional[ctk.BooleanVar] = None
+        self._prefetch_enabled_switch: Optional[ctk.CTkSwitch] = None
+        self._prefetch_concurrency_dropdown: Optional[ctk.CTkOptionMenu] = None
+        self._prefetch_keep_decoded_var: Optional[ctk.BooleanVar] = None
+        self._prefetch_keep_decoded_switch: Optional[ctk.CTkSwitch] = None
+        self._mpc_export_workers_dropdown: Optional[ctk.CTkOptionMenu] = None
         self._export_sr_dropdown: Optional[ctk.CTkOptionMenu] = None
         self._export_bits_dropdown: Optional[ctk.CTkOptionMenu] = None
         self._discovery_health_label: Optional[ctk.CTkLabel] = None
@@ -429,17 +435,49 @@ class SettingsTab(ctk.CTkFrame):
         )
         self._workers_dropdown.pack(padx=2, pady=2)
 
-        # Default stems toggle
         self._field_label(
             body,
             2,
+            "MPC export workers",
+            "Simultaneous MPC exports from Digital Crate. Keep at 1 unless "
+            "you have a fast CPU — demucs is heavy.",
+        )
+        _mpc_workers_wrapper = ctk.CTkFrame(
+            body,
+            fg_color=t.border.strong,
+            border_width=0,
+            corner_radius=t.radius.md,
+        )
+        _mpc_workers_wrapper.grid(row=3, column=0, sticky="w", pady=(0, t.space.lg))
+        self._mpc_export_workers_dropdown = ctk.CTkOptionMenu(
+            _mpc_workers_wrapper,
+            values=[str(n) for n in range(1, 5)],
+            command=self._save_mpc_export_workers,
+            fg_color=t.surface.raised,
+            button_color=t.surface.raised,
+            button_hover_color=t.surface.elevated,
+            dropdown_fg_color=t.surface.elevated,
+            text_color=t.text.primary,
+            dropdown_text_color=t.text.primary,
+            dropdown_hover_color=t.surface.overlay,
+            font=t.font.body,
+            corner_radius=max(0, t.radius.md - 2),
+            width=156,
+            height=38,
+        )
+        self._mpc_export_workers_dropdown.pack(padx=2, pady=2)
+
+        # Default stems toggle
+        self._field_label(
+            body,
+            4,
             "Default 'Split stems' to on",
             "When enabled, the Manual Rip and Digital Crate tabs start "
             "with stem separation turned on.",
         )
 
         toggle_row = ctk.CTkFrame(body, fg_color="transparent")
-        toggle_row.grid(row=3, column=0, sticky="w")
+        toggle_row.grid(row=5, column=0, sticky="w")
 
         self._stems_default_var = ctk.BooleanVar(value=False)
         self._stems_default_switch = ctk.CTkSwitch(
@@ -461,7 +499,7 @@ class SettingsTab(ctk.CTkFrame):
         # AI metadata toggle
         self._field_label(
             body,
-            4,
+            6,
             "AI title extraction  (✦ DeepSeek)",
             "Sends the YouTube video title to DeepSeek to recover the original artist "
             "and song title. Requires a DeepSeek API key — set it in API keys below. "
@@ -469,7 +507,7 @@ class SettingsTab(ctk.CTkFrame):
         )
 
         ai_toggle_row = ctk.CTkFrame(body, fg_color="transparent")
-        ai_toggle_row.grid(row=5, column=0, sticky="w", pady=(0, t.space.xs))
+        ai_toggle_row.grid(row=7, column=0, sticky="w", pady=(0, t.space.xs))
 
         self._ai_metadata_var = ctk.BooleanVar(value=True)
         self._ai_metadata_switch = ctk.CTkSwitch(
@@ -706,11 +744,74 @@ class SettingsTab(ctk.CTkFrame):
         )
         self._preview_volume_label.grid(row=0, column=1)
 
+        self._field_label(
+            body, 14, "Warm previews after Dig",
+            "Background-download quick previews so Play is usually instant.",
+        )
+        prefetch_row = ctk.CTkFrame(body, fg_color="transparent")
+        prefetch_row.grid(row=15, column=0, sticky="w", pady=(0, t.space.sm))
+        self._prefetch_enabled_var = ctk.BooleanVar(value=True)
+        self._prefetch_enabled_switch = ctk.CTkSwitch(
+            prefetch_row, text="", variable=self._prefetch_enabled_var,
+            onvalue=True, offvalue=False,
+            command=lambda: self._save_prefetch_enabled(
+                self._prefetch_enabled_var.get(),
+            ),
+            progress_color=t.accent.purple,
+            button_color=t.text.primary,
+            button_hover_color=t.text.primary,
+            fg_color=t.surface.elevated, width=40, height=22,
+        )
+        self._prefetch_enabled_switch.pack(side="left")
+
+        self._field_label(body, 16, "Prefetch concurrency")
+        _pf_wrapper = ctk.CTkFrame(
+            body, fg_color=t.border.strong, border_width=0,
+            corner_radius=t.radius.md,
+        )
+        _pf_wrapper.grid(row=17, column=0, sticky="w", pady=(0, t.space.md))
+        self._prefetch_concurrency_dropdown = ctk.CTkOptionMenu(
+            _pf_wrapper,
+            values=[str(n) for n in range(1, 5)],
+            command=self._save_prefetch_concurrency,
+            fg_color=t.surface.raised,
+            button_color=t.surface.raised,
+            button_hover_color=t.surface.elevated,
+            dropdown_fg_color=t.surface.elevated,
+            text_color=t.text.primary,
+            dropdown_text_color=t.text.primary,
+            font=t.font.body,
+            corner_radius=max(0, t.radius.md - 2),
+            width=120,
+            height=38,
+        )
+        self._prefetch_concurrency_dropdown.pack(padx=2, pady=2)
+
+        self._field_label(
+            body, 18, "Keep decoded previews in memory",
+            "LRU cache (8 tracks) for instant waveform on Preview click.",
+        )
+        keep_row = ctk.CTkFrame(body, fg_color="transparent")
+        keep_row.grid(row=19, column=0, sticky="w", pady=(0, t.space.md))
+        self._prefetch_keep_decoded_var = ctk.BooleanVar(value=True)
+        self._prefetch_keep_decoded_switch = ctk.CTkSwitch(
+            keep_row, text="", variable=self._prefetch_keep_decoded_var,
+            onvalue=True, offvalue=False,
+            command=lambda: self._save_prefetch_keep_decoded(
+                self._prefetch_keep_decoded_var.get(),
+            ),
+            progress_color=t.accent.purple,
+            button_color=t.text.primary,
+            button_hover_color=t.text.primary,
+            fg_color=t.surface.elevated, width=40, height=22,
+        )
+        self._prefetch_keep_decoded_switch.pack(side="left")
+
         self._discovery_health_label = ctk.CTkLabel(
             body, text="", text_color=t.text.muted,
             font=t.font.caption, anchor="w", justify="left", wraplength=680,
         )
-        self._discovery_health_label.grid(row=14, column=0, sticky="w")
+        self._discovery_health_label.grid(row=20, column=0, sticky="w")
 
         return row + 3
 
@@ -1020,6 +1121,11 @@ class SettingsTab(ctk.CTkFrame):
         if self._workers_dropdown is not None:
             self._workers_dropdown.set(str(cfg.general.concurrent_workers))
 
+        if self._mpc_export_workers_dropdown is not None:
+            self._mpc_export_workers_dropdown.set(
+                str(cfg.general.mpc_export_max_concurrent),
+            )
+
         if self._stems_default_var is not None:
             self._stems_default_var.set(cfg.general.enable_stems_by_default)
 
@@ -1063,6 +1169,14 @@ class SettingsTab(ctk.CTkFrame):
         if self._preview_volume_slider is not None:
             self._preview_volume_slider.set(cfg.ui.preview_volume)
             self._update_preview_volume_label(cfg.ui.preview_volume)
+        if self._prefetch_enabled_var is not None:
+            self._prefetch_enabled_var.set(disc.preview_prefetch_enabled)
+        if self._prefetch_concurrency_dropdown is not None:
+            self._prefetch_concurrency_dropdown.set(
+                str(disc.preview_prefetch_concurrency),
+            )
+        if self._prefetch_keep_decoded_var is not None:
+            self._prefetch_keep_decoded_var.set(disc.preview_prefetch_keep_decoded)
 
         exp = cfg.export
         if self._export_sr_dropdown is not None:
@@ -1158,6 +1272,21 @@ class SettingsTab(ctk.CTkFrame):
             )
         except ConfigError as e:
             self._ctx.publish_toast(str(e), kind="error")
+
+    def _save_mpc_export_workers(self, value: str) -> None:
+        try:
+            n = int(value)
+        except ValueError:
+            return
+        try:
+            self._config.update_general(mpc_export_max_concurrent=n)
+        except ConfigError as e:
+            self._ctx.publish_toast(str(e), kind="error")
+        else:
+            mgr = self._ctx.mpc_export_manager
+            if mgr is not None:
+                mgr.set_max_workers(n)
+            self._ctx.notify_config_changed()
 
     def _save_stems_default(self, value: bool) -> None:
         try:
@@ -1275,6 +1404,40 @@ class SettingsTab(ctk.CTkFrame):
         except ConfigError as e:
             self._ctx.publish_toast(str(e), kind="error")
         else:
+            self._ctx.notify_config_changed()
+
+    def _save_prefetch_enabled(self, value: bool) -> None:
+        try:
+            self._config.update_discovery(preview_prefetch_enabled=bool(value))
+        except ConfigError as e:
+            self._ctx.publish_toast(str(e), kind="error")
+        else:
+            self._ctx.notify_config_changed()
+
+    def _save_prefetch_concurrency(self, value: str) -> None:
+        try:
+            n = int(value)
+        except ValueError:
+            return
+        try:
+            self._config.update_discovery(preview_prefetch_concurrency=n)
+        except ConfigError as e:
+            self._ctx.publish_toast(str(e), kind="error")
+        else:
+            pf = self._ctx.preview_prefetch
+            if pf is not None:
+                pf.configure(max_workers=n)
+            self._ctx.notify_config_changed()
+
+    def _save_prefetch_keep_decoded(self, value: bool) -> None:
+        try:
+            self._config.update_discovery(preview_prefetch_keep_decoded=bool(value))
+        except ConfigError as e:
+            self._ctx.publish_toast(str(e), kind="error")
+        else:
+            pf = self._ctx.preview_prefetch
+            if pf is not None:
+                pf.configure(keep_decoded=bool(value))
             self._ctx.notify_config_changed()
 
     def _on_preview_volume_slider(self, value: float) -> None:
@@ -1544,6 +1707,7 @@ class SettingsTab(ctk.CTkFrame):
                 vault_root=str(Path.home() / "Music" / "CrateDigger_Vault"),
                 staging_root=str(Path.home() / ".cratedigger" / "staging"),
                 concurrent_workers=2,
+                mpc_export_max_concurrent=1,
                 enable_stems_by_default=False,
                 use_ai_metadata=True,
                 vault_folder_scheme="genre/bpm_key_artist_title",
@@ -1562,6 +1726,9 @@ class SettingsTab(ctk.CTkFrame):
                 prioritize_samples=True,
                 sample_weight_intensity=0.6,
                 allow_compilations=False,
+                preview_prefetch_enabled=True,
+                preview_prefetch_concurrency=2,
+                preview_prefetch_keep_decoded=True,
             )
             self._config.update_export(sample_rate=44100, bit_depth=16)
             self._config.update_ui(preview_volume=0.85)
