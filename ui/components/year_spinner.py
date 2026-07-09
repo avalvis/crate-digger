@@ -111,16 +111,22 @@ class YearSpinner(ctk.CTkFrame):
         self._entry.bind("<FocusOut>", self._validate)
 
     def _on_increment(self) -> None:
+        if str(self._entry.cget("state")) == "disabled":
+            return
         val = self._get_current_val()
         new_val = min(self._max, val + 1)
         self._set_val(new_val)
 
     def _on_decrement(self) -> None:
+        if str(self._entry.cget("state")) == "disabled":
+            return
         val = self._get_current_val()
         new_val = max(self._min, val - 1)
         self._set_val(new_val)
 
     def _on_mousewheel(self, event) -> None:
+        if str(self._entry.cget("state")) == "disabled":
+            return "break"
         if event.delta > 0:
             self._on_increment()
         else:
@@ -143,6 +149,8 @@ class YearSpinner(ctk.CTkFrame):
             self._command(val)
 
     def _validate(self, _event=None) -> None:
+        if str(self._entry.cget("state")) == "disabled":
+            return
         raw = self._var.get().strip()
         if not raw:
             return
@@ -154,3 +162,13 @@ class YearSpinner(ctk.CTkFrame):
         val = int(raw)
         if val < self._min: self._set_val(self._min)
         elif val > self._max: self._set_val(self._max)
+
+    def set_enabled(self, enabled: bool) -> None:
+        """Enable or disable the spinner (used while a dig is in flight)."""
+        state = "normal" if enabled else "disabled"
+        try:
+            self._entry.configure(state=state)
+            self._btn_up.configure(state=state)
+            self._btn_down.configure(state=state)
+        except Exception:
+            pass

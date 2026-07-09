@@ -129,8 +129,17 @@ class DigitalCrateTab(ctk.CTkFrame):
 
         # State
         self._digging = False
+        self._dig_generation = 0
         self._dig_lock = threading.Lock()
         self._cards: list[_ReelCard] = []
+        self._filters_locked = False
+        self._filter_widgets: list[ctk.CTkBaseClass] = []
+        self._render_generation = 0
+        self._pending_render: list[DiscoverySuggestion] = []
+        self._render_index = 0
+        self._render_after: Optional[str] = None
+        self._config_save_after: Optional[str] = None
+        self._prefetch_status_after: Optional[str] = None
 
         # Widget refs
         self._from_var: Optional[ctk.StringVar] = None
@@ -181,6 +190,7 @@ class DigitalCrateTab(ctk.CTkFrame):
 
     def on_tab_hidden(self) -> None:
         """Pause reel previews when leaving the tab."""
+        self._cancel_pending_render()
         for card in self._cards:
             try:
                 card.pause_preview()
@@ -352,12 +362,20 @@ class DigitalCrateTab(ctk.CTkFrame):
                                  widget=era_wrap)
         era_wrap.grid_columnconfigure(0, weight=1)
         era_wrap.grid_columnconfigure(2, weight=1)
-        YearSpinner(era_wrap, t, self._from_var, min_year=1900, max_year=2035,
-                    placeholder="From").grid(row=0, column=0, sticky="ew")
+        self._from_spinner = YearSpinner(
+            era_wrap, t, self._from_var, min_year=1900, max_year=2035,
+            placeholder="From",
+        )
+        self._from_spinner.grid(row=0, column=0, sticky="ew")
+        self._filter_widgets.append(self._from_spinner)
         ctk.CTkLabel(era_wrap, text="→", text_color=t.text.muted,
                      font=t.font.body).grid(row=0, column=1, padx=t.space.sm)
-        YearSpinner(era_wrap, t, self._to_var, min_year=1900, max_year=2035,
-                    placeholder="To").grid(row=0, column=2, sticky="ew")
+        self._to_spinner = YearSpinner(
+            era_wrap, t, self._to_var, min_year=1900, max_year=2035,
+            placeholder="To",
+        )
+        self._to_spinner.grid(row=0, column=2, sticky="ew")
+        self._filter_widgets.append(self._to_spinner)
 
         self._build_filter_field(
             inner, 1, 1, label="Format",
@@ -387,14 +405,16 @@ class DigitalCrateTab(ctk.CTkFrame):
         self._prioritize_var = ctk.BooleanVar(value=disc.prioritize_samples)
         prio_row = ctk.CTkFrame(opts, fg_color="transparent")
         prio_row.grid(row=0, column=0, sticky="w")
-        ctk.CTkSwitch(
+        self._prioritize_switch = ctk.CTkSwitch(
             prio_row, text="Prioritize sample-friendly gems",
             variable=self._prioritize_var, onvalue=True, offvalue=False,
             command=self._on_prioritize_toggle,
             progress_color=t.accent.purple, button_color=t.text.primary,
             button_hover_color=t.text.primary, fg_color=t.surface.elevated,
             text_color=t.text.primary, font=t.font.body,
-        ).pack(side="left")
+        )
+        self._prioritize_switch.pack(side="left")
+        self._filter_widgets.append(self._prioritize_switch)
 
         # Intensity slider
         intensity_row = ctk.CTkFrame(opts, fg_color="transparent")
@@ -409,18 +429,21 @@ class DigitalCrateTab(ctk.CTkFrame):
         )
         self._intensity_slider.set(disc.sample_weight_intensity)
         self._intensity_slider.pack(side="left")
+        self._filter_widgets.append(self._intensity_slider)
 
         # Compilations + reel size
         self._compilations_var = ctk.BooleanVar(value=disc.allow_compilations)
         comp_row = ctk.CTkFrame(opts, fg_color="transparent")
         comp_row.grid(row=2, column=0, sticky="w", pady=(t.space.sm, 0))
-        ctk.CTkSwitch(
+        self._compilations_switch = ctk.CTkSwitch(
             comp_row, text="Include compilations (Various Artists)",
             variable=self._compilations_var, onvalue=True, offvalue=False,
             progress_color=t.accent.purple, button_color=t.text.primary,
             button_hover_color=t.text.primary, fg_color=t.surface.elevated,
             text_color=t.text.primary, font=t.font.body,
-        ).pack(side="left")
+        )
+        self._compilations_switch.pack(side="left")
+        self._filter_widgets.append(self._compilations_switch)
 
         size_row = ctk.CTkFrame(opts, fg_color="transparent")
         size_row.grid(row=3, column=0, sticky="w", pady=(t.space.sm, 0))
@@ -428,7 +451,9 @@ class DigitalCrateTab(ctk.CTkFrame):
                      **style_label_meta(t)).pack(side="left",
                                                 padx=(0, t.space.sm))
         self._reel_size_var = ctk.StringVar(value=str(disc.reel_size))
-        self._make_size_dropdown(size_row).pack(side="left")
+        self._reel_size_menu = self._make_size_dropdown(size_row)
+        self._reel_size_menu.pack(side="left")
+        self._filter_widgets.append(self._reel_size_menu)
 
         ctk.CTkLabel(
             inner,
@@ -457,12 +482,14 @@ class DigitalCrateTab(ctk.CTkFrame):
         t = self._theme
         wrapper = ctk.CTkFrame(parent, fg_color=t.border.strong, border_width=0,
                                corner_radius=t.radius.md)
-        ctk.CTkEntry(
+        entry = ctk.CTkEntry(
             wrapper, textvariable=variable, placeholder_text=placeholder,
             fg_color=t.surface.raised, border_width=0, text_color=t.text.primary,
             placeholder_text_color=t.text.muted, font=t.font.body,
             corner_radius=max(0, t.radius.md - 2), height=38,
-        ).pack(fill="x", padx=2, pady=2)
+        )
+        entry.pack(fill="x", padx=2, pady=2)
+        self._filter_widgets.append(entry)
         return wrapper
 
     def _make_combobox(self, parent, variable: ctk.StringVar,
@@ -480,8 +507,11 @@ class DigitalCrateTab(ctk.CTkFrame):
             corner_radius=max(0, t.radius.md - 2), height=38,
         )
         cb.pack(fill="x", padx=2, pady=2)
+        self._filter_widgets.append(cb)
 
         def on_wheel(event):
+            if self._filters_locked:
+                return "break"
             current = variable.get()
             try:
                 idx = values.index(current)
@@ -569,6 +599,8 @@ class DigitalCrateTab(ctk.CTkFrame):
     # ── Presets ──
 
     def _apply_preset(self, preset: _Preset) -> None:
+        if self._filters_locked or self._digging:
+            return
         self._from_var.set(str(preset.year_min) if preset.year_min else "")
         self._to_var.set(str(preset.year_max) if preset.year_max else "")
         self._country_var.set(preset.country)
@@ -580,12 +612,45 @@ class DigitalCrateTab(ctk.CTkFrame):
         self._on_dig_clicked()
 
     def _on_prioritize_toggle(self) -> None:
-        # Persist so the choice sticks across sessions.
+        if self._filters_locked:
+            return
+        self._schedule_discovery_pref_save()
+
+    def _schedule_discovery_pref_save(self) -> None:
+        if self._config_save_after is not None:
+            try:
+                self.after_cancel(self._config_save_after)
+            except Exception:
+                pass
+        self._config_save_after = self.after(400, self._persist_discovery_prefs)
+
+    def _persist_discovery_prefs(self) -> None:
+        self._config_save_after = None
+        if self._filters_locked:
+            self._schedule_discovery_pref_save()
+            return
         try:
             self._ctx.config.update_discovery(
                 prioritize_samples=bool(self._prioritize_var.get()))
         except Exception:
             self._log.debug("Could not persist prioritize toggle", exc_info=True)
+
+    def _persist_dig_prefs_worker(
+        self,
+        prioritize: bool,
+        intensity: float,
+        allow_compilations: bool,
+        reel_size: int,
+    ) -> None:
+        try:
+            self._ctx.config.update_discovery(
+                prioritize_samples=prioritize,
+                sample_weight_intensity=intensity,
+                allow_compilations=allow_compilations,
+                reel_size=reel_size,
+            )
+        except Exception:
+            self._log.debug("Could not persist discovery prefs", exc_info=True)
 
     # ── Dig ──
 
@@ -609,6 +674,11 @@ class DigitalCrateTab(ctk.CTkFrame):
                 btn.configure(state="normal" if ready else "disabled")
 
     def _set_filters_enabled(self, enabled: bool) -> None:
+        self._filters_locked = not enabled
+        if not enabled:
+            self._dismiss_filter_focus()
+        for widget in self._filter_widgets:
+            self._set_widget_enabled(widget, enabled)
         for btn in self._preset_buttons:
             if enabled:
                 snap = self._ctx.config.snapshot()
@@ -617,17 +687,70 @@ class DigitalCrateTab(ctk.CTkFrame):
             else:
                 btn.configure(state="disabled")
 
+    def _set_widget_enabled(self, widget: ctk.CTkBaseClass, enabled: bool) -> None:
+        if isinstance(widget, YearSpinner):
+            widget.set_enabled(enabled)
+            return
+        state = "normal" if enabled else "disabled"
+        try:
+            widget.configure(state=state)
+        except Exception:
+            pass
+
+    def _dismiss_filter_focus(self) -> None:
+        """Close dropdowns / entries before disabling filter controls."""
+        try:
+            if self._dig_button is not None:
+                self._dig_button.focus_set()
+        except Exception:
+            try:
+                self.focus_set()
+            except Exception:
+                pass
+
+    def _cancel_pending_render(self) -> None:
+        if self._render_after is not None:
+            try:
+                self.after_cancel(self._render_after)
+            except Exception:
+                pass
+            self._render_after = None
+        self._pending_render = []
+        self._render_index = 0
+
+    def _is_alive(self) -> bool:
+        try:
+            return bool(self.winfo_exists())
+        except Exception:
+            return False
+
+    def _safe_after(self, ms: int, fn: Callable[[], None]) -> Optional[str]:
+        if not self._is_alive():
+            return None
+
+        def _wrapped() -> None:
+            if not self._is_alive():
+                return
+            try:
+                fn()
+            except Exception:
+                self._log.exception("Digital Crate deferred callback failed")
+
+        return self.after(ms, _wrapped)
+
     def _on_dig_clicked(self) -> None:
         with self._dig_lock:
             if self._digging:
                 return
             self._digging = True
+            self._dig_generation += 1
+            generation = self._dig_generation
+        self._cancel_pending_render()
         self._set_dig_in_flight(True)
 
         snap = self._ctx.config.snapshot()
         if not snap.discogs_token or not self._ctx.discovery:
-            self._set_dig_in_flight(False)
-            self._digging = False
+            self._finish_dig_session(generation, unlock_filters=True)
             self._ctx.publish_toast("Add a Discogs token in Settings.",
                                     "warning")
             self._refresh_token_gate()
@@ -635,47 +758,82 @@ class DigitalCrateTab(ctk.CTkFrame):
 
         filters = self._collect_filters()
         count = self._collect_reel_size()
-        try:
-            self._ctx.config.update_discovery(
-                prioritize_samples=bool(self._prioritize_var.get()),
-                sample_weight_intensity=round(float(intensity := (
-                    self._intensity_slider.get()
-                    if self._intensity_slider is not None else 0.6
-                )), 2),
-                allow_compilations=bool(self._compilations_var.get()),
-                reel_size=count,
-            )
-        except Exception:
-            self._log.debug("Could not persist discovery prefs", exc_info=True)
-        threading.Thread(target=self._run_dig_worker, args=(filters, count),
-                         daemon=True).start()
+        intensity = (
+            self._intensity_slider.get()
+            if self._intensity_slider is not None else 0.6
+        )
+        self._schedule_discovery_pref_save()
+        threading.Thread(
+            target=self._persist_dig_prefs_worker,
+            args=(
+                bool(self._prioritize_var.get()),
+                round(float(intensity), 2),
+                bool(self._compilations_var.get()),
+                count,
+            ),
+            daemon=True,
+        ).start()
+        threading.Thread(
+            target=self._run_dig_worker,
+            args=(filters, count, generation),
+            daemon=True,
+        ).start()
 
-    def _run_dig_worker(self, filters: DiscoveryFilters, count: int) -> None:
+    def _run_dig_worker(
+        self,
+        filters: DiscoveryFilters,
+        count: int,
+        generation: int,
+    ) -> None:
         results: list[DiscoverySuggestion] = []
         error: Optional[Exception] = None
         try:
             results = self._ctx.discovery.dig_many(filters, count=count)
         except Exception as e:  # noqa: BLE001 — surfaced via toast
             error = e
-        self.after(0, lambda: self._on_dig_finished(results, error))
+        if not self._is_alive():
+            return
+        self._safe_after(
+            0,
+            lambda: self._on_dig_finished(results, error, generation),
+        )
 
-    def _on_dig_finished(self, results: list[DiscoverySuggestion],
-                         error: Optional[Exception]) -> None:
+    def _finish_dig_session(
+        self,
+        generation: int,
+        *,
+        unlock_filters: bool,
+    ) -> None:
+        if generation != self._dig_generation:
+            return
         self._digging = False
-        self._set_dig_in_flight(False)
-        self._update_health()
-        if error is not None:
-            self._handle_dig_error(error)
+        if unlock_filters:
+            self._set_dig_in_flight(False)
+
+    def _on_dig_finished(
+        self,
+        results: list[DiscoverySuggestion],
+        error: Optional[Exception],
+        generation: int,
+    ) -> None:
+        if generation != self._dig_generation:
             return
-        if not results:
-            self._ctx.publish_toast("No results found. Try wider filters.",
-                                    "warning")
-            return
-        self._render_reel(results)
-        self._start_prefetch(results)
-        self._ctx.publish_toast(
-            f"Dug up {len(results)} gem{'s' if len(results) != 1 else ''}.",
-            "success")
+        try:
+            self._update_health()
+            if error is not None:
+                self._handle_dig_error(error)
+                return
+            if not results:
+                self._ctx.publish_toast("No results found. Try wider filters.",
+                                        "warning")
+                return
+            self._render_reel_chunked(results, generation)
+        except Exception as e:  # noqa: BLE001
+            self._log.exception("Dig finish handler failed")
+            self._ctx.publish_toast(f"Could not show dig results: {e}", "error")
+        finally:
+            if error is not None or not results:
+                self._finish_dig_session(generation, unlock_filters=True)
 
     def _handle_dig_error(self, error: Exception) -> None:
         if isinstance(error, NoResultsError):
@@ -715,24 +873,73 @@ class DigitalCrateTab(ctk.CTkFrame):
         done, total = pf.batch_progress()
         self._set_dig_status(f"Warming previews ({done}/{total})…")
 
-    def _render_reel(self, results: list[DiscoverySuggestion]) -> None:
+    def _render_reel_chunked(
+        self,
+        results: list[DiscoverySuggestion],
+        generation: int,
+    ) -> None:
+        self._cancel_pending_render()
         self._clear_cards()
         self._video_to_card.clear()
         self._reel_empty.grid_remove()
+        self._pending_render = list(results)
+        self._render_index = 0
+        self._render_generation = generation
+        self._set_dig_status("Building reel…")
+        self._render_next_chunk()
+
+    _REEL_RENDER_CHUNK = 2
+
+    def _render_next_chunk(self) -> None:
+        self._render_after = None
+        if self._render_generation != self._dig_generation:
+            return
+        if self._reel_frame is None:
+            self._finish_dig_session(self._render_generation, unlock_filters=True)
+            return
+
         t = self._theme
-        for i, s in enumerate(results):
-            card = _ReelCard(
-                self._reel_frame, self._ctx, s,
-                on_queued=self._on_card_queued,
-                on_mpc_confirm=self._on_card_mpc_confirm,
-            )
-            card.grid(row=i, column=0, sticky="ew", pady=(0, t.space.md))
-            self._cards.append(card)
-            if s.youtube_video_id:
-                self._video_to_card[s.youtube_video_id] = card
-                pf = self._ctx.preview_prefetch
-                if pf is not None:
-                    card.apply_prefetch_state(pf.get_state(s.youtube_video_id))
+        end = min(
+            self._render_index + self._REEL_RENDER_CHUNK,
+            len(self._pending_render),
+        )
+        for i in range(self._render_index, end):
+            s = self._pending_render[i]
+            try:
+                card = _ReelCard(
+                    self._reel_frame, self._ctx, s,
+                    on_queued=self._on_card_queued,
+                    on_mpc_confirm=self._on_card_mpc_confirm,
+                )
+                card.grid(row=i, column=0, sticky="ew", pady=(0, t.space.md))
+                self._cards.append(card)
+                if s.youtube_video_id:
+                    self._video_to_card[s.youtube_video_id] = card
+                    pf = self._ctx.preview_prefetch
+                    if pf is not None:
+                        card.apply_prefetch_state(
+                            pf.get_state(s.youtube_video_id),
+                        )
+            except Exception:
+                self._log.exception("Failed to build reel card for %s", s.display_name)
+
+        self._render_index = end
+        if self._render_index < len(self._pending_render):
+            self._render_after = self._safe_after(16, self._render_next_chunk)
+            return
+
+        self._pending_render = []
+        results_count = len(self._cards)
+        self._ctx.publish_toast(
+            f"Dug up {results_count} gem{'s' if results_count != 1 else ''}.",
+            "success",
+        )
+        self._finish_dig_session(self._render_generation, unlock_filters=True)
+        self._start_prefetch([c._s for c in self._cards])
+
+    def _render_reel(self, results: list[DiscoverySuggestion]) -> None:
+        """Synchronous render — kept for callers/tests; prefer chunked path."""
+        self._render_reel_chunked(results, self._dig_generation)
 
     def _on_card_mpc_confirm(
         self, suggestion: DiscoverySuggestion, mode: MpcExportMode,
@@ -851,12 +1058,15 @@ class DigitalCrateTab(ctk.CTkFrame):
             self._set_dig_status(None)
 
     def _set_dig_status(self, message: Optional[str]) -> None:
-        if message:
-            self._dig_spinner.start()
-            self._dig_status_label.configure(text=message)
-        else:
-            self._dig_spinner.stop()
-            self._dig_status_label.configure(text="")
+        try:
+            if message:
+                self._dig_spinner.start()
+                self._dig_status_label.configure(text=message)
+            else:
+                self._dig_spinner.stop()
+                self._dig_status_label.configure(text="")
+        except Exception:
+            self._log.debug("Could not update dig status", exc_info=True)
 
     # ── Filter collection ──
 
@@ -965,22 +1175,39 @@ class DigitalCrateTab(ctk.CTkFrame):
         self._mpc_unsub = mgr.subscribe(self._on_mpc_export_event, weak=True)
 
     def _on_prefetch_event(self, event: PrefetchEvent) -> None:
-        self.after(0, lambda e=event: self._apply_prefetch_event(e))
+        if not self._is_alive():
+            return
+        self._safe_after(0, lambda e=event: self._apply_prefetch_event(e))
 
     def _apply_prefetch_event(self, event: PrefetchEvent) -> None:
-        card = self._video_to_card.get(event.video_id)
-        if card is not None:
-            card.apply_prefetch_event(event)
-        if event.type == PrefetchEventType.BATCH_DRAINED:
-            self._set_dig_status(None)
-        elif event.type in (
-            PrefetchEventType.STATE_CHANGED,
-            PrefetchEventType.PROGRESS,
-        ):
-            pf = self._ctx.preview_prefetch
-            if pf is not None:
-                done, total = pf.batch_progress()
-                self._set_dig_status(f"Warming previews ({done}/{total})…")
+        try:
+            card = self._video_to_card.get(event.video_id)
+            if card is not None:
+                if event.type == PrefetchEventType.PROGRESS:
+                    card.apply_prefetch_event(event, throttle=True)
+                else:
+                    card.apply_prefetch_event(event)
+            if event.type == PrefetchEventType.BATCH_DRAINED:
+                self._set_dig_status(None)
+            elif event.type == PrefetchEventType.STATE_CHANGED:
+                self._schedule_prefetch_status_update()
+        except Exception:
+            self._log.exception("Prefetch UI update failed")
+
+    def _schedule_prefetch_status_update(self) -> None:
+        if self._prefetch_status_after is not None:
+            return
+        self._prefetch_status_after = self._safe_after(
+            250, self._update_prefetch_status,
+        )
+
+    def _update_prefetch_status(self) -> None:
+        self._prefetch_status_after = None
+        pf = self._ctx.preview_prefetch
+        if pf is None:
+            return
+        done, total = pf.batch_progress()
+        self._set_dig_status(f"Warming previews ({done}/{total})…")
 
     def _on_mpc_export_event(self, event) -> None:
         self.after(0, lambda e=event: self._apply_mpc_export_event(e))
@@ -1105,6 +1332,8 @@ class _ReelCard(ctk.CTkFrame):
         self._mpc_btn: Optional[ctk.CTkButton] = None
         self._mpc_popover: Optional[_MpcModePopover] = None
         self._inner: Optional[ctk.CTkFrame] = None
+        self._last_prefetch_pct = -1.0
+        self._last_prefetch_msg = ""
 
         self.grid_columnconfigure(0, weight=1)
         self._build()
@@ -1205,7 +1434,18 @@ class _ReelCard(ctk.CTkFrame):
         }
         self._set_prefetch_chip(labels.get(state, ""), state)
 
-    def apply_prefetch_event(self, event: PrefetchEvent) -> None:
+    def apply_prefetch_event(
+        self, event: PrefetchEvent, *, throttle: bool = False,
+    ) -> None:
+        if throttle and event.type == PrefetchEventType.PROGRESS:
+            msg = event.message or "Warming…"
+            if (
+                event.percent - self._last_prefetch_pct < 8.0
+                and msg == self._last_prefetch_msg
+            ):
+                return
+            self._last_prefetch_pct = event.percent
+            self._last_prefetch_msg = msg
         if event.type == PrefetchEventType.PROGRESS:
             msg = event.message or "Warming…"
             self._set_prefetch_chip(msg, event.state)
