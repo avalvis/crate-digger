@@ -850,7 +850,7 @@ class _MpcWorkflowDialog(ctk.CTkToplevel):
     """Choose export contents, then show progress for MPC workflow."""
 
     _WIDTH = 520
-    _HEIGHT_CHOICE = 340
+    _HEIGHT_CHOICE_MIN = 420
     _HEIGHT_PROGRESS = 240
 
     def __init__(
@@ -880,23 +880,30 @@ class _MpcWorkflowDialog(ctk.CTkToplevel):
         t = self._theme
         self.title("MPC Workflow")
         self.configure(fg_color=t.surface.base)
-        self.geometry(f"{self._WIDTH}x{self._HEIGHT_CHOICE}")
         self.resizable(False, False)
         self.transient(parent)
         self.protocol("WM_DELETE_WINDOW", self._on_cancel)
 
-        self._center_over(parent)
         self._body_frame = ctk.CTkFrame(self, fg_color="transparent")
         self._body_frame.pack(fill="both", expand=True, padx=t.space.xl, pady=t.space.xl)
         self._build_choice_phase()
+        self._fit_choice_window(parent)
 
-    def _center_over(self, parent: ctk.CTkBaseClass) -> None:
+    def _fit_choice_window(self, parent: ctk.CTkBaseClass) -> None:
+        self.update_idletasks()
+        height = max(self._HEIGHT_CHOICE_MIN, self.winfo_reqheight() + 24)
+        self.geometry(f"{self._WIDTH}x{height}")
+        self._center_over(parent, height=height)
+
+    def _center_over(
+        self, parent: ctk.CTkBaseClass, *, height: Optional[int] = None,
+    ) -> None:
         parent.update_idletasks()
         px = parent.winfo_rootx()
         py = parent.winfo_rooty()
         pw = parent.winfo_width()
         ph = parent.winfo_height()
-        h = self._HEIGHT_CHOICE
+        h = height if height is not None else self.winfo_height()
         self.geometry(f"+{px + (pw - self._WIDTH) // 2}+{py + (ph - h) // 2}")
 
     def _build_choice_phase(self) -> None:
@@ -993,7 +1000,7 @@ class _MpcWorkflowDialog(ctk.CTkToplevel):
         frame.grid_columnconfigure(0, weight=1)
         t = self._theme
         self.geometry(f"{self._WIDTH}x{self._HEIGHT_PROGRESS}")
-        self._center_over(self.master)
+        self._center_over(self.master, height=self._HEIGHT_PROGRESS)
 
         mode_label = {
             MpcExportMode.SONG: "Exporting original song…",

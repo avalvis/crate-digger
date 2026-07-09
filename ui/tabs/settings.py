@@ -20,6 +20,9 @@ invalid values produce a red-bordered field + toast rather than a save.
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import webbrowser
 from pathlib import Path
 from tkinter import filedialog
@@ -245,11 +248,19 @@ class SettingsTab(ctk.CTkFrame):
 
         ctk.CTkButton(
             vault_row,
+            text="Open",
+            command=self._open_vault_root,
+            **style_ghost_button(t),
+            width=72,
+        ).grid(row=0, column=1, sticky="e", padx=(0, t.space.xs))
+
+        ctk.CTkButton(
+            vault_row,
             text="Browse…",
             command=self._pick_vault_root,
             **style_secondary_button(t),
             width=100,
-        ).grid(row=0, column=1, sticky="e")
+        ).grid(row=0, column=2, sticky="e")
 
         # Staging root (secondary)
         self._field_label(
@@ -357,11 +368,19 @@ class SettingsTab(ctk.CTkFrame):
 
         ctk.CTkButton(
             mpc_row,
+            text="Open",
+            command=self._open_mpc_root,
+            **style_ghost_button(t),
+            width=72,
+        ).grid(row=0, column=1, sticky="e", padx=(0, t.space.xs))
+
+        ctk.CTkButton(
+            mpc_row,
             text="Browse…",
             command=self._pick_mpc_root,
             **style_secondary_button(t),
             width=100,
-        ).grid(row=0, column=1, sticky="e")
+        ).grid(row=0, column=2, sticky="e")
 
         return row + 3  # heading + subtitle + card row
 
@@ -1433,6 +1452,42 @@ class SettingsTab(ctk.CTkFrame):
         self._refresh_deepseek_status(snap)
 
     # ── Browse buttons ──
+
+    def _open_vault_root(self) -> None:
+        self._open_directory(self._vault_entry.get() if self._vault_entry else "", "Vault root")
+
+    def _open_mpc_root(self) -> None:
+        self._open_directory(
+            self._mpc_root_entry.get() if self._mpc_root_entry else "",
+            "MPC Samples folder",
+        )
+
+    def _open_directory(self, raw_path: str, label: str) -> None:
+        value = self._normalize_path(raw_path)
+        if not value:
+            self._ctx.publish_toast(f"Enter a {label.lower()} path first.", "warning")
+            return
+
+        path = Path(value).expanduser()
+        if not path.exists():
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                self._ctx.publish_toast(f"Could not open {label}: {e}", "error")
+                return
+
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.run(["open", str(path)], check=False)
+            else:
+                subprocess.run(["xdg-open", str(path)], check=False)
+        except Exception as e:
+            try:
+                webbrowser.open(path.as_uri())
+            except Exception:
+                self._ctx.publish_toast(f"Could not open folder: {e}", "error")
 
     def _pick_vault_root(self) -> None:
         current = self._vault_entry.get() if self._vault_entry else ""

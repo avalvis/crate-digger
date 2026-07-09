@@ -144,8 +144,7 @@ class ProgressRow(ctk.CTkFrame):
             s.display_name = event.display_name
         if event.stage is not None:
             s.stage = event.stage
-        if event.overall_percent:
-            # Don't let progress go backwards.
+        if event.overall_percent is not None:
             s.overall_percent = max(s.overall_percent, event.overall_percent)
         if event.message:
             s.message = event.message
@@ -276,11 +275,12 @@ class ProgressRow(ctk.CTkFrame):
             title = title[:67] + "…"
         self._title_label.configure(text=title)
 
-        # Stage + percent
-        stage_text = _STAGE_LABELS.get(s.stage, s.stage.value)
-        if s.is_failed and s.error_message:
+        # Stage line: prefer the live pipeline message (sub-step detail),
+        # fall back to the static stage label when none has arrived yet.
+        stage_text = self._status_text()
+        if s.is_failed:
             self._stage_label.configure(
-                text=f"{stage_text}  ·  {s.error_message[:80]}",
+                text=stage_text,
                 text_color=t.status.error,
             )
         elif s.is_cancelled:
@@ -325,6 +325,15 @@ class ProgressRow(ctk.CTkFrame):
 
         # Action buttons
         self._render_actions()
+
+    def _status_text(self) -> str:
+        s = self._state
+        if s.is_failed and s.error_message:
+            stage_text = s.message or _STAGE_LABELS.get(s.stage, s.stage.value)
+            return f"{stage_text}  ·  {s.error_message[:80]}"
+        if s.message:
+            return s.message
+        return _STAGE_LABELS.get(s.stage, s.stage.value)
 
     def _render_chips(self) -> None:
         t = self._theme
