@@ -44,6 +44,9 @@ class _StubQueueManager:
     def shutdown(self, timeout=5.0, cancel_in_flight=True):
         self._stopped.set()
 
+    def list_jobs(self, statuses=None, limit: int = 100):
+        return []
+
     def _emit_loop(self):
         """Emit a fake job every ~8 seconds so you can see the UI react."""
         job_id = 1000

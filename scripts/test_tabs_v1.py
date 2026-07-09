@@ -39,6 +39,9 @@ class _StubQueueManager:
     def shutdown(self, timeout=5.0, cancel_in_flight=True):
         self._stopped.set()
 
+    def list_jobs(self, statuses=None, limit: int = 100):
+        return []
+
     def enqueue(self, request):
         jid = self._next_id
         self._next_id += 1

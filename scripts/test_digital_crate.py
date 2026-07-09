@@ -114,6 +114,8 @@ class _StubQueueManager:
 
     def start(self): pass
     def shutdown(self, **_k): pass
+    def list_jobs(self, statuses=None, limit: int = 100):
+        return []
 
     def enqueue(self, request):
         jid = self._next_id
