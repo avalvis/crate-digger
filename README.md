@@ -88,8 +88,9 @@ pip install -r requirements.txt
 
 ## Run
 
-**Windows (recommended):** double-click `Run Crate Digger.bat` in the project folder.  
-On first launch it creates a `.venv`, installs dependencies, then starts the app.
+**Windows (recommended):** double-click **`Crate Digger.lnk`** in the project folder (vinyl icon shortcut).  
+If the shortcut is missing, run **`Create Shortcut.bat`** once to generate it from `assets/crate-digger.ico`.  
+You can also use `Run Crate Digger.bat` directly — on first launch it creates a `.venv`, installs dependencies, then starts the app.
 
 ```bash
 python main.py

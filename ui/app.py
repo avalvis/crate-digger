@@ -251,20 +251,45 @@ class CrateDiggerApp:
         self.shutdown()
 
     def _persist_window_state(self) -> None:
-        try:
-            w = self._root.winfo_width()
-            h = self._root.winfo_height()
-        except Exception:
-            return
-        if w < 200 or h < 200:
-            return
-        updates: dict = {"window_width": int(w), "window_height": int(h)}
+        maximized = self._is_window_maximized()
+        updates: dict = {"window_maximized": maximized}
+        if not maximized:
+            try:
+                w = self._root.winfo_width()
+                h = self._root.winfo_height()
+            except Exception:
+                return
+            if w < 200 or h < 200:
+                return
+            updates["window_width"] = int(w)
+            updates["window_height"] = int(h)
         if self._active_tab_key:
             updates["last_active_tab"] = self._active_tab_key
         try:
             self._config.update_ui(**updates)
         except Exception:
             self._log.exception("update_ui during shutdown failed")
+
+    def _is_window_maximized(self) -> bool:
+        try:
+            if sys.platform == "win32":
+                return str(self._root.state()) == "zoomed"
+            if sys.platform == "darwin":
+                return str(self._root.state()) == "zoomed"
+            return bool(self._root.attributes("-zoomed"))
+        except Exception:
+            return False
+
+    def _apply_window_maximized(self) -> None:
+        try:
+            if sys.platform == "win32":
+                self._root.state("zoomed")
+            elif sys.platform == "darwin":
+                self._root.state("zoomed")
+            else:
+                self._root.attributes("-zoomed", True)
+        except Exception:
+            self._log.debug("Could not maximize window on this platform", exc_info=True)
 
     def _cancel_pending_tk_after_callbacks(self) -> None:
         try:
@@ -287,13 +312,25 @@ class CrateDiggerApp:
         r.configure(fg_color=t.surface.app)
         r.minsize(t.window_min_width, t.window_min_height)
         snap = self._config.snapshot()
-        init_w = max(t.window_min_width, snap.config.ui.window_width)
-        init_h = max(t.window_min_height, snap.config.ui.window_height)
-        screen_w = r.winfo_screenwidth()
-        screen_h = r.winfo_screenheight()
-        x = max(0, (screen_w - init_w) // 2)
-        y = max(0, (screen_h - init_h) // 2)
-        r.geometry(f"{init_w}x{init_h}+{x}+{y}")
+        ui = snap.config.ui
+
+        if ui.window_maximized:
+            init_w = max(t.window_min_width, ui.window_width)
+            init_h = max(t.window_min_height, ui.window_height)
+            screen_w = r.winfo_screenwidth()
+            screen_h = r.winfo_screenheight()
+            x = max(0, (screen_w - init_w) // 2)
+            y = max(0, (screen_h - init_h) // 2)
+            r.geometry(f"{init_w}x{init_h}+{x}+{y}")
+            r.after(0, self._apply_window_maximized)
+        else:
+            init_w = max(t.window_min_width, ui.window_width)
+            init_h = max(t.window_min_height, ui.window_height)
+            screen_w = r.winfo_screenwidth()
+            screen_h = r.winfo_screenheight()
+            x = max(0, (screen_w - init_w) // 2)
+            y = max(0, (screen_h - init_h) // 2)
+            r.geometry(f"{init_w}x{init_h}+{x}+{y}")
 
     # ── Nav items ──
 

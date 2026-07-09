@@ -201,6 +201,7 @@ class UIConfig(BaseModel):
 
     window_width: int = Field(default=1280, ge=1120)
     window_height: int = Field(default=820, ge=720)
+    window_maximized: bool = True
     last_active_tab: str = "manual_rip"
     # Playback volume for the in-app preview players (0.0..1.0).
     preview_volume: float = Field(default=0.85, ge=0.0, le=1.0)
