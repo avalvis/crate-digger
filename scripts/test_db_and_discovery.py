@@ -58,6 +58,8 @@ def test_database() -> None:
             artist="João Gilberto",
             title="Corcovado (remastered)",   # updated
             genre="Jazz",
+            bpm=92.5,
+            year=1964,
             source_url="https://music.youtube.com/watch?v=TEST",
             source_platform="youtube_music",
         ))
@@ -134,6 +136,11 @@ def test_database() -> None:
                     ))
             except Exception as e:
                 errors.append(e)
+            finally:
+                conn = getattr(db._tls, "conn", None)
+                if conn is not None:
+                    conn.close()
+                    delattr(db._tls, "conn")
 
         t0 = time.monotonic()
         threads = [threading.Thread(target=insert_batch, args=(i,))
@@ -201,7 +208,10 @@ def test_discovery() -> None:
         for i in range(10):
             try:
                 eng.dig(DiscoveryFilters(
-                    decade=1970 + (i % 3) * 10, genre="Jazz", min_have=20,
+                    year_min=1970 + (i % 3) * 10,
+                    year_max=1979 + (i % 3) * 10,
+                    genre="Jazz",
+                    min_have=20,
                 ))
                 successes += 1
             except DiscoveryError as e:

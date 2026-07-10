@@ -615,7 +615,7 @@ class SettingsTab(ctk.CTkFrame):
         )
 
         self._field_label(
-            body, 0, "Minimum collectors (want)",
+            body, 0, "Minimum owners (have)",
             "Discogs 'have' threshold — lower surfaces rarer records.",
         )
         self._min_have_entry = ctk.CTkEntry(

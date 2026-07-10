@@ -107,15 +107,22 @@ class _Preset:
 
 
 _PRESETS: list[_Preset] = [
-    _Preset("70s Soul / Funk", 1970, 1979, genre="Funk / Soul"),
-    _Preset("60s–70s Jazz", 1960, 1979, genre="Jazz"),
-    _Preset("Greek 60s–80s", 1960, 1989, country="Greece"),
-    _Preset("Library / OST", 1960, 1985, genre="Stage & Screen",
-            style="Library Music"),
-    _Preset("Brazilian", 1965, 1985, country="Brazil"),
-    _Preset("Spiritual Jazz", 1965, 1979, genre="Jazz",
+    # Presets define broad, fertile crates. The sampling taxonomy then lifts
+    # break-friendly substyles without starving Discogs with AND filters.
+    _Preset("Soul & Funk Breaks", 1965, 1983, genre="Funk / Soul"),
+    _Preset("Jazz-Funk & Soul-Jazz", 1963, 1983, genre="Jazz"),
+    _Preset("Library & Soundtracks", 1955, 1985, genre="Stage & Screen"),
+    _Preset("Brazil: MPB & Samba", 1964, 1985, country="Brazil"),
+    _Preset("Spiritual Jazz", 1963, 1979, genre="Jazz",
             style="Spiritual Jazz"),
-    _Preset("Everything (weighted)"),
+    _Preset("Afrobeat", 1960, 1985, style="Afrobeat"),
+    _Preset("Highlife", 1955, 1985, style="Highlife"),
+    _Preset("Psych & Prog Textures", 1965, 1982, genre="Rock"),
+    _Preset("Dub & Roots Reggae", 1965, 1985, genre="Reggae"),
+    _Preset("Greek Golden Era", 1955, 1989, country="Greece"),
+    _Preset("Greek Rebetiko & Laiko", 1930, 1979, country="Greece",
+            genre="Folk, World, & Country"),
+    _Preset("Wildcard Gems"),
 ]
 
 
@@ -332,10 +339,10 @@ class DigitalCrateTab(ctk.CTkFrame):
 
         wrap = ctk.CTkFrame(parent, fg_color="transparent")
         wrap.grid(row=row + 1, column=0, sticky="ew", pady=(0, t.space.lg))
-        # Use a flowing row of chip buttons.
-        col = 0
+        # Two compact rows keep the producer crates visible at normal widths.
+        columns = 4
         self._preset_buttons = []
-        for preset in _PRESETS:
+        for index, preset in enumerate(_PRESETS):
             btn = ctk.CTkButton(
                 wrap, text=preset.label,
                 command=lambda p=preset: self._apply_preset(p),
@@ -344,10 +351,10 @@ class DigitalCrateTab(ctk.CTkFrame):
                 border_width=t.stroke.regular, corner_radius=t.radius.pill,
                 font=t.font.caption, height=32,
             )
-            btn.grid(row=0, column=col, padx=(0, t.space.sm), pady=t.space.xxs,
+            btn.grid(row=index // columns, column=index % columns,
+                     padx=(0, t.space.sm), pady=t.space.xxs,
                      sticky="w")
             self._preset_buttons.append(btn)
-            col += 1
         return row + 2
 
     def _build_filters_card(self, parent, row: int) -> int:
@@ -956,7 +963,7 @@ class DigitalCrateTab(ctk.CTkFrame):
             return
         self._safe_after(
             0,
-            lambda: self._on_dig_finished(results, error, generation),
+            lambda: self._on_dig_finished(results, error, generation, filters),
         )
 
     def _on_dig_cancelled(self, generation: int) -> None:
@@ -985,13 +992,14 @@ class DigitalCrateTab(ctk.CTkFrame):
         results: list[DiscoverySuggestion],
         error: Optional[Exception],
         generation: int,
+        filters: DiscoveryFilters,
     ) -> None:
         if generation != self._dig_generation:
             return
         try:
             self._update_health()
             if error is not None:
-                self._handle_dig_error(error)
+                self._handle_dig_error(error, filters)
                 return
             if not results:
                 self._ctx.publish_toast("No results found. Try wider filters.",
@@ -1006,16 +1014,30 @@ class DigitalCrateTab(ctk.CTkFrame):
             if error is not None or not results:
                 self._finish_dig_session(generation, unlock_filters=True)
 
-    def _handle_dig_error(self, error: Exception) -> None:
+    def _handle_dig_error(
+        self, error: Exception, filters: DiscoveryFilters,
+    ) -> None:
         if isinstance(error, NoResultsError):
             snap = self._ctx.config.snapshot().config.discovery
-            self._ctx.publish_toast(
-                "No diggable records in your want/have window. "
-                f"With no filters we explore a random genre — try lowering "
-                f"Min Have (now {snap.default_min_have}) or raising "
-                f"Max Have (now {snap.max_have}) in Settings.",
-                "info",
-            )
+            has_filters = any((
+                filters.query, filters.country, filters.genre, filters.style,
+                filters.format, filters.year, filters.year_min, filters.year_max,
+            ))
+            if has_filters:
+                self._ctx.publish_toast(
+                    "No records matched this crate after metadata checks. "
+                    "Try widening the era or clearing one filter. "
+                    f"Owners are already relaxed for filtered digs; "
+                    f"Max Have is {snap.max_have}.",
+                    "info",
+                )
+            else:
+                self._ctx.publish_toast(
+                    "No diggable records in the current owners window. "
+                    f"Try lowering Min Have (now {snap.default_min_have}) or "
+                    f"raising Max Have (now {snap.max_have}) in Settings.",
+                    "info",
+                )
         elif isinstance(error, NoYouTubeMatchError):
             self._ctx.publish_toast(
                 "Found records on Discogs but none resolved on YouTube Music. "

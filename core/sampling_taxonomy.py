@@ -34,16 +34,16 @@ from typing import Iterable, Optional
 # Multipliers applied to the base desirability. 1.0 is neutral. Values
 # above 1.0 boost; below 1.0 gently deprioritize. Nothing goes to 0.
 
-_TIER_PRIME = 1.6      # the classic sampling bedrock
-_TIER_STRONG = 1.4     # deep-dig staples
+_TIER_PRIME = 1.75     # the classic sampling bedrock
+_TIER_STRONG = 1.45    # deep-dig staples
 _TIER_GOOD = 1.2       # frequently flipped
 _TIER_NEUTRAL = 1.0    # no opinion
 _TIER_SOFT = 0.85      # rarely sampled, mild deprioritize
-_TIER_COLD = 0.7       # modern/electronic-leaning, least sample-friendly
+_TIER_COLD = 0.62      # modern/electronic-leaning, least sample-friendly
 
 # Country bonus — additive nudge folded in multiplicatively below.
 _GREECE_BONUS = 1.35   # the user's home crate; surface Greek gems more often
-_INTL_DIG_BONUS = 1.15  # classic international digging territories
+_INTL_DIG_BONUS = 1.2   # classic international digging territories
 
 
 # ─── Genre weights (Discogs top-level genre strings) ─────────────────
@@ -76,11 +76,13 @@ _STYLE_WEIGHTS: dict[str, float] = {
     "soul": _TIER_PRIME,
     "funk": _TIER_PRIME,
     "rhythm & blues": _TIER_PRIME,
+    "breaks": _TIER_PRIME,
+    "breakbeat": _TIER_STRONG,
     "neo soul": _TIER_STRONG,
     "disco": _TIER_STRONG,
     "boogie": _TIER_STRONG,
-    "gospel": _TIER_STRONG,
-    "p.funk": _TIER_STRONG,
+    "gospel": _TIER_PRIME,
+    "p.funk": _TIER_PRIME,
     # Jazz family — the deep well
     "soul-jazz": _TIER_PRIME,
     "jazz-funk": _TIER_PRIME,
@@ -98,8 +100,8 @@ _STYLE_WEIGHTS: dict[str, float] = {
     "easy listening": _TIER_GOOD,
     # Library / soundtrack / cinematic
     "library music": _TIER_PRIME,
-    "score": _TIER_STRONG,
-    "soundtrack": _TIER_STRONG,
+    "score": _TIER_PRIME,
+    "soundtrack": _TIER_PRIME,
     "theme": _TIER_GOOD,
     # Brazilian / Latin
     "mpb": _TIER_STRONG,
@@ -117,11 +119,11 @@ _STYLE_WEIGHTS: dict[str, float] = {
     "afrobeat": _TIER_STRONG,
     "highlife": _TIER_STRONG,
     "ethio-jazz": _TIER_PRIME,
-    "afro-funk": _TIER_STRONG,
+    "afro-funk": _TIER_PRIME,
     "juju": _TIER_GOOD,
     # Psych / prog / rock textures worth flipping
     "psychedelic rock": _TIER_STRONG,
-    "prog rock": _TIER_GOOD,
+    "prog rock": _TIER_STRONG,
     "krautrock": _TIER_STRONG,
     "folk rock": _TIER_GOOD,
     "acid rock": _TIER_GOOD,
@@ -130,7 +132,7 @@ _STYLE_WEIGHTS: dict[str, float] = {
     "avantgarde": _TIER_GOOD,
     # Reggae / dub
     "dub": _TIER_STRONG,
-    "roots reggae": _TIER_GOOD,
+    "roots reggae": _TIER_STRONG,
     "rocksteady": _TIER_STRONG,
     "ska": _TIER_GOOD,
     "dancehall": _TIER_SOFT,
@@ -161,6 +163,9 @@ _STYLE_WEIGHTS: dict[str, float] = {
     "eurodance": _TIER_COLD,
     "gabber": _TIER_COLD,
     "hardcore": _TIER_COLD,
+    "jungle": _TIER_SOFT,
+    "deep house": _TIER_COLD,
+    "garage house": _TIER_COLD,
     "synth-pop": _TIER_SOFT,
     "euro house": _TIER_COLD,
 }
@@ -318,20 +323,26 @@ _DISCOGS_DIG_GENRES: tuple[tuple[str, float], ...] = (
     ("Reggae", _TIER_GOOD),
     ("Folk, World, & Country", _TIER_GOOD),
     ("Blues", _TIER_GOOD),
-    ("Rock", _TIER_NEUTRAL),
-    ("Electronic", _TIER_COLD),
-    ("Pop", _TIER_SOFT),
+    ("Rock", _TIER_GOOD),
 )
 
 _DISCOGS_DIG_STYLES: tuple[tuple[str, float], ...] = (
     ("Soul", _TIER_PRIME),
     ("Funk", _TIER_PRIME),
+    ("Breaks", _TIER_PRIME),
     ("Soul-Jazz", _TIER_PRIME),
-    ("Library Music", _TIER_STRONG),
+    ("Jazz-Funk", _TIER_PRIME),
+    ("Library Music", _TIER_PRIME),
+    ("Soundtrack", _TIER_STRONG),
+    ("MPB", _TIER_STRONG),
     ("Boogaloo", _TIER_STRONG),
     ("Afrobeat", _TIER_STRONG),
-    ("Gospel", _TIER_GOOD),
-    ("Psychedelic Rock", _TIER_GOOD),
+    ("Ethio-jazz", _TIER_STRONG),
+    ("Highlife", _TIER_STRONG),
+    ("Dub", _TIER_STRONG),
+    ("Gospel", _TIER_STRONG),
+    ("Psychedelic Rock", _TIER_STRONG),
+    ("Prog Rock", _TIER_GOOD),
     ("Éntekhno", _TIER_STRONG),
     ("Laïkó", _TIER_STRONG),
     ("Rebetiko", _TIER_STRONG),
