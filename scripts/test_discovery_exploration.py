@@ -16,6 +16,7 @@ from core.discovery import (
     DiscogsCandidate,
     DiscoveryEngine,
     DiscoveryFilters,
+    NoYouTubeMatchError,
 )
 
 
@@ -328,6 +329,21 @@ def test_ytm_match_compares_search_buckets_before_choosing() -> None:
             eng._ytm_search = _fake_search  # type: ignore[method-assign]
             suggestion = eng._match_youtube(cand)
             assert suggestion.youtube_video_id == "official"
+
+            replacement = eng.rematch_youtube(
+                suggestion, exclude_video_ids={"official"},
+            )
+            assert replacement.youtube_video_id == "acceptable"
+
+            try:
+                eng.rematch_youtube(
+                    replacement,
+                    exclude_video_ids={"official", "acceptable"},
+                )
+            except NoYouTubeMatchError:
+                pass
+            else:
+                raise AssertionError("rematch reused an excluded YouTube source")
         finally:
             db.close()
 

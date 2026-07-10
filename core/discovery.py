@@ -526,6 +526,32 @@ class DiscoveryEngine:
                 suggestion.discogs_master_id,
             )
 
+    def rematch_youtube(
+        self,
+        suggestion: DiscoverySuggestion,
+        *,
+        exclude_video_ids: Iterable[str] = (),
+    ) -> DiscoverySuggestion:
+        """Find another credible YTM source for an existing Discogs result."""
+        cand = DiscogsCandidate(
+            master_id=suggestion.discogs_master_id,
+            release_id=suggestion.discogs_release_id,
+            artist=suggestion.artist,
+            title=suggestion.title,
+            year=suggestion.year,
+            country=suggestion.country,
+            genres=((suggestion.genre,) if suggestion.genre else ()),
+            styles=((suggestion.style,) if suggestion.style else ()),
+            formats=(),
+            have=0,
+            want=0,
+        )
+        return self._match_youtube(
+            cand,
+            exclude_video_ids=frozenset(str(v) for v in exclude_video_ids if v),
+            retry=True,
+        )
+
     @staticmethod
     def _emit_progress(
         progress: Optional[Callable[[str], None]], message: str,
@@ -1041,7 +1067,11 @@ class DiscoveryEngine:
     # ── YouTube Music matcher ──
 
     def _match_youtube(
-        self, cand: DiscogsCandidate,
+        self,
+        cand: DiscogsCandidate,
+        *,
+        exclude_video_ids: frozenset[str] = frozenset(),
+        retry: bool = False,
     ) -> DiscoverySuggestion:
         """
         Search YTM for the best audio match for `cand`.
@@ -1068,6 +1098,11 @@ class DiscoveryEngine:
             primary_queries.append(
                 f"{cand.artist.replace('*', '').strip()} {cand.title}"
             )
+        if retry and not _is_various_artist(cand.artist):
+            primary_queries.extend((
+                f"{primary_artist} {cand.title} official audio",
+                f"{primary_artist} {cand.title} full album",
+            ))
 
         search_stages = [primary_queries]
         if not _is_various_artist(cand.artist):
@@ -1080,7 +1115,7 @@ class DiscoveryEngine:
                 for ytm_filter in ("songs", "videos"):
                     for result in self._ytm_search(ytm, query, ytm_filter):
                         video_id = str(result.get("videoId") or "")
-                        if not video_id:
+                        if not video_id or video_id in exclude_video_ids:
                             continue
                         enriched = dict(result)
                         enriched["_crate_search_filter"] = ytm_filter
@@ -1181,7 +1216,8 @@ class DiscoveryEngine:
                 "lesson", "type beat", "tribute", "sample breakdown",
                 "rehearsal", "audience recording", "phone recording",
                 "cam recording", "low quality", "poor quality", "slowed",
-                "nightcore", "8d audio",
+                "nightcore", "8d audio", "concert", "festival", "bootleg",
+                "radio session", "acoustic version", "alternate take",
             )
             if _contains_banned_yt_noise(yt_title, target_title, banned):
                 continue
@@ -1231,7 +1267,16 @@ class DiscoveryEngine:
             quality_bonus += 0.05 * _ytm_popularity_score(r.get("views"))
             quality_bonus = min(0.12, quality_bonus)
 
-            score = min(1.0, 0.88 * semantic_score + quality_bonus)
+            quality_penalty = 0.0
+            if video_type.endswith("_UGC"):
+                quality_penalty += 0.06
+            if "unofficial" in yt_source:
+                quality_penalty += 0.04
+
+            score = min(
+                1.0,
+                max(0.0, 0.88 * semantic_score + quality_bonus - quality_penalty),
+            )
 
             scored.append((score, r))
 

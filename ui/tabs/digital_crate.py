@@ -1125,6 +1125,7 @@ class DigitalCrateTab(ctk.CTkFrame):
                     self._reel_frame, self._ctx, s,
                     on_queued=self._on_card_queued,
                     on_mpc_confirm=self._on_card_mpc_confirm,
+                    on_rematched=self._on_card_rematched,
                 )
                 card.grid(row=i, column=0, sticky="ew", pady=(0, t.space.md))
                 self._cards.append(card)
@@ -1160,21 +1161,33 @@ class DigitalCrateTab(ctk.CTkFrame):
 
     def _on_card_mpc_confirm(
         self, suggestion: DiscoverySuggestion, mode: MpcExportMode,
-    ) -> None:
+    ) -> bool:
         mgr = self._ctx.mpc_export_manager
         if mgr is None:
             self._ctx.publish_toast("MPC export manager unavailable.", "error")
-            return
+            return False
         try:
             self._ensure_mpc_manager_window()
             mgr.enqueue(suggestion, mode)
         except Exception as e:  # noqa: BLE001
             self._ctx.publish_toast(f"Could not queue MPC export: {e}", "error")
-            return
+            return False
         self._ctx.publish_toast(f"Queued MPC export: {suggestion.display_name}", "info")
+        return True
 
     def _on_card_queued(self, suggestion: DiscoverySuggestion) -> None:
         self._refresh_recent_digs()
+
+    def _on_card_rematched(
+        self, old_video_id: str, suggestion: DiscoverySuggestion,
+    ) -> None:
+        card = self._video_to_card.pop(old_video_id, None)
+        if card is not None:
+            self._video_to_card[suggestion.youtube_video_id] = card
+        pf = self._ctx.preview_prefetch
+        if pf is not None:
+            pf.cancel_batch([old_video_id])
+            pf.enqueue_batch([suggestion.youtube_video_id])
 
     def _clear_cards(self) -> None:
         ids = [
@@ -1576,7 +1589,8 @@ class _ReelCard(ctk.CTkFrame):
         suggestion: DiscoverySuggestion,
         *,
         on_queued: Optional[Callable[[DiscoverySuggestion], None]] = None,
-        on_mpc_confirm: Optional[Callable[[DiscoverySuggestion, MpcExportMode], None]] = None,
+        on_mpc_confirm: Optional[Callable[[DiscoverySuggestion, MpcExportMode], bool]] = None,
+        on_rematched: Optional[Callable[[str, DiscoverySuggestion], None]] = None,
     ) -> None:
         t = ctx.theme
         super().__init__(parent, **style_card_elevated(t))
@@ -1587,8 +1601,13 @@ class _ReelCard(ctk.CTkFrame):
         self._s = suggestion
         self._on_queued = on_queued
         self._on_mpc_confirm = on_mpc_confirm
+        self._on_rematched = on_rematched
 
         self._cancel_event = threading.Event()
+        self._source_revision = 0
+        self._rejected_video_ids: set[str] = set()
+        self._rematch_in_progress = False
+        self._source_locked = False
         self._preview_started = False
         self._full_preview_loading = False
         self._recorded = False
@@ -1600,6 +1619,8 @@ class _ReelCard(ctk.CTkFrame):
         self._preview_btn: Optional[ctk.CTkButton] = None
         self._queue_btn: Optional[ctk.CTkButton] = None
         self._mpc_btn: Optional[ctk.CTkButton] = None
+        self._retry_match_btn: Optional[ctk.CTkButton] = None
+        self._match_meta_label: Optional[ctk.CTkLabel] = None
         self._mpc_popover: Optional[_MpcModePopover] = None
         self._inner: Optional[ctk.CTkFrame] = None
         self._last_prefetch_pct = -1.0
@@ -1648,9 +1669,11 @@ class _ReelCard(ctk.CTkFrame):
                       if x]
         conf = int(s.match_score * 100)
         meta_parts.append(f"YT {conf}%")
-        ctk.CTkLabel(inner, text="   ·   ".join(meta_parts),
-                     text_color=t.text.secondary, font=t.font.caption,
-                     anchor="w").grid(row=2, column=0, sticky="w")
+        self._match_meta_label = ctk.CTkLabel(
+            inner, text="   ·   ".join(meta_parts),
+            text_color=t.text.secondary, font=t.font.caption, anchor="w",
+        )
+        self._match_meta_label.grid(row=2, column=0, sticky="w")
 
         affinity = sample_affinity(
             genres=[s.genre] if s.genre else [],
@@ -1709,6 +1732,16 @@ class _ReelCard(ctk.CTkFrame):
         ctk.CTkButton(actions, text="YouTube",
                       command=self._on_open_youtube, **style_ghost_button(t),
                       width=80).pack(side="left", padx=(t.space.sm, 0))
+
+        source_actions = ctk.CTkFrame(inner, fg_color="transparent")
+        source_actions.grid(row=chip_row + 2, column=0, sticky="w",
+                            pady=(t.space.sm, 0))
+        self._retry_match_btn = ctk.CTkButton(
+            source_actions, text="↻  Find better audio",
+            command=self._on_retry_match_clicked,
+            **style_ghost_button(t), width=160,
+        )
+        self._retry_match_btn.pack(side="left")
 
     # ── Prefetch / MPC status ──
 
@@ -1772,6 +1805,9 @@ class _ReelCard(ctk.CTkFrame):
         t = self._theme
         if event.type == MpcExportEventType.ENQUEUED:
             self._mpc_btn.configure(text="Queued", state="disabled")
+            self._source_locked = True
+            if self._retry_match_btn is not None:
+                self._retry_match_btn.configure(state="disabled")
         elif event.type == MpcExportEventType.STARTED:
             self._mpc_btn.configure(text="Exporting…", state="disabled")
         elif event.type == MpcExportEventType.COMPLETED:
@@ -1786,10 +1822,16 @@ class _ReelCard(ctk.CTkFrame):
             self._mpc_btn.configure(
                 text="↻  Retry MPC", state="normal", fg_color=t.surface.raised,
             )
+            self._source_locked = self._queued
+            if self._retry_match_btn is not None and not self._source_locked:
+                self._retry_match_btn.configure(state="normal")
         elif event.type == MpcExportEventType.CANCELLED:
             self._mpc_btn.configure(
                 text="◈  MPC Workflow", state="normal", fg_color=t.surface.raised,
             )
+            self._source_locked = self._queued
+            if self._retry_match_btn is not None and not self._source_locked:
+                self._retry_match_btn.configure(state="normal")
 
     def set_scroll_paused(self, paused: bool) -> None:
         if self._player is not None:
@@ -1826,6 +1868,7 @@ class _ReelCard(ctk.CTkFrame):
 
         pf = self._ctx.preview_prefetch
         vid = self._s.youtube_video_id
+        revision = self._source_revision
         if pf is not None:
             cached = pf.get_decoded(vid)
             if cached is not None:
@@ -1833,7 +1876,9 @@ class _ReelCard(ctk.CTkFrame):
                 player.grid()
                 player.set_loading("Loading preview…")
                 self._safe_after(
-                    0, lambda d=cached: self._show_preview_data(d, full=False),
+                    0, lambda d=cached, r=revision: self._show_preview_data(
+                        d, full=False, revision=r,
+                    ),
                 )
                 return
             state = pf.get_state(vid)
@@ -1846,7 +1891,8 @@ class _ReelCard(ctk.CTkFrame):
                 player.grid()
                 player.set_loading("Almost ready…")
                 threading.Thread(
-                    target=self._wait_prefetch_worker, daemon=True,
+                    target=self._wait_prefetch_worker,
+                    args=(revision, vid), daemon=True,
                 ).start()
                 return
 
@@ -1855,27 +1901,37 @@ class _ReelCard(ctk.CTkFrame):
         player.set_loading("Fetching quick preview…")
         threading.Thread(
             target=self._preview_worker,
-            kwargs={"full": False},
+            kwargs={"full": False, "revision": revision, "video_id": vid},
             daemon=True,
         ).start()
 
-    def _wait_prefetch_worker(self) -> None:
+    def _wait_prefetch_worker(self, revision: int, video_id: str) -> None:
         pf = self._ctx.preview_prefetch
         if pf is None:
-            self._safe_after(0, self._preview_worker_ui_start)
+            self._safe_after(
+                0, lambda: self._preview_worker_ui_start(revision, video_id),
+            )
             return
-        data = pf.wait_ready(self._s.youtube_video_id, timeout=120.0)
+        data = pf.wait_ready(video_id, timeout=120.0)
         if data is not None:
-            self._safe_after(0, lambda d=data: self._show_preview_data(d, full=False))
+            self._safe_after(
+                0, lambda d=data: self._show_preview_data(
+                    d, full=False, revision=revision,
+                ),
+            )
         else:
-            self._safe_after(0, self._preview_worker_ui_start)
+            self._safe_after(
+                0, lambda: self._preview_worker_ui_start(revision, video_id),
+            )
 
-    def _preview_worker_ui_start(self) -> None:
+    def _preview_worker_ui_start(self, revision: int, video_id: str) -> None:
+        if revision != self._source_revision:
+            return
         player = self._ensure_player()
         player.set_loading("Fetching quick preview…")
         threading.Thread(
             target=self._preview_worker,
-            kwargs={"full": False},
+            kwargs={"full": False, "revision": revision, "video_id": video_id},
             daemon=True,
         ).start()
 
@@ -1887,11 +1943,17 @@ class _ReelCard(ctk.CTkFrame):
             self._player.set_full_loading(True)
         threading.Thread(
             target=self._preview_worker,
-            kwargs={"full": True},
+            kwargs={
+                "full": True,
+                "revision": self._source_revision,
+                "video_id": self._s.youtube_video_id,
+            },
             daemon=True,
         ).start()
 
-    def _preview_worker(self, *, full: bool) -> None:
+    def _preview_worker(
+        self, *, full: bool, revision: int, video_id: str,
+    ) -> None:
         import time as time_mod
         last_progress_at = 0.0
 
@@ -1908,26 +1970,38 @@ class _ReelCard(ctk.CTkFrame):
         try:
             if full:
                 data = self._ctx.preview.fetch(
-                    self._s.youtube_video_id,
+                    video_id,
                     cancel_event=self._cancel_event,
                 )
             else:
                 data = self._ctx.preview.fetch_quick(
-                    self._s.youtube_video_id,
+                    video_id,
                     progress_callback=on_progress,
                     cancel_event=self._cancel_event,
                 )
         except Exception as e:  # noqa: BLE001
-            self._safe_after(0, lambda err=e, f=full: self._on_preview_error(err, full=f))
+            self._safe_after(
+                0, lambda err=e, f=full, r=revision: self._on_preview_error(
+                    err, full=f, revision=r,
+                ),
+            )
             return
-        self._safe_after(0, lambda d=data, f=full: self._show_preview_data(d, full=f))
+        self._safe_after(
+            0, lambda d=data, f=full, r=revision: self._show_preview_data(
+                d, full=f, revision=r,
+            ),
+        )
 
     def _on_preview_progress(self, message: str) -> None:
         if self._prefetch_chip is not None:
             self._set_prefetch_chip(message, PrefetchState.DOWNLOADING)
 
-    def _show_preview_data(self, data, *, full: bool) -> None:
+    def _show_preview_data(
+        self, data, *, full: bool, revision: Optional[int] = None,
+    ) -> None:
         if self._cancel_event.is_set():
+            return
+        if revision is not None and revision != self._source_revision:
             return
         try:
             if not self.winfo_exists():
@@ -1959,7 +2033,12 @@ class _ReelCard(ctk.CTkFrame):
                     pass
                 return
 
-    def _on_preview_error(self, error: Exception, *, full: bool = False) -> None:
+    def _on_preview_error(
+        self, error: Exception, *, full: bool = False,
+        revision: Optional[int] = None,
+    ) -> None:
+        if revision is not None and revision != self._source_revision:
+            return
         if full:
             self._full_preview_loading = False
             if self._player is not None:
@@ -1973,6 +2052,67 @@ class _ReelCard(ctk.CTkFrame):
         self._preview_started = False
 
     # ── Actions ──
+
+    def _on_retry_match_clicked(self) -> None:
+        if self._source_locked or self._rematch_in_progress:
+            return
+        if self._ctx.discovery is None:
+            self._ctx.publish_toast("Discovery engine unavailable.", "error")
+            return
+        self._rematch_in_progress = True
+        self._rejected_video_ids.add(self._s.youtube_video_id)
+        if self._retry_match_btn is not None:
+            self._retry_match_btn.configure(state="disabled", text="Searching…")
+        threading.Thread(target=self._rematch_worker, daemon=True).start()
+
+    def _rematch_worker(self) -> None:
+        try:
+            suggestion = self._ctx.discovery.rematch_youtube(
+                self._s,
+                exclude_video_ids=frozenset(self._rejected_video_ids),
+            )
+        except Exception as e:  # noqa: BLE001
+            self._safe_after(0, lambda err=e: self._on_rematch_error(err))
+            return
+        self._safe_after(0, lambda s=suggestion: self._apply_rematch(s))
+
+    def _apply_rematch(self, suggestion: DiscoverySuggestion) -> None:
+        old_video_id = self._s.youtube_video_id
+        self._source_revision += 1
+        self._s = suggestion
+        self._rematch_in_progress = False
+        self._preview_started = False
+        self._full_preview_loading = False
+        self._close_mpc_popover()
+        if self._player is not None:
+            try:
+                self._player.stop()
+                self._player.destroy()
+            except Exception:
+                pass
+            self._player = None
+        if self._inner is not None:
+            self._inner.destroy()
+            self._inner = None
+        self._build()
+        if self._on_rematched is not None:
+            self._on_rematched(old_video_id, suggestion)
+        self._ctx.publish_toast(
+            f"Selected another source: {suggestion.youtube_title}", "success",
+        )
+        self._request_scroll_refresh()
+
+    def _on_rematch_error(self, error: Exception) -> None:
+        self._rematch_in_progress = False
+        if self._retry_match_btn is not None:
+            self._retry_match_btn.configure(
+                state="normal", text="↻  Find better audio",
+            )
+        if isinstance(error, NoYouTubeMatchError):
+            message = "No other credible YouTube source was found."
+        else:
+            message = f"Could not search for another source: {error}"
+        self._ctx.publish_toast(message, "warning")
 
     def _on_queue_clicked(self) -> None:
         if self._queued:
@@ -1993,11 +2133,14 @@ class _ReelCard(ctk.CTkFrame):
             self._ctx.publish_toast(f"Could not queue: {e}", "error")
             return
         self._queued = True
+        self._source_locked = True
         self._record(was_queued=True)
         t = self._theme
         if self._queue_btn is not None:
             self._queue_btn.configure(text="Queued ✓", state="disabled",
                                       fg_color=t.status.success)
+        if self._retry_match_btn is not None:
+            self._retry_match_btn.configure(state="disabled")
         self._ctx.publish_toast(f"Queued: {s.display_name}", "success")
         if self._on_queued is not None:
             self._on_queued(s)
@@ -2056,7 +2199,10 @@ class _ReelCard(ctk.CTkFrame):
     def _confirm_mpc_mode(self, mode: MpcExportMode) -> None:
         self._close_mpc_popover()
         if self._on_mpc_confirm is not None:
-            self._on_mpc_confirm(self._s, mode)
+            if self._on_mpc_confirm(self._s, mode):
+                self._source_locked = True
+                if self._retry_match_btn is not None:
+                    self._retry_match_btn.configure(state="disabled")
 
     def _record(self, *, was_queued: bool) -> None:
         if self._ctx.discovery is None:
