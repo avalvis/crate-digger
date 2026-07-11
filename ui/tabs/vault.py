@@ -65,7 +65,12 @@ from core.exporter import (
 )
 from core.pipeline import PipelineRequest
 from core.queue_manager import QueueEvent, QueueEventType
-from core.stems import StemModel
+from core.stems import (
+    SeparationProgress,
+    StemModel,
+    StemSeparationCancelledError,
+    StemSeparator,
+)
 from ui.components.data_table import (
     Column,
     SortDirection,
@@ -224,9 +229,11 @@ class VaultTab(ctk.CTkFrame):
         self._export_button: Optional[ctk.CTkButton] = None
         self._reveal_button: Optional[ctk.CTkButton] = None
         self._reanalyze_button: Optional[ctk.CTkButton] = None
+        self._split_stems_button: Optional[ctk.CTkButton] = None
         self._delete_button: Optional[ctk.CTkButton] = None
         self._inspect_button: Optional[ctk.CTkButton] = None
         self._crate_button: Optional[ctk.CTkButton] = None
+        self._stem_dialog: Optional["_StemSeparationDialog"] = None
 
         # Maps crate dropdown labels → crate ids (label "All crates" → None).
         self._crate_label_to_id: dict[str, Optional[int]] = {}
@@ -537,6 +544,16 @@ class VaultTab(ctk.CTkFrame):
             state="disabled",
         )
         self._reveal_button.pack(side="left", padx=(0, t.space.xs))
+
+        self._split_stems_button = ctk.CTkButton(
+            actions,
+            text="Split stems",
+            command=self._on_split_stems_clicked,
+            **style_ghost_button(t),
+            state="disabled",
+            width=105,
+        )
+        self._split_stems_button.pack(side="left", padx=(0, t.space.xs))
 
         self._reanalyze_button = ctk.CTkButton(
             actions,
@@ -982,6 +999,20 @@ class VaultTab(ctk.CTkFrame):
             if btn is not None:
                 btn.configure(state=enabled)
 
+        # Stem separation is useful only for downloaded tracks that do not
+        # already have stems. Mixed selections process the missing subset.
+        if self._split_stems_button is not None:
+            has_missing_stems = any(
+                not track.stems_separated for track in self._selected_tracks
+            )
+            self._split_stems_button.configure(
+                state=(
+                    "normal"
+                    if has_missing_stems and self._stem_dialog is None
+                    else "disabled"
+                )
+            )
+
         # Inspect operates on a single track only.
         if self._inspect_button is not None:
             self._inspect_button.configure(
@@ -1186,6 +1217,46 @@ class VaultTab(ctk.CTkFrame):
         CREATE_NO_WINDOW = 0x08000000
         return {"creationflags": CREATE_NO_WINDOW}
 
+    # ── Action: Split stems ──
+
+    def _on_split_stems_clicked(self) -> None:
+        tracks = [t for t in self._selected_tracks if not t.stems_separated]
+        if not tracks:
+            return
+        if self._ctx.stem_separator is None:
+            self._ctx.publish_toast(
+                "Stem separator is unavailable. Check Stem Separation in Settings.",
+                "error",
+            )
+            return
+
+        snap = self._ctx.config.snapshot()
+        try:
+            stem_model = StemModel(snap.config.stems.model)
+        except ValueError:
+            stem_model = StemModel.HTDEMUCS_FT
+
+        self._stem_dialog = _StemSeparationDialog(
+            parent=self,
+            theme=self._theme,
+            separator=self._ctx.stem_separator,
+            database=self._ctx.database,
+            tracks=tracks,
+            model=stem_model,
+            toast_publisher=self._ctx.publish_toast,
+            logger=self._log.getChild("stems"),
+            on_tracks_updated=self._on_stems_updated,
+            on_closed=self._on_stem_dialog_closed,
+        )
+        self._update_toolbar_state()
+
+    def _on_stems_updated(self) -> None:
+        self._refresh_data()
+
+    def _on_stem_dialog_closed(self) -> None:
+        self._stem_dialog = None
+        self._update_toolbar_state()
+
     # ── Action: Re-analyze ──
 
     def _on_reanalyze_clicked(self) -> None:
@@ -1367,6 +1438,281 @@ class VaultTab(ctk.CTkFrame):
             toast_publisher=self._ctx.publish_toast,
             logger=self._log.getChild("export"),
         )
+
+
+# ─── Vault stem separation progress dialog ─────────────────────────
+
+
+class _StemSeparationDialog(ctk.CTkToplevel):
+    """Split already-downloaded vault tracks without re-running ingestion."""
+
+    _WIDTH = 540
+    _HEIGHT = 270
+
+    def __init__(
+        self,
+        parent: ctk.CTkBaseClass,
+        theme: Theme,
+        separator: StemSeparator,
+        database: Any,
+        tracks: list[TrackRecord],
+        model: StemModel,
+        toast_publisher: Callable[..., None],
+        logger: logging.Logger,
+        on_tracks_updated: Callable[[], None],
+        on_closed: Callable[[], None],
+    ) -> None:
+        super().__init__(parent)
+
+        self._theme = theme
+        self._separator = separator
+        self._database = database
+        self._tracks = tracks
+        self._model = model
+        self._toast_publisher = toast_publisher
+        self._log = logger
+        self._on_tracks_updated = on_tracks_updated
+        self._on_closed = on_closed
+        self._cancel_event = threading.Event()
+        self._finished = False
+        self._closed = False
+
+        self.title("Split stems")
+        self.configure(fg_color=theme.surface.base)
+        self.geometry(f"{self._WIDTH}x{self._HEIGHT}")
+        self.resizable(False, False)
+        self.transient(parent.winfo_toplevel())
+        self.protocol("WM_DELETE_WINDOW", self._on_close_request)
+
+        self._build_body()
+        self._center_over(parent)
+        self.bind("<Escape>", lambda _e: self._on_close_request())
+
+        threading.Thread(
+            target=self._run_worker,
+            name="vault-stem-separation",
+            daemon=True,
+        ).start()
+
+    def _build_body(self) -> None:
+        t = self._theme
+        frame = ctk.CTkFrame(self, fg_color="transparent")
+        frame.pack(fill="both", expand=True, padx=t.space.xl, pady=t.space.xl)
+        frame.grid_columnconfigure(0, weight=1)
+
+        count = len(self._tracks)
+        ctk.CTkLabel(
+            frame,
+            text=f"Splitting stems for {count} track{'s' if count != 1 else ''}",
+            text_color=t.text.primary,
+            font=t.font.subheading,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+
+        ctk.CTkLabel(
+            frame,
+            text=f"Model: {self._model.value}",
+            text_color=t.text.secondary,
+            font=t.font.mono_body,
+            anchor="w",
+        ).grid(row=1, column=0, sticky="w", pady=(t.space.xxs, t.space.lg))
+
+        self._status_label = ctk.CTkLabel(
+            frame,
+            text="Preparing…",
+            text_color=t.text.primary,
+            font=t.font.body,
+            anchor="w",
+        )
+        self._status_label.grid(row=2, column=0, sticky="ew")
+
+        self._counter_label = ctk.CTkLabel(
+            frame,
+            text="0%",
+            text_color=t.text.secondary,
+            font=t.font.mono_body,
+            anchor="w",
+        )
+        self._counter_label.grid(row=3, column=0, sticky="ew", pady=(2, t.space.sm))
+
+        self._progress_bar = ctk.CTkProgressBar(
+            frame,
+            fg_color=t.surface.elevated,
+            progress_color=t.accent.purple,
+            corner_radius=t.radius.pill,
+            height=6,
+        )
+        self._progress_bar.grid(row=4, column=0, sticky="ew", pady=(0, t.space.xl))
+        self._progress_bar.set(0.0)
+
+        button_row = ctk.CTkFrame(frame, fg_color="transparent")
+        button_row.grid(row=5, column=0, sticky="ew")
+        self._cancel_button = ctk.CTkButton(
+            button_row,
+            text="Cancel",
+            command=self._on_cancel_clicked,
+            **style_secondary_button(t),
+        )
+        self._cancel_button.pack(side="right")
+        self._close_button = ctk.CTkButton(
+            button_row,
+            text="Close",
+            command=self._close,
+            **style_primary_button(t),
+            state="disabled",
+        )
+        self._close_button.pack(side="right", padx=(0, t.space.sm))
+
+    def _center_over(self, parent: ctk.CTkBaseClass) -> None:
+        parent.update_idletasks()
+        x = parent.winfo_rootx() + (parent.winfo_width() - self._WIDTH) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - self._HEIGHT) // 2
+        self.geometry(f"+{x}+{y}")
+
+    def _run_worker(self) -> None:
+        succeeded = 0
+        failures: list[str] = []
+        total = len(self._tracks)
+
+        for index, track in enumerate(self._tracks, start=1):
+            if self._cancel_event.is_set():
+                break
+
+            display_name = f"{track.artist} — {track.title}"
+            audio_path = Path(track.file_path)
+            stems_dir = audio_path.parent / "stems"
+
+            def on_progress(
+                progress: SeparationProgress,
+                *,
+                current_index: int = index,
+                name: str = display_name,
+            ) -> None:
+                overall = (
+                    (current_index - 1) + progress.percent / 100.0
+                ) / total * 100.0
+                self.after(
+                    0,
+                    lambda i=current_index, n=name, m=progress.message, o=overall: (
+                        self._apply_progress(
+                            i,
+                            total,
+                            n,
+                            m,
+                            o,
+                        )
+                    ),
+                )
+
+            try:
+                if track.id is None:
+                    raise ValueError("Track is missing its database id")
+                if not audio_path.is_file():
+                    raise FileNotFoundError(f"Audio file not found: {audio_path}")
+                self._separator.separate(
+                    audio_path,
+                    stems_dir,
+                    progress_callback=on_progress,
+                    cancel_event=self._cancel_event,
+                    model=self._model,
+                )
+                self._database.set_track_stems(track.id, str(stems_dir))
+                succeeded += 1
+            except StemSeparationCancelledError:
+                break
+            except Exception:
+                failures.append(display_name)
+                self._log.exception("Stem separation failed for %s", display_name)
+
+        cancelled = self._cancel_event.is_set()
+        self.after(
+            0,
+            lambda: self._on_finished(succeeded, failures, cancelled),
+        )
+
+    def _apply_progress(
+        self,
+        index: int,
+        total: int,
+        display_name: str,
+        message: str,
+        overall_percent: float,
+    ) -> None:
+        if self._finished:
+            return
+        label = display_name if len(display_name) <= 58 else display_name[:55] + "…"
+        self._status_label.configure(text=f"{label}  ·  {message}")
+        self._counter_label.configure(
+            text=f"{index} of {total}  ·  {int(overall_percent)}%"
+        )
+        self._progress_bar.set(max(0.0, min(1.0, overall_percent / 100.0)))
+
+    def _on_finished(
+        self,
+        succeeded: int,
+        failures: list[str],
+        cancelled: bool,
+    ) -> None:
+        self._finished = True
+        self._cancel_button.configure(state="disabled")
+        self._close_button.configure(state="normal")
+
+        if succeeded:
+            self._on_tracks_updated()
+
+        if cancelled:
+            self._status_label.configure(
+                text=f"Cancelled · {succeeded} completed",
+                text_color=self._theme.text.muted,
+            )
+            self._toast_publisher(
+                f"Stem separation cancelled. {succeeded} completed.",
+                "warning",
+            )
+        elif failures:
+            self._progress_bar.configure(progress_color=self._theme.status.warning)
+            self._status_label.configure(
+                text=f"{succeeded} completed · {len(failures)} failed",
+                text_color=self._theme.status.warning,
+            )
+            self._toast_publisher(
+                f"Stem separation finished: {succeeded} completed, "
+                f"{len(failures)} failed.",
+                "warning",
+            )
+        else:
+            self._progress_bar.set(1.0)
+            self._status_label.configure(
+                text=f"Stems ready for {succeeded} track"
+                f"{'s' if succeeded != 1 else ''}.",
+                text_color=self._theme.status.success,
+            )
+            self._counter_label.configure(text="100%")
+            self._toast_publisher(
+                f"Created stems for {succeeded} track"
+                f"{'s' if succeeded != 1 else ''}.",
+                "success",
+            )
+
+    def _on_cancel_clicked(self) -> None:
+        if self._finished:
+            return
+        self._cancel_event.set()
+        self._cancel_button.configure(state="disabled", text="Cancelling…")
+        self._status_label.configure(text="Cancelling after the current process stops…")
+
+    def _on_close_request(self) -> None:
+        if self._finished:
+            self._close()
+        else:
+            self._on_cancel_clicked()
+
+    def _close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._on_closed()
+        self.destroy()
 
 
 # ─── Delete confirmation dialog ─────────────────────────────────────
