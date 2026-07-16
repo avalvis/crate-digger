@@ -678,6 +678,20 @@ class VaultDatabase:
             if cur.rowcount == 0:
                 raise RecordNotFoundError(f"No track with id={track_id}")
 
+    def set_track_stems(self, track_id: int, stems_path: str) -> None:
+        """Mark a track's stem separation complete and store its folder."""
+        with self._writing() as conn:
+            cur = conn.execute(
+                """
+                UPDATE tracks
+                   SET stems_separated=1, stems_path=?, date_modified=?
+                 WHERE id=?
+                """,
+                (stems_path, _utc_now_iso(), track_id),
+            )
+            if cur.rowcount == 0:
+                raise RecordNotFoundError(f"No track with id={track_id}")
+
     def set_track_rating(self, track_id: int, rating: Optional[int]) -> None:
         """Set a 0–5 star rating (None clears). Bumps date_modified."""
         if rating is not None:
