@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from datetime import date
 from pathlib import Path
 
 
@@ -68,7 +69,8 @@ def sanitize_filename_component(
 # Ordered list of (scheme_key, human_label) pairs for UI dropdowns.
 # The first entry is the default used on fresh installs.
 VAULT_FOLDER_SCHEMES: list[tuple[str, str]] = [
-    ("genre/bpm_key_artist_title", "Genre / BPM · Key · Artist – Title  (default)"),
+    ("date/artist_title",           "Date / Artist – Title  (recent-first default)"),
+    ("genre/bpm_key_artist_title", "Genre / BPM · Key · Artist – Title"),
     ("artist/bpm_key_title",       "Artist / BPM · Key – Title"),
     ("genre/artist/bpm_key_title", "Genre / Artist / BPM · Key – Title"),
     ("bpm_key_artist_title",       "BPM · Key · Artist – Title  (flat)"),
@@ -87,13 +89,15 @@ def build_vault_track_dir(
     artist: str,
     title: str,
     scheme: str = _DEFAULT_SCHEME,
+    filed_on: date | None = None,
 ) -> Path:
     """
     Construct the vault directory for one track according to `scheme`.
 
     Schemes
     -------
-    genre/bpm_key_artist_title  → Genre/BPM_Key_Artist_Title  (default)
+    date/artist_title           → YYYY-MM-DD/Artist_Title  (default)
+    genre/bpm_key_artist_title  → Genre/BPM_Key_Artist_Title
     artist/bpm_key_title        → Artist/BPM_Key_Title
     genre/artist/bpm_key_title  → Genre/Artist/BPM_Key_Title
     bpm_key_artist_title        → BPM_Key_Artist_Title  (flat, no subfolder)
@@ -115,13 +119,19 @@ def build_vault_track_dir(
     bpm_key_title        = san(f"{bpm_key}_{title_part}", max_length=180)
     artist_title         = san(f"{artist_part}_{title_part}", max_length=180)
 
+    if scheme == "date/artist_title":
+        date_part = (filed_on or date.today()).isoformat()
+        return vault_root / date_part / artist_title
     if scheme == "artist/bpm_key_title":
         return vault_root / artist_part / bpm_key_title
     if scheme == "genre/artist/bpm_key_title":
         return vault_root / genre_dir / artist_part / bpm_key_title
+    if scheme == "genre/bpm_key_artist_title":
+        return vault_root / genre_dir / bpm_key_artist_title
     if scheme == "bpm_key_artist_title":
         return vault_root / bpm_key_artist_title
     if scheme == "artist_title":
         return vault_root / artist_title
-    # Default: genre/bpm_key_artist_title (also catches unknown scheme values)
-    return vault_root / genre_dir / bpm_key_artist_title
+    # Unknown scheme values fall back to the recent-first default.
+    date_part = (filed_on or date.today()).isoformat()
+    return vault_root / date_part / artist_title

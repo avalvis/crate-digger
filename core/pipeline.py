@@ -11,7 +11,7 @@ workflow. The canonical stages:
     3. artwork        — fetch YT thumbnail, 1:1 center-crop
     4. tag            — embed covr + all atoms via mutagen
     5. relocate       — move from staging into ~/Music/CrateDigger_Vault/
-                         [Genre]/[BPM]_[Key]_[Artist]_[Title]/
+                         [YYYY-MM-DD]/[Artist]_[Title]/
     6. index          — upsert into vault.db
     7. stems (opt)    — demucs separation into the track's vault dir
 
@@ -210,7 +210,7 @@ class IngestionPipeline:
         vault_root: Path,
         staging_root: Path,
         ai_enricher: Optional[_AiEnricher] = None,
-        folder_scheme: str = "genre/bpm_key_artist_title",
+        folder_scheme: str = "date/artist_title",
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self._dl = downloader
@@ -233,6 +233,10 @@ class IngestionPipeline:
     def update_ai_enricher(self, enricher: Optional[_AiEnricher]) -> None:
         """Called by Settings when the DeepSeek key is saved or cleared."""
         self._ai_enricher = enricher
+
+    def update_folder_scheme(self, folder_scheme: str) -> None:
+        """Apply a Settings folder-layout change to subsequent relocations."""
+        self._folder_scheme = folder_scheme
 
     def run(
         self,
@@ -650,8 +654,7 @@ class IngestionPipeline:
         title: str,
     ) -> tuple[Path, Path]:
         """
-        Move `src` into the vault at
-            ~/Music/CrateDigger_Vault/[Genre]/[BPM]_[Key]_[Artist]_[Title]/
+        Move `src` into the vault using the configured folder scheme.
         and return (final_audio_path, track_dir).
 
         Every path component is sanitized via utils.paths.

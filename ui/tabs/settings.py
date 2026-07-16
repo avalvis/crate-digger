@@ -1306,6 +1306,9 @@ class SettingsTab(ctk.CTkFrame):
             return
         try:
             self._config.update_general(vault_folder_scheme=key)
+            if self._ctx.pipeline is not None:
+                self._ctx.pipeline.update_folder_scheme(key)
+            self._ctx.notify_config_changed()
             self._ctx.publish_toast(
                 "Folder scheme updated. New tracks will use this layout.",
                 kind="info",
@@ -1710,7 +1713,7 @@ class SettingsTab(ctk.CTkFrame):
                 mpc_export_max_concurrent=1,
                 enable_stems_by_default=False,
                 use_ai_metadata=True,
-                vault_folder_scheme="genre/bpm_key_artist_title",
+                vault_folder_scheme="date/artist_title",
                 # Note: has_deepseek_key is not reset — credentials are preserved.
             )
             self._config.update_stems(model="htdemucs", device="auto")
@@ -1740,6 +1743,9 @@ class SettingsTab(ctk.CTkFrame):
             return
 
         self._populate_from_config()
+        if self._ctx.pipeline is not None:
+            self._ctx.pipeline.update_folder_scheme("date/artist_title")
+        self._ctx.notify_config_changed()
         self._ctx.publish_toast(
             "Settings reset to defaults.",
             kind="success",
