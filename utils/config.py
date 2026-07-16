@@ -163,7 +163,7 @@ class StemsConfig(BaseModel):
     """Stem separation preferences."""
 
     model: str = Field(
-        default="htdemucs_ft",
+        default="htdemucs",
         description="Default demucs model.",
     )
     device: str = Field(

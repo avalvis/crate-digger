@@ -1213,7 +1213,7 @@ class VaultTab(ctk.CTkFrame):
         try:
             stem_model = StemModel(snap.config.stems.model)
         except ValueError:
-            stem_model = StemModel.HTDEMUCS_FT
+            stem_model = StemModel.HTDEMUCS
 
         queued = 0
         for track in self._selected_tracks:

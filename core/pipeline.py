@@ -125,7 +125,7 @@ class PipelineRequest:
 
     source_url: str
     enable_stems: bool = False
-    stem_model: StemModel = StemModel.HTDEMUCS_FT
+    stem_model: StemModel = StemModel.HTDEMUCS
     # Per-download AI metadata flag. When True (and the pipeline was
     # constructed with an ai_enricher), DeepSeek is called to extract
     # the original artist/title from the YouTube video title.

@@ -18,7 +18,7 @@ Why subprocess instead of the demucs Python API:
   • CLI stability. demucs.separate CLI flags have been stable across
     4.x releases; the Python API has shifted multiple times.
 
-Default model: htdemucs_ft (fine-tuned, highest production quality).
+Default model: htdemucs (balanced quality and speed).
 The separator accepts a per-call model override so the pipeline can
 honor the user's Settings-tab choice without instance rebuild.
 """
@@ -49,8 +49,8 @@ class StemModel(str, Enum):
     so the Settings dropdown can render them in a sensible default order.
     """
 
-    HTDEMUCS_FT = "htdemucs_ft"  # Fine-tuned, highest quality (DEFAULT)
-    HTDEMUCS = "htdemucs"  # Demucs v4 default
+    HTDEMUCS_FT = "htdemucs_ft"  # Fine-tuned 4-model ensemble; slowest
+    HTDEMUCS = "htdemucs"  # Demucs v4 balanced default
     HTDEMUCS_6S = "htdemucs_6s"  # 6-stem variant (+piano, +guitar)
     MDX_EXTRA = "mdx_extra"  # MDX architecture; ~2x faster on CPU
     MDX_EXTRA_Q = "mdx_extra_q"  # Quantized MDX; smallest memory, fastest
@@ -114,6 +114,7 @@ class StemSeparationCancelledError(StemSeparationError):
 
 # tqdm progress line, e.g. " 43%|████▎     | 86/200 [00:12<00:16,  6.92it/s]"
 _PROGRESS_RE = re.compile(r"\b(\d{1,3})%\|")
+_BAG_MODELS_RE = re.compile(r"\bbag of (\d+) models?\b", re.IGNORECASE)
 
 # Injected as `python -c _DEMUCS_RUNNER` so we can patch torchaudio.save
 # before demucs imports it.  torchaudio 2.8+ delegates save() to torchcodec
@@ -148,7 +149,7 @@ class StemSeparator:
 
     def __init__(
         self,
-        model: Union[StemModel, str] = StemModel.HTDEMUCS_FT,
+        model: Union[StemModel, str] = StemModel.HTDEMUCS,
         device: str = "auto",
         ffmpeg_path: Optional[str] = None,
         python_executable: Optional[str] = None,
@@ -171,6 +172,12 @@ class StemSeparator:
         self._ffmpeg_path = ffmpeg_path
         self._python = python_executable or sys.executable
         self._log = logger or logging.getLogger("cratedigger.stems")
+        # Demucs saturates the CPU and consumes substantial RAM. Running two
+        # instances together makes both dramatically slower and can make the
+        # desktop UI feel hung. The app shares one separator, so this lock
+        # keeps the expensive portion single-file while downloads/analysis
+        # remain concurrent.
+        self._run_lock = threading.Lock()
 
     # ── Availability probe ──
 
@@ -264,34 +271,38 @@ class StemSeparator:
 
         device = self._resolve_device()
 
-        started = time.monotonic()
-        self._emit(
-            progress_callback,
-            SeparationStage.PREPARING,
-            0.0,
-            0.0,
-            f"Preparing (model={active_model.value}, device={device})",
-        )
-
         # Staging root isolates demucs's nested output structure from
         # the caller's flat `output_dir`. Cleaned up after files move.
         staging_root = output_dir / "_demucs_staging"
-        if staging_root.exists():
-            shutil.rmtree(staging_root, ignore_errors=True)
-        staging_root.mkdir(parents=True, exist_ok=True)
-
-        cmd = [
-            self._python,
-            "-c", _DEMUCS_RUNNER,
-            "-n", active_model.value,
-            "-d", device,
-            "-o", str(staging_root),
-            str(audio_path),
-        ]
-        self._log.debug("demucs args: -n %s -d %s -o %s %s",
-                        active_model.value, device, staging_root, audio_path)
-
+        acquired = False
         try:
+            self._acquire_run_slot(progress_callback, cancel_event)
+            acquired = True
+
+            started = time.monotonic()
+            self._emit(
+                progress_callback,
+                SeparationStage.PREPARING,
+                0.0,
+                0.0,
+                f"Preparing (model={active_model.value}, device={device})",
+            )
+
+            if staging_root.exists():
+                shutil.rmtree(staging_root, ignore_errors=True)
+            staging_root.mkdir(parents=True, exist_ok=True)
+
+            cmd = [
+                self._python,
+                "-c", _DEMUCS_RUNNER,
+                "-n", active_model.value,
+                "-d", device,
+                "-o", str(staging_root),
+                str(audio_path),
+            ]
+            self._log.debug("demucs args: -n %s -d %s -o %s %s",
+                            active_model.value, device, staging_root, audio_path)
+
             self._run_demucs(cmd, progress_callback, cancel_event, started)
 
             # demucs output layout: {staging_root}/{model_name}/{track_stem}/*.wav
@@ -337,8 +348,34 @@ class StemSeparator:
             raise StemSeparationFailedError(f"Unexpected error: {e}") from e
         finally:
             shutil.rmtree(staging_root, ignore_errors=True)
+            if acquired:
+                self._run_lock.release()
 
     # ── Subprocess management ──
+
+    def _acquire_run_slot(
+        self,
+        progress_callback: Optional[Callable[[SeparationProgress], None]],
+        cancel_event: Optional[threading.Event],
+    ) -> None:
+        """Wait cancellably for the single heavy Demucs execution slot."""
+        waiting_since = time.monotonic()
+        last_emit = waiting_since - 2.0
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise StemSeparationCancelledError("Cancelled while waiting for stems.")
+            if self._run_lock.acquire(timeout=0.25):
+                return
+            now = time.monotonic()
+            if now - last_emit >= 2.0:
+                last_emit = now
+                self._emit(
+                    progress_callback,
+                    SeparationStage.PREPARING,
+                    0.0,
+                    now - waiting_since,
+                    "Waiting for the active stem separation to finish",
+                )
 
     def _prepare_runtime(
         self,
@@ -473,6 +510,10 @@ class StemSeparator:
 
         last_reported_pct = 0.0
         saw_model_load = False
+        saw_separating_track = False
+        model_count = 1
+        current_model = 0
+        previous_demucs_pct: Optional[int] = None
         output_lines: list[str] = []  # full buffer for error reporting
         last_emit_time = time.monotonic()
         # Between demucs's tqdm bar hitting 100% and the process actually
@@ -501,7 +542,12 @@ class StemSeparator:
                         SeparationStage.SEPARATING,
                         last_reported_pct,
                         elapsed,
-                        f"Separating… ({elapsed:.0f}s elapsed)",
+                        (
+                            f"Separating model {current_model + 1}/{model_count}… "
+                            f"({elapsed:.0f}s elapsed)"
+                            if model_count > 1
+                            else f"Separating… ({elapsed:.0f}s elapsed)"
+                        ),
                     )
                 continue
 
@@ -514,6 +560,13 @@ class StemSeparator:
 
             output_lines.append(line)
             self._log.debug("demucs: %s", line)
+
+            bag_match = _BAG_MODELS_RE.search(line)
+            if bag_match:
+                model_count = max(1, int(bag_match.group(1)))
+
+            if "separating track" in line.lower():
+                saw_separating_track = True
 
             # Stage heuristics. First "loading"/"downloading" line fires
             # the LOADING_MODEL event — useful because model download on
@@ -532,21 +585,42 @@ class StemSeparator:
                         "Loading model weights",
                     )
 
-            # Parse tqdm progress. Map demucs's 0-100 onto our 10-95
-            # range so PREPARING/LOADING_MODEL/WRITING have visual room.
+            # Parse tqdm progress. Ensemble models (notably htdemucs_ft)
+            # print one independent 0-100 bar per model. Treating the first
+            # bar as the whole run is what made the UI sit at 97% for most of
+            # the actual work. Aggregate all model bars before mapping the
+            # result onto our 10-95 range.
             m = _PROGRESS_RE.search(line)
-            if m:
+            if m and saw_separating_track:
                 demucs_pct = int(m.group(1))
-                mapped = 10.0 + (demucs_pct / 100.0) * 85.0
+                if (
+                    previous_demucs_pct is not None
+                    and demucs_pct < previous_demucs_pct
+                    and previous_demucs_pct >= 90
+                ):
+                    current_model = min(current_model + 1, model_count - 1)
+                previous_demucs_pct = demucs_pct
+
+                aggregate_pct = (
+                    (current_model + demucs_pct / 100.0) / model_count * 100.0
+                )
+                mapped = 10.0 + (aggregate_pct / 100.0) * 85.0
                 if mapped > last_reported_pct + 0.5:  # throttle UI spam
                     last_reported_pct = mapped
                     last_emit_time = time.monotonic()
+                    if model_count > 1:
+                        message = (
+                            f"Separating model {current_model + 1}/{model_count} "
+                            f"({demucs_pct}%)"
+                        )
+                    else:
+                        message = f"Separating ({demucs_pct}%)"
                     self._emit(
                         progress_callback,
                         SeparationStage.SEPARATING,
                         mapped,
                         time.monotonic() - started,
-                        f"Separating ({demucs_pct}%)",
+                        message,
                     )
 
         drain_thread.join(timeout=2.0)

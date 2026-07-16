@@ -458,10 +458,10 @@ class ManualRipTab(ctk.CTkFrame):
             stem_model = StemModel(stem_model_raw)
         except ValueError:
             self._log.warning(
-                "Invalid stem model in config: %r — falling back to htdemucs_ft",
+                "Invalid stem model in config: %r — falling back to htdemucs",
                 stem_model_raw,
             )
-            stem_model = StemModel.HTDEMUCS_FT
+            stem_model = StemModel.HTDEMUCS
 
         request = PipelineRequest(
             source_url=value,

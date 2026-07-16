@@ -10,7 +10,7 @@ inputs) so there's no "Save" button and no unsaved-state bookkeeping.
 Sections:
   • Library        — vault root, staging root
   • Ingestion      — concurrent workers, default stems toggle
-  • Stem Separation — model dropdown (HTDEMUCS_FT default), device
+  • Stem Separation — model dropdown (HTDEMUCS balanced default), device
   • Discovery      — Discogs token with keyring-availability status
   • About          — app version, log location, reset defaults
 
@@ -53,8 +53,8 @@ if TYPE_CHECKING:
 # Display names for stem models — keeps the UI human-readable while
 # the underlying StemModel enum stays stable.
 _STEM_MODEL_CHOICES: list[tuple[StemModel, str]] = [
-    (StemModel.HTDEMUCS_FT, "htdemucs_ft  —  Fine-tuned, highest quality"),
-    (StemModel.HTDEMUCS, "htdemucs  —  Demucs v4 default"),
+    (StemModel.HTDEMUCS, "htdemucs  —  Balanced default (1 pass)"),
+    (StemModel.HTDEMUCS_FT, "htdemucs_ft  —  Highest quality (4 passes, slow)"),
     (StemModel.HTDEMUCS_6S, "htdemucs_6s  —  6 stems (adds piano + guitar)"),
     (StemModel.MDX_EXTRA, "mdx_extra  —  ~2x faster on CPU"),
     (StemModel.MDX_EXTRA_Q, "mdx_extra_q  —  Quantized, smallest memory"),
@@ -1713,7 +1713,7 @@ class SettingsTab(ctk.CTkFrame):
                 vault_folder_scheme="genre/bpm_key_artist_title",
                 # Note: has_deepseek_key is not reset — credentials are preserved.
             )
-            self._config.update_stems(model="htdemucs_ft", device="auto")
+            self._config.update_stems(model="htdemucs", device="auto")
             self._config.update_downloader(
                 retries=5,
                 fragment_retries=5,

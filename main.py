@@ -464,7 +464,7 @@ def _bootstrap(splash: _SplashWindow, log: logging.Logger) -> int:
             "Unknown stem model in config: %r — using default.",
             snap.config.stems.model,
         )
-        stem_model = StemModel.HTDEMUCS_FT
+        stem_model = StemModel.HTDEMUCS
 
     stem_separator = StemSeparator(
         model=stem_model,
